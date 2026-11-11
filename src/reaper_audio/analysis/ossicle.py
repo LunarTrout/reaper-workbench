@@ -46,17 +46,21 @@ MIN_S = 1.0
 MAX_S = 120.0        # beyond this the model streams pieces and stops using stereo cues
 TRAINED_S = 30.0     # clips the checkpoint was actually trained on
 
-# Ask for comparisons, never for adjectives. The model answers in a couple of hundred
-# tokens, so the battery is ordered by what is most useful to a mixer.
-DEFAULT_QUESTION = """Listen to this excerpt and answer in short labelled lines. Compare, do not label: words like bright, dark or wide mean nothing without a reference.
-SOURCES: the distinct sources you can pick out, most dominant first.
-SIDES: which sources sit left, which right, which in the centre; say if that changes during the excerpt.
-MASKING: name pairs, "A hides B", and which of the two loses.
-LOW END: kick against bass, and the low end against everything else - which is louder.
-MOVEMENT: anything that grows or shrinks relative to the rest, and where.
-WIDTH: which element is widest in the stereo image and which is narrowest.
-PROBLEMS: for each, the direction of the fix (raise/lower/narrow/widen X relative to Y), most important first.
-CONFIDENCE: low, medium or high, and what you could not judge."""
+# Ask for a full, field-by-field reading. The short "what do you hear" question returns a
+# single benchmark-style sentence; a numbered ten-point battery returns a report that can
+# actually be checked against measurements (validated on a solo guitar stem, where the model
+# correctly reported "only a distorted guitar, no drums, no vocals, dull highs").
+DEFAULT_QUESTION = """Listen to this section and answer each numbered line separately, with detail. Do not repeat one sentence for every line.
+1. SOURCES: every source you can identify, most to least dominant.
+2. GUITARS: how many distinct guitar parts, where each sits (left, right, both, centre), how wide.
+3. DRUMS: which kit pieces you can pick out, which dominates, is the cymbal wash masking anything.
+4. BASS: a separate instrument or weight under the guitars, and in what register.
+5. VOCALS: present or not, scream or clean, male or female, how far forward.
+6. LOW END: kick against bass, which holds the sub, any mud between 100 and 300 Hz.
+7. MIDRANGE: what occupies 500 Hz to 2 kHz, is anything boxy or honky.
+8. HIGHS: cymbal and pick attack, harsh or dull.
+9. SPACE: what is close, what is far, how much room there is.
+10. PROBLEM: the single biggest problem of this section and the direction of the fix."""
 
 
 class OssicleError(ReaperAudioError):
@@ -238,7 +242,7 @@ def stereo_facts(x: np.ndarray) -> dict[str, Any]:
 
 def analyze(jobs: Iterable[dict[str, Any]], device: int = 0,
             dtype: str | None = None, quantize: str = "none",
-            max_new_tokens: int = 220) -> dict[str, Any]:
+            max_new_tokens: int = 400) -> dict[str, Any]:
     """Run the audio model on one or more stereo clips in a single model load.
 
     Each job: {"wav": path, "wav2": optional second clip, "question": str,
