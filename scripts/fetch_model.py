@@ -1,20 +1,19 @@
-"""Download the Ossicle-4B checkpoint (root files) into work/models/ossicle-4b.
+"""Parallel range downloader for a pinned Hugging Face checkpoint (default: Ossicle-4B).
 
-Parallel range downloader. The HF CDN throttles a single connection to roughly
-0.5 MB/s from here, while a dozen parallel connections saturate the link, so each
-large file is fetched in fixed-size ranges by a thread pool, written at its own
-offset into the final file, and resumed from a sidecar of finished chunks. Every
-file is then checked against the size and sha256 pinned in manifest.json; a
-checksum failure drops that file's chunk state and re-fetches it once.
+The HF CDN throttles a single connection to roughly 0.5 MB/s from here, while a dozen
+parallel connections saturate the link, so each large file is fetched in fixed-size
+ranges by a thread pool, written at its own offset into the final file, and resumed from
+a sidecar of finished chunks. Every file is then checked against the size and sha256
+pinned in manifest.json; a checksum failure drops that file's chunk state and re-fetches
+it once. The manifest is generated from the Hub API, so a model whose remote code lives in
+the checkpoint (trust_remote_code) gets every root file, not just the shards.
 
-The model is loaded by transformers with trust_remote_code, so the root-level
-`modeling_ossicle.py` / `configuration_ossicle.py` / chat template are part of the
-checkpoint and must be fetched too - a shards-only download is not loadable.
-
-Usage:
-    python scripts/fetch_ossicle.py                 # resume/complete the download
-    python scripts/fetch_ossicle.py --workers 16
-    python scripts/fetch_ossicle.py --verify        # only check what is on disk
+    python scripts/fetch_model.py                       # Ossicle-4B
+    python scripts/fetch_model.py --verify
+    python scripts/fetch_model.py --repo Audante/MOSS-Music-8B-Instruct-bnb-nf4 \
+        --revision 91e222c03efb5320cf1bab1a39928307b9ceabdf \
+        --dest work/models/moss-music-8b-nf4
+    python scripts/fetch_model.py --workers 16
 """
 
 from __future__ import annotations
@@ -37,6 +36,7 @@ MANIFEST = DEST / "manifest.json"
 CHUNK = 8 * 1024 * 1024
 STATE = DEST / ".chunks"
 URL = f"https://huggingface.co/{REPO}/resolve/{REVISION}/"
+LICENSE = "apache-2.0"
 
 _print_lock = threading.Lock()
 
@@ -66,7 +66,7 @@ def remote_files() -> dict[str, dict]:
 
 
 def write_manifest(files: dict[str, dict]) -> None:
-    man = {"repo": REPO, "revision": REVISION, "license": "apache-2.0",
+    man = {"repo": REPO, "revision": REVISION, "license": LICENSE,
            "files": files,
            "total_bytes": sum((f.get("size") or 0) for f in files.values())}
     MANIFEST.write_text(json.dumps(man, indent=2, sort_keys=True), encoding="utf-8")
@@ -164,10 +164,22 @@ def verify(files: dict[str, dict]) -> dict:
 def main() -> int:
     import requests
 
-    ap = argparse.ArgumentParser()
+    global REPO, REVISION, DEST, MANIFEST, STATE, URL, LICENSE
+
+    ap = argparse.ArgumentParser(description="parallel range fetch of a pinned HF checkpoint")
+    ap.add_argument("--repo", default=REPO)
+    ap.add_argument("--revision", default=REVISION)
+    ap.add_argument("--dest", default=None, help="defaults to the Ossicle folder")
+    ap.add_argument("--license", default=LICENSE)
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--workers", type=int, default=12)
     args = ap.parse_args()
+
+    REPO, REVISION, LICENSE = args.repo, args.revision, args.license
+    if args.dest:
+        DEST = Path(args.dest)
+    MANIFEST, STATE = DEST / "manifest.json", DEST / ".chunks"
+    URL = f"https://huggingface.co/{REPO}/resolve/{REVISION}/"
 
     DEST.mkdir(parents=True, exist_ok=True)
     files = remote_files()

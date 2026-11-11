@@ -39,7 +39,12 @@ def main() -> int:
         print(json.dumps(fail("GPU_REQUIRED", f"device {device_index} is {name!r}, not a Tesla V100")))
         return 0
 
-    dtype_name = request.get("dtype") or ("bfloat16" if torch.cuda.is_bf16_supported() else "float16")
+    dtype_name = request.get("dtype")
+    if not dtype_name:
+        # is_bf16_supported() is true on a V100 through its emulation branch, which is
+        # slow and numerically unreliable; pick by capability instead.
+        major = torch.cuda.get_device_capability(device_index)[0]
+        dtype_name = "bfloat16" if major >= 8 else "float16"
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16,
              "float32": torch.float32}[dtype_name]
     quantize = (request.get("quantize") or "none").lower()
