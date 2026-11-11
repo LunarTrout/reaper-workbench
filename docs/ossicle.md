@@ -139,7 +139,20 @@ frequencies" — a confident comparison of two identical signals, with invented 
 
 Rules that follow:
 
-* **Never ask "which of the two is more X".** The answer is decided by slot order, not audio.
+### The model reads the numbers and inverts their direction
+
+`scripts/context_brief.py --ask` hands the model the measured table (our values, the references,
+the delta) together with the audio and asks for an analysis. Result on the 195–225 s section:
+the brief said `lufs_i −4.89` (ours quieter) and `centroid_hz −96.5` (ours darker); the answer
+was "the track is off by **+4.89 dB** in loudness and **−96.5 Hz** in centroid … the loudness
+and centroid are higher … the volume should be reduced". The numbers are taken from the table,
+the direction is flipped, and the recommendation follows the flipped sign.
+
+So the split is fixed: measurements decide, the model only listens. Feed it audio and ask what
+it hears; never ask it to reason over a numeric table, and never let its "analysis" sentence
+carry a delta.
+
+- **Never ask "which of the two is more X".** The answer is decided by slot order, not audio.
 * Compare two clips by asking about each one separately, then compare the *measured facts*
   (`stereo_facts`) and your own numbers — not the model's words.
 * Descriptive questions about one clip (what is there, who masks whom, where things sit,
