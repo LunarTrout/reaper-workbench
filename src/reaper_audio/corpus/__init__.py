@@ -18,6 +18,7 @@ from .model import CorpusModel
 from .degrade import DEGRADATIONS, degrade
 from .benchmark import run_benchmark
 from .gates import check, gate_values
+from .manifest import Entry, Manifest
 from .report import Assessment, assess, assess_file, corpus_matrix_from_dir
 
 __all__ = [
@@ -30,6 +31,8 @@ __all__ = [
     "run_benchmark",
     "check",
     "gate_values",
+    "Entry",
+    "Manifest",
     "Assessment",
     "assess",
     "assess_file",
