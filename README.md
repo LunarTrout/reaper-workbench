@@ -44,6 +44,57 @@ REAPER's Audio Accessor is a different signal tap: its samples are pre-FX and mu
 
 Analysis audio is stored outside the `.RPP` in a bounded job directory. It is leased for the analysis request and cleaned up on release or by the stale-job policy. The capture path may temporarily change render settings or track selection and restore them afterward; callers must use the returned revision rather than assuming the project's change counter is unchanged.
 
+#### What is measured, and what the model receives
+
+One reaper_analyze request captures every non-master track and the master as separate outputs for the requested project-time range, then runs the available measurement suite over all of them. This is an offline REAPER render, not a real-time audio stream. The capture does not add tracks or items to the arrangement: WAV artifacts live outside the .RPP, are associated with a manifest, and are removed on release or lease expiry.
+
+Every source is tied to its project revision, track GUID, time window, sample rate, capture method, and available track context. That context includes the track's current fader, pan, mute/solo state and available FX/routing information; the project tempo map is looked up at each point on the analysis timeline. A separate rendered master is analyzed in the same request. A track render and the master answer different questions, so neither is used as a substitute for the other.
+
+The report contains measurements at several time scales:
+
+| Analysis | What it reports | How to interpret it |
+|---|---|---|
+| Level and dynamics | Sample peak, a 4× oversampled true-peak estimate, RMS, crest factor, integrated LUFS, loudness range when the section is long enough, clipped-sample counts, and DC offset. | These describe measured signal level and change over time. The true-peak value is an estimate, not a broadcast-compliance certificate. Short sections may not support a stable loudness-range estimate; coverage notes say when a value is missing or limited. |
+| Frequency and tonal features | Average and time-varying levels in 28 one-third-octave-style bands centered from 25 Hz to 12.5 kHz (subject to the signal's Nyquist limit); spectral centroid, spread, flatness and roll-off; pitch-class/chroma distribution and an exploratory major/minor-template fit; and local fundamental-pitch and harmonicity estimates where the signal supports them. | These are signal features, not instrument labels or a guaranteed key transcription. Distorted, layered or polyphonic material can make pitch and tonal-center estimates ambiguous. |
+| Time-local profile | A feature tape at roughly 100 ms intervals, including level, band energy, spectral change, attack/decay descriptors, pitch-related features, and stereo width, left/right energy balance and correlation where applicable. | Each cell is evidence about that section of audio, with timestamps on the project timeline. It is not a classification of the playing technique or musical role. |
+| Events and transients | Short-window onset, level-spike and clipping candidates, plus spectral-flux transient candidates with low/mid/high-band strength and confidence. | These are candidate event locations derived from signal changes. They are not guaranteed beat labels, note boundaries or instructions to cut. |
+| Tempo | The exact effective project tempo/time-signature context from REAPER's tempo map, attached along the timeline, plus a separate local BPM estimate derived from onset periodicity with confidence and plausible metrical alternatives. | The project map is the session's tempo authority. The audio estimate is independent evidence: dense attacks can represent beats or subdivisions, so a half/double-time ambiguity is reported rather than silently treated as certainty. |
+| Stereo and phase | Stereo correlation, side/mid level, mono fold-down level change, and—when requested for selected track pairs—cross-spectral coherence/phase, correlation, relative delay and summed-power change. | These indicate relationships between signals. A low correlation or fold-down change alone does not prove an audible fault or say whether the width is intentional. Pairwise phase analysis is opt-in. |
+
+Additional per-source values include modulation rate and depth, a pitch-jitter estimate, transient density, onset/spike/clipping event counts, and a coarse 500–4000 Hz energy ratio. The last value is explicitly a speech-band proxy; it is not a standards-based Speech Intelligibility Index or an intelligibility score. Every metric carries units and coverage/availability notes where the input duration, channel layout or signal quality limits the calculation.
+
+The time tape also carries low/mid/high and ERB-like band energies, zero-crossing rate, harmonic-partial and band-decay estimates, and a derived “wall” descriptor. “Wall” is a library heuristic combining mid-band energy share and spectral flatness, not a standardized acoustic metric. Cross-source “masking” evidence is likewise a relative band-level dominance heuristic, not a psychoacoustic masking model.
+
+#### Calculation path
+
+The core pass is deterministic signal processing in Python, using NumPy and SciPy. Integrated LUFS and loudness-range measurements use pyloudnorm; the optional ISO 532 partial-loudness model uses phonometry. Librosa is an optional research dependency, not part of the default analysis path. Spectral summaries use Hann-windowed short-time Fourier transforms (4096-sample windows, 1024-sample hops by default). Power is calculated per channel and averaged, rather than summing left and right waveforms first, so an anti-phase stereo signal cannot disappear from the spectrum. Each time-local cell is calculated on an approximately 100 ms step and includes band levels and signal descriptors.
+
+Two event detectors provide complementary evidence. A short-window envelope detector scans peak levels in 4 ms windows every 2 ms for onsets, spikes and clipped samples; it also records local RMS and event shape. A separate transient detector measures positive spectral-energy change in low, mid and high bands and ranks peaks against a robust local baseline. Local BPM candidates are then derived from the timing periodicity of onset events in rolling eight-second windows; this is not a general-purpose beat tracker and it does not replace REAPER's project tempo map.
+
+The default bundle also compares each track's measurements numerically with the rendered master and reports cross-source band-level relationships over aligned time cells. These are deltas and relative level evidence, not an overall mix score or a verdict that one source is masking another. Explicit source-to-source all-pairs comparisons, phase-pair analysis, reference-file comparisons, and ISO-model partial-loudness attribution are available when requested; pairwise and partial-loudness work is not silently enabled for every project.
+
+Optional partial-loudness attribution estimates how each aligned stem contributes to a modeled loudness of the mix, using an ISO 532 model and an assumed calibration reference. It is not an acoustic SPL measurement, does not prove masking, and does not reproduce nonlinear processing in a bus or master chain. Reference comparisons report metric deltas and, for multiple references, a median and median absolute deviation; they do not automatically declare a target mix.
+
+The analysis is DSP-based: it measures levels, spectra, envelopes, periodicity and stereo relationships. It does not run an instrument-recognition model, identify a guitar or drum part by genre, judge whether a mix is good, or prescribe EQ, panning, compression or mastering targets. Any edit decision must combine these measurements with the actual audio, the project state and the user's stated goal. In dense or heavily distorted metal, transient and pitch candidates need particular care: fast attacks, cymbals, distortion and layered performances can confuse simple signal features.
+
+The MCP result returns a compact per-source summary and URIs for the detailed report and captured audio. A source row contains its GUID, name, master-track flag, fader, pan, mute state, capture metadata, summary metrics and audio URI; the full report adds track context, time curves, event candidates, coverage, comparisons and provenance. In outline, the model sees a revisioned project summary and a list of records shaped like this:
+
+~~~json
+{
+  "source_guid": "track-guid",
+  "name": "Bass",
+  "is_master": false,
+  "volume": 0.8,
+  "pan": 0.0,
+  "mute": false,
+  "capture": {"method": "native_reaper_offline_render", "time_window": {}},
+  "metrics": {"peak_dbfs": {"value": -6.2, "unit": "dBFS"}},
+  "audio_uri": "reaper://analyses/.../audio/track-guid"
+}
+~~~
+
+The actual report also carries project tempo at each timeline cell, FX/routing context, and links to the complete curves and event list. For the model to literally listen to a captured source, its MCP host must fetch the audio resource and pass it through an audio-capable model path; exposing an audio URI alone does not guarantee that every MCP client will deliver sound to the model. That end-to-end audio handoff remains a validation item.
+
 ### LLM-facing interface
 
 The MCP server currently exposes a compact set of **12 tools** and **5 resource templates**. It does not publish one tool per ReaScript function. The model can inspect project context, browse capability domains, search an operation by structured object/operation qualifiers, request integrated analysis, prepare and apply supported edit batches, and call lower-level API functions or Actions when needed.
