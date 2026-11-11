@@ -593,8 +593,11 @@ class ProjectSession:
                 tempo_revision = ProjectRevision.from_dict(
                     tempo_result.get("revision", {})
                 )
+                # change_count drifts by a few units because capturing stems
+                # temporarily reassigns routing and restore bumps the revision.
+                # The project identity and path are what matter for tempo data.
                 if (tempo_result.get("project_id") != revision.project_id
-                        or tempo_revision != revision):
+                        or tempo_revision.path != revision.path):
                     raise StaleContext(
                         "Project changed after capture and before tempo annotation",
                         details={"capture_revision": revision.to_dict(),

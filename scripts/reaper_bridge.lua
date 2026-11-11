@@ -1164,7 +1164,8 @@ end
 local function validate_track_values(values)
   local allowed = { name = true, volume = true, pan = true, mute = true,
                     record_arm = true, record_mode = true,
-                    record_mode_flags = true, main_send = true }
+                    record_mode_flags = true, main_send = true,
+                    selected = true }
   require_object_values(values, allowed)
   for key, value in pairs(values) do
     if key == "name" then
@@ -1198,7 +1199,8 @@ end
 local function validate_item_values(values)
   local allowed = { position_s = true, length_s = true, mute = true,
                     stretch_ratio = true, preserve_pitch = true,
-                    stretch_markers = true }
+                    stretch_markers = true, beat_attachmode = true,
+                    auto_stretch = true }
   require_object_values(values, allowed)
   if values.position_s ~= nil and not finite_number(values.position_s) then
     fail("validation_error", "item position_s must be finite")
@@ -1236,6 +1238,14 @@ local function validate_item_values(values)
       end
       previous = marker.position_s
     end
+  end
+  if values.beat_attachmode ~= nil and
+     (not finite_number(values.beat_attachmode) or values.beat_attachmode % 1 ~= 0 or
+      values.beat_attachmode < -1 or values.beat_attachmode > 2) then
+    fail("validation_error", "item beat_attachmode must be an integer from -1 to 2")
+  end
+  if values.auto_stretch ~= nil and type(values.auto_stretch) ~= "boolean" then
+    fail("validation_error", "item auto_stretch must be a boolean")
   end
 end
 
@@ -1783,6 +1793,7 @@ local function read_edit_state(project, operation)
                      main_send = "B_MAINSEND" }
     for key in pairs(values) do
       if key == "name" then state.name = get_track_name(target)
+      elseif key == "selected" then state.selected = reaper.IsTrackSelected(target)
       elseif key == "mute" or key == "record_arm" or key == "main_send" then
         state[key] = reaper.GetMediaTrackInfo_Value(target, fields[key]) ~= 0
       else
@@ -1790,7 +1801,8 @@ local function read_edit_state(project, operation)
       end
     end
   elseif kind == "item.set" then
-    local fields = { position_s = "D_POSITION", length_s = "D_LENGTH", mute = "B_MUTE" }
+    local fields = { position_s = "D_POSITION", length_s = "D_LENGTH", mute = "B_MUTE",
+                     beat_attachmode = "C_BEATATTACHMODE", auto_stretch = "C_AUTOSTRETCH" }
     local take = reaper.GetActiveTake(target)
     for key in pairs(values) do
       if key == "stretch_ratio" then
@@ -2163,13 +2175,16 @@ local function apply_edit(project, inspected)
           fail("transaction_apply_failed", "REAPER rejected the track name edit",
                { target_guid = operation.target_guid })
         end
+      elseif key == "selected" then
+        checked_call(reaper.SetTrackSelected, target, value == true)
       else
         local numeric = type(value) == "boolean" and (value and 1 or 0) or value
         checked_call(reaper.SetMediaTrackInfo_Value, target, fields[key], numeric)
       end
     end
   elseif kind == "item.set" then
-    local fields = { position_s = "D_POSITION", length_s = "D_LENGTH", mute = "B_MUTE" }
+    local fields = { position_s = "D_POSITION", length_s = "D_LENGTH", mute = "B_MUTE",
+                     beat_attachmode = "C_BEATATTACHMODE", auto_stretch = "C_AUTOSTRETCH" }
     local take = reaper.GetActiveTake(target)
     local stretch = values.stretch_ratio
     if stretch ~= nil then

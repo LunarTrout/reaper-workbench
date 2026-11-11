@@ -107,10 +107,15 @@ def test_mcp_surface_is_bounded_and_has_discovery_resources() -> None:
     names = {tool.name for tool in tools}
     uris = {resource.uri_template for resource in templates}
 
-    assert len(names) == 12
+    assert len(names) == 19
     assert {"reaper_capabilities", "reaper_api_search", "reaper_api_call",
             "reaper_project", "reaper_analyze", "reaper_edit",
-            "reaper_edit_map", "reaper_mix_evidence", "reaper_action"} <= names
+            "reaper_edit_map", "reaper_mix_evidence", "reaper_action",
+            "reaper_save", "reaper_release", "reaper_session",
+            "reaper_timeline_context", "reaper_spatial_status",
+            "reaper_spatial_analyze", "reaper_spatial_timeline",
+            "reaper_flamingo_status", "reaper_flamingo_describe",
+            "reaper_flamingo_ask"} == names
     assert "reaper://api/{name}" in uris
     assert "reaper://analyses/{analysis_id}/audio/{source_guid}" in uris
 
