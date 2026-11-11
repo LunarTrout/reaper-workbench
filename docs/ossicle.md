@@ -17,13 +17,13 @@ It replaced **MiDashengLM-Spatial** (see the last section for why).
 | Audio in | mono or stereo, any sample rate, any length; stereo goes through a `StereoAdapter` fed with 72 interaural level/phase cues per token |
 | Token rate | 12.5 audio tokens per second |
 | Local path | `<library>/work/models/ossicle-4b` |
-| Interpreter | `C:/Users/epicc/mcp/flstudio-mcp/.venv-midasheng` (Python 3.12, torch 2.6+cu124, transformers 5.x) |
+| Interpreter | `C:/Users/epicc/mcp/flstudio-mcp/.venv-ossicle` (Python 3.12, torch 2.6.0+cu124, torchaudio 2.6, transformers 5.22.2) |
 
 ## Files
 
 | File | Role |
 |---|---|
-| `scripts/fetch_ossicle.py` | parallel range download (the CDN throttles one connection to ~0.5 MB/s), manifest with size + sha256, resume, re-fetch on a checksum mismatch |
+| `scripts/fetch_model.py` | parallel range download (the CDN throttles one connection to ~0.5 MB/s), manifest with size + sha256, resume, re-fetch on a checksum mismatch. Defaults to this checkpoint; `--repo/--revision/--dest` fetch any other |
 | `src/reaper_audio/analysis/ossicle.py` | backend: weight verification, GPU gate, stereo loading, measured facts, worker call, `compare()` |
 | `scripts/ossicle_worker.py` | one model load per call, N questions, hard GPU assertions, fp16 on V100 |
 | `scripts/spatial_acceptance.py` | known-scene harness: hard left / right / centre / three sources, each with swapped L-R |
@@ -118,4 +118,32 @@ Conclusion: use it for orientation and element identification on real material, 
 the only judge of a tonal change — its brightness/level comparisons can invert, and its
 confidence does not track its accuracy. `scripts/spatial_calibration.py` measures each axis
 before anything is trusted.
+
+### Pairwise questions are position bias, not judgement
+
+`scripts/spatial_calibration.py --run-model` builds three variants per axis (brightness by
+high shelf, width by side gain, level by dB, distance by wet ratio), presents all three pairs
+with the order shuffled, and scores the answer against the variant that carries more of the
+axis. Result on a 12 s excerpt of the project master (fp16, shuffled order):
+
+| Axis | Accuracy | What it actually said |
+|---|---|---|
+| brightness | 2/3 — but "Audio 1" in 3/3 pairs | constant |
+| width | 0/3 | "Audio 1" in 3/3 |
+| level | 1/3 | "Audio 1" in 3/3 |
+| distance | 1/3 | "Audio 2" in 3/3 |
+
+Decisive check: the **same file** as Audio 1 and as Audio 2. Answer: "Audio 1 is louder
+overall … a heavier, more distorted bass guitar" and "Audio 1 has more energy in the high
+frequencies" — a confident comparison of two identical signals, with invented reasoning.
+
+Rules that follow:
+
+* **Never ask "which of the two is more X".** The answer is decided by slot order, not audio.
+* Compare two clips by asking about each one separately, then compare the *measured facts*
+  (`stereo_facts`) and your own numbers — not the model's words.
+* Descriptive questions about one clip (what is there, who masks whom, where things sit,
+  what would you change) are not affected by this bias.
+* Any claim in a report must be paired with the measurement it is supposed to explain.
+
 

@@ -140,20 +140,49 @@ def main() -> None:
         print("\nstage 1 only: variants built and measured, no model run")
         return
 
-    # One model load for every pair: analyse() takes a job list, each job carries both clips.
+    # One model load for every pair: analyse() takes a job list, each job carries both
+    # clips. Presentation order is shuffled per pair, otherwise a model that always
+    # answers "Audio 1" (or always "Audio 2") scores 100% without discriminating
+    # anything - which is exactly what the first run of this harness showed.
+    import random
     from reaper_audio.analysis import ossicle as ms
+    rng = random.Random(1234)
     jobs, keys = [], []
     for axis, paths in variants.items():
         for i, j in ((0, 1), (1, 2), (0, 2)):
-            jobs.append({"wav": str(paths[i]), "wav2": str(paths[j]),
-                         "question": QUESTIONS[axis]})
-            keys.append((axis, i, j))
+            swapped = rng.random() < 0.5
+            a, b = (paths[j], paths[i]) if swapped else (paths[i], paths[j])
+            jobs.append({"wav": str(a), "wav2": str(b), "question": QUESTIONS[axis]})
+            keys.append((axis, i, j, swapped))
     reply = ms.analyze(jobs)
     results: dict[str, dict] = {}
-    for (axis, i, j), row in zip(keys, reply["answers"]):
+    for (axis, i, j, swapped), row in zip(keys, reply["answers"]):
         results.setdefault(axis, {"pairs": [], "measured": facts[axis]})
-        results[axis]["pairs"].append({"pair": [i, j], "text": row["text"],
-                                      "seconds": row["seconds"]})
+        results[axis]["pairs"].append({"pair": [i, j], "presented": "swapped" if swapped else "in order",
+                                      "text": row["text"], "seconds": row["seconds"]})
+    # Score every pair against the axis direction that was built into the variants:
+    # index 1 carries more of the axis than index 0, index 2 more than index 1.
+    for axis, block in results.items():
+        if not isinstance(block, dict) or "pairs" not in block:
+            continue
+        hits, scored, said_one, said_two = 0, 0, 0, 0
+        for row in block["pairs"]:
+            i, j = row["pair"]
+            expected = "audio 1" if row["presented"] == "swapped" else "audio 2"
+            text = row["text"].lower()
+            first = min([(text.find(t), t) for t in ("audio 1", "audio 2") if text.find(t) >= 0],
+                        default=(None, None))[1]
+            if first is None:
+                row["verdict"] = "no choice named"
+                continue
+            said_one += first == "audio 1"
+            said_two += first == "audio 2"
+            scored += 1
+            row["expected"] = expected
+            row["verdict"] = "hit" if first == expected else "miss"
+            hits += row["verdict"] == "hit"
+        block["accuracy"] = f"{hits}/{scored}" if scored else "0/0"
+        block["said"] = {"audio 1": said_one, "audio 2": said_two}
     results["runtime"] = reply["runtime"]
     results["gpu"] = reply["gpu"]
     out = OUT / "calibration.json"

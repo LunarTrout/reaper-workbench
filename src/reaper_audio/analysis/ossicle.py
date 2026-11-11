@@ -40,7 +40,7 @@ MANIFEST = MODEL_DIR / "manifest.json"
 WORKER = Path(__file__).resolve().parents[3] / "scripts" / "ossicle_worker.py"
 PYTHON = os.environ.get(
     "OSSICLE_PYTHON",
-    r"C:/Users/epicc/mcp/flstudio-mcp/.venv-midasheng/Scripts/python.exe")
+    r"C:/Users/epicc/mcp/flstudio-mcp/.venv-ossicle/Scripts/python.exe")
 SR = 16000
 MIN_S = 1.0
 MAX_S = 120.0        # beyond this the model streams pieces and stops using stereo cues
