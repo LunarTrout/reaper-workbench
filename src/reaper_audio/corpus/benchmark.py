@@ -50,7 +50,9 @@ def run_benchmark(
         x, sr = _load(p, max_seconds)
         ws = list(windows(x, sr, window_s))
         feats = np.stack([measure_signal(w, sr).values for w in ws]) if ws else np.empty((0, len(FEATURE_NAMES)))
-        loaded.append({"path": str(p), "sr": sr, "windows": ws, "features": feats})
+        group = Path(p).stem.split("_")[0]
+        loaded.append({"path": str(p), "group": group, "sr": sr, "windows": ws,
+                       "features": feats})
 
     results: dict[str, dict] = {}
     for deg in DEGRADATIONS:
@@ -58,7 +60,8 @@ def run_benchmark(
             continue
         wins, margins, ratios, orig_d, deg_d = 0, [], [], [], []
         for i, item in enumerate(loaded):
-            others = [o["features"] for j, o in enumerate(loaded) if j != i and len(o["features"])]
+            others = [o["features"] for o in loaded
+                      if o["group"] != item["group"] and len(o["features"])]
             if not others:
                 continue
             model = CorpusModel.fit(np.vstack(others), FEATURE_NAMES)
@@ -88,7 +91,8 @@ def run_benchmark(
     # compared with the production degradations, and its sign is meaningless.
     per_track = []
     for i, item in enumerate(loaded):
-        others = [o["features"] for j, o in enumerate(loaded) if j != i and len(o["features"])]
+        others = [o["features"] for o in loaded
+                  if o["group"] != item["group"] and len(o["features"])]
         if not others:
             continue
         model = CorpusModel.fit(np.vstack(others), FEATURE_NAMES)
@@ -106,6 +110,7 @@ def run_benchmark(
             "window_s": window_s,
             "max_seconds": max_seconds,
             "excerpts": len(loaded),
+            "groups": len({item["group"] for item in loaded}),
             "features": list(FEATURE_NAMES),
         },
         "degradations": results,
