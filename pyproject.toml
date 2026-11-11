@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reaper-workbench"
+version = "0.2.0"
+description = "REAPER Workbench: native project control and audio analysis for Python and MCP clients"
+readme = "README.md"
+requires-python = ">=3.13"
+keywords = [
+  "reaper",
+  "reaper-workbench",
+  "reascript",
+  "reaper-control",
+  "reaper-mcp",
+  "daw-automation",
+  "audio-analysis",
+  "audio-measurement",
+  "mixing",
+  "ai-music-production",
+]
+
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Win32 (MS Windows)",
+  "Intended Audience :: Developers",
+  "Topic :: Multimedia :: Sound/Audio :: Analysis",
+  "Topic :: Multimedia :: Sound/Audio :: Editors",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+  "numpy>=1.26",
+  "scipy>=1.11",
+  "soundfile>=0.12",
+  "pyloudnorm>=0.1",
+  "phonometry>=3,<4",
+]
+
+[project.urls]
+Homepage = "https://github.com/LunarTrout/reaper-workbench"
+Repository = "https://github.com/LunarTrout/reaper-workbench"
+Issues = "https://github.com/LunarTrout/reaper-workbench/issues"
+
+[project.optional-dependencies]
+perceptual = ["pystoi>=0.4"]
+research = ["librosa>=0.10"]
+mcp = ["mcp>=2.0,<3"]
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"reaper_audio.reaper" = ["api_catalog.json"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
