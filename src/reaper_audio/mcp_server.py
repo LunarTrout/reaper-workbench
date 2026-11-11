@@ -1172,6 +1172,438 @@ def analysis_audio_resource(analysis_id: str, source_guid: str) -> bytes:
     return _analysis_artifact_path(record, source_guid).read_bytes()
 
 
+@server.tool()
+@_guard
+def reaper_flamingo_status() -> dict[str, Any]:
+    """Report whether Music Flamingo can run here: GPU, model files, llama.cpp binary."""
+    from .analysis import flamingo as fl
+    st = fl.gpu_status()
+    return {
+        "ok": bool(st.get("ok")),
+        "gpu": st,
+        "cuda": fl.cuda_devices(),
+        "model": {"path": str(fl.MODEL_FILE), "exists": fl.MODEL_FILE.exists()},
+        "mmproj": {"path": str(fl.MMPROJ_FILE), "exists": fl.MMPROJ_FILE.exists()},
+        "binary": {"name": fl.LLAMA_BIN,
+                   "resolved": fl.llama_binary()},
+        "windows": {"window_s": fl.WINDOW_S, "max_total_s": fl.MAX_TOTAL_S},
+    }
+
+
+def _api_call(ctx, name, values):
+    return reaper_api_call(name=name, values=values,
+                           project_id=ctx["revision"]["project_id"],
+                           expected_revision=ctx["revision"])["returns"]
+
+
+def _track_send_destinations(ctx, track_guid):
+    """Destination GUIDs of a track's normal sends (routing, not names)."""
+    ref = {"$reaper_ref": {"kind": "MediaTrack", "guid": track_guid}}
+    count = _api_call(ctx, "GetTrackNumSends", [ref, 0])[0]
+    out = []
+    for index in range(int(count)):
+        dest = _api_call(ctx, "GetTrackSendInfo_Value", [ref, 0, index, "P_DESTTRACK"])[0]
+        guid = _api_call(ctx, "GetTrackGUID", [dest])[0]
+        out.append(guid)
+    return out
+
+
+def _render_isolated_track(session, ctx, key, start_s, end_s):
+    """Render one track alone, decided by actual routing.
+
+    A track is kept audible together with every track it feeds (transitively), so a
+    bus or a folder parent is never muted out from under the target. Every other track
+    is muted, then the exact pre-existing mute/solo state is restored and verified.
+    """
+    tracks = ctx["tracks"]
+    target = next((t for t in tracks if t["name"] == key or t["guid"] == key), None)
+    if target is None:
+        raise ValidationError("unknown track", details={"key": key,
+                                                        "tracks": [t["name"] for t in tracks]})
+
+    by_guid = {t["guid"]: t for t in tracks}
+    keep = {target["guid"]}
+    frontier = [target["guid"]]
+    seen = set()
+    while frontier:
+        guid = frontier.pop()
+        if guid in seen:
+            continue
+        seen.add(guid)
+        for dest in _track_send_destinations(ctx, guid):
+            if dest in by_guid and dest not in keep:
+                keep.add(dest)
+                frontier.append(dest)
+
+    mute_ops, mute_restore = [], []
+    solo_ops, solo_restore = [], []
+    snapshot = {}
+    for t in tracks:
+        snapshot[t["guid"]] = {"mute": bool(t.get("mute")), "solo": int(t.get("solo") or 0)}
+        want_mute = t["guid"] not in keep
+        if bool(t.get("mute")) != want_mute:
+            mute_ops.append({"kind": "track.set", "target_guid": t["guid"],
+                             "values": {"mute": want_mute}})
+        mute_restore.append({"kind": "track.set", "target_guid": t["guid"],
+                             "values": {"mute": snapshot[t["guid"]]["mute"]}})
+        if int(t.get("solo") or 0) != 0:
+            solo_ops.append({"kind": "track.set", "target_guid": t["guid"],
+                             "values": {"solo": 0}})
+            solo_restore.append({"kind": "track.set", "target_guid": t["guid"],
+                                 "values": {"solo": snapshot[t["guid"]]["solo"]}})
+
+    def apply(ops, reason):
+        if not ops:
+            return
+        ctx_now = session.snapshot(include_fx_params=False)
+        prev = reaper_edit(mode="preview", project_id=ctx_now["revision"]["project_id"],
+                           expected_revision=ctx_now["revision"], operations=ops, reason=reason)
+        if not prev.get("ok", True):
+            raise ValidationError(f"{reason} failed", details=prev)
+        reaper_edit(mode="apply", project_id=ctx_now["revision"]["project_id"],
+                    expected_revision=ctx_now["revision"],
+                    plan_id=prev["plan"]["plan_id"], reason=reason)
+
+    apply(solo_ops, "clear solo for isolation")
+    apply(mute_ops, "temporary track isolation")
+    try:
+        fresh = session.snapshot(include_fx_params=False)
+        return _flamingo_render(session, fresh, start_s, end_s), target
+    finally:
+        apply(mute_restore + solo_restore, "restore mute/solo after isolation")
+        check = session.snapshot(include_fx_params=False)
+        drifted = []
+        for t in check["tracks"]:
+            was = snapshot.get(t["guid"])
+            if was is None:
+                continue
+            if bool(t.get("mute")) != was["mute"] or int(t.get("solo") or 0) != was["solo"]:
+                drifted.append(t["name"])
+        if drifted:
+            from .analysis.flamingo import FlamingoError
+            raise FlamingoError("ISOLATION_RESTORE_FAILED",
+                                "mute/solo state did not return to its original values",
+                                {"tracks": drifted})
+
+
+def _flamingo_render(session, ctx, start_s, end_s):
+    import tempfile
+    from pathlib import Path
+    tmp = tempfile.mkdtemp(prefix="flamingo-render-")
+    session.bridge.capture_render(expected_revision=ctx["revision"], output_dir=tmp,
+                                  job_id="flamingo", expected_track_count=ctx["track_count"],
+                                  timeout_s=1800.0,
+                                  section_start_s=start_s, section_end_s=end_s,
+                                  master_only=True)
+    wavs = sorted([p for p in Path(tmp).glob("*.wav")], key=lambda p: p.stat().st_mtime)
+    return wavs[-1]
+
+
+def _project_summary(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Compact, explicit project state bound to the analysed audio."""
+    tracks = []
+    for t in ctx.get("tracks", []):
+        tracks.append({
+            "index": t.get("index"), "name": t.get("name"),
+            "volume": t.get("volume"), "pan": t.get("pan"),
+            "mute": bool(t.get("mute")), "solo": t.get("solo"),
+            "sends": t.get("sends"), "receives": t.get("receives"),
+            "fx": [f.get("name") for f in (t.get("fx") or [])],
+            "item_count": len(t.get("items") or []),
+        })
+    master = ctx.get("master") or {}
+    return {"name": ctx.get("name"), "path": ctx.get("path"),
+            "revision": ctx.get("revision"), "tempo": ctx.get("tempo"),
+            "track_count": ctx.get("track_count"), "tracks": tracks,
+            "master_fx": [f.get("name") for f in (master.get("fx") or [])]}
+
+
+@server.tool()
+@_guard
+def reaper_flamingo_describe(target: str = "master",
+                             start_s: float | None = None,
+                             end_s: float | None = None,
+                             representations: list[str] | None = None,
+                             reference_path: str | None = None,
+                             prompt: str | None = None,
+                             project_id: str | None = None,
+                             bridge_session_id: str | None = None) -> dict[str, Any]:
+    """Describe audio with Music Flamingo (GPU only).
+
+    target: "master" renders the project master through its FX; "file:<path>" uses an
+    existing audio file (for example a reference). The model hears one mono 16 kHz
+    signal per run; L/R/Mid/Side are separate labelled runs and stereo facts come from
+    the DSP measurements, not from the model.
+    """
+    import shutil
+    from .analysis import flamingo as fl
+    fl.require_gpu()          # fail fast: never render or touch the project without a GPU
+    if (start_s is None) != (end_s is None):
+        raise ValidationError("start_s and end_s must be supplied together")
+    if target.startswith("file:"):
+        path = target[5:]
+        report = fl.describe(path, prompt=prompt, start_s=start_s or 0.0, end_s=end_s,
+                             representations=representations,
+                             reference_path=reference_path)
+        return {"ok": True, "report": report}
+    if target != "master" and not target.startswith("track:"):
+        raise ValidationError("target must be 'master', 'track:<name|guid>' or 'file:<path>'")
+    session = _session(project_id, bridge_session_id)
+    ctx = session.snapshot(include_fx_params=False)
+
+    if target.startswith("track:"):
+        wav, tinfo = _render_isolated_track(session, ctx, target[6:], start_s, end_s)
+        try:
+            dsp = fl.quick_dsp(wav)
+            report = fl.describe(wav, prompt=prompt, start_s=0.0, end_s=None,
+                                 representations=representations,
+                                 reference_path=reference_path)
+        finally:
+            shutil.rmtree(wav.parent, ignore_errors=True)
+        report["target"] = {"track": tinfo.get("name"), "guid": tinfo.get("guid"),
+                            "volume": tinfo.get("volume"), "pan": tinfo.get("pan"),
+                            "fx": [f.get("name") for f in (tinfo.get("fx") or [])]}
+        report["dsp"] = dsp
+        report["project"] = {"name": ctx.get("name"), "path": ctx.get("path"),
+                             "revision": ctx.get("revision"), "tempo": ctx.get("tempo")}
+        report["note"] = ("Track rendered alone by temporarily muting the rest; mutes were "
+                          "restored immediately. " + report.get("note", ""))
+        return {"ok": True, "report": report}
+
+    wav = _flamingo_render(session, ctx, start_s, end_s)
+    try:
+        dsp = fl.quick_dsp(wav)
+        report = fl.describe(wav, prompt=prompt, start_s=0.0, end_s=None,
+                             representations=representations,
+                             reference_path=reference_path)
+    finally:
+        shutil.rmtree(wav.parent, ignore_errors=True)
+    report["target"] = "master"
+    report["dsp"] = dsp
+    report["project"] = {"name": ctx.get("name"), "path": ctx.get("path"),
+                         "revision": ctx.get("revision"), "tempo": ctx.get("tempo")}
+    report["project_context"] = _project_summary(ctx)
+    report["note"] = ("Temporary render removed after analysis; the project was not modified. "
+                      + report.get("note", ""))
+    return {"ok": True, "report": report}
+
+
+@server.tool()
+@_guard
+def reaper_flamingo_ask(question: str,
+                        target: str = "master",
+                        start_s: float | None = None,
+                        end_s: float | None = None,
+                        representations: list[str] | None = None,
+                        reference_path: str | None = None,
+                        project_id: str | None = None,
+                        bridge_session_id: str | None = None) -> dict[str, Any]:
+    """Ask Music Flamingo a free-form question about the master or a file, optionally bounded."""
+    if not isinstance(question, str) or not question.strip():
+        raise ValidationError("question must be a non-empty string")
+    return reaper_flamingo_describe(target=target, start_s=start_s, end_s=end_s,
+                                    representations=representations,
+                                    reference_path=reference_path,
+                                    prompt=question.strip(),
+                                    project_id=project_id,
+                                    bridge_session_id=bridge_session_id)
+
+
+@server.tool()
+@_guard
+def reaper_spatial_status() -> dict[str, Any]:
+    """Ossicle-4B backend: weights, revision, licence, interpreter and GPU.
+
+    Reports whether every file of the checkpoint matches its pinned size/sha256, whether
+    the model interpreter sees a Tesla V100, and whether its transformers knows the
+    qwen3_5 text model this checkpoint needs. Nothing is loaded or executed here.
+    """
+    from .analysis import ossicle as ms
+    return ms.status()
+
+
+@server.tool()
+@_guard
+def reaper_spatial_analyze(question: str | None = None,
+                           target: str = "master",
+                           start_s: float | None = None,
+                           end_s: float | None = None,
+                           allow_mono: bool = False,
+                           quantize: str = "none",
+                           with_timeline: bool = True,
+                           project_id: str | None = None,
+                           bridge_session_id: str | None = None) -> dict[str, Any]:
+    """Ask Ossicle-4B about the real L/R channels of a stereo source (GPU only).
+
+    target: "master" renders the master through its FX as stereo; "track:<name>" renders
+    that track alone (its pan and level included); "file:<path>" uses a stereo file.
+    The two channels are fed as a genuine (2, T) binaural signal - never summed, never
+    concatenated. Mono sources are refused unless allow_mono is set, and a mono render
+    carries no directional information even then. Sections are capped at 120 s: past that
+    the model streams the clip and stops using its stereo adapter.
+
+    quantize: "none" keeps fp16 weights (9.9 GB), "int4" uses the checkpoint's own
+    group-wise 4-bit layers (3.6 GB) - useful when a long section needs the VRAM.
+    """
+    import shutil
+    from .analysis import ossicle as ms
+    ms.require_gpu()          # fail fast: no render, no project touch without a GPU
+    question = (question or ms.DEFAULT_QUESTION).strip()
+    if (start_s is None) != (end_s is None):
+        raise ValidationError("start_s and end_s must be supplied together")
+
+    if target.startswith("file:"):
+        result = ms.analyze([{"wav": target[5:], "question": question.strip(),
+                              "start_s": start_s or 0.0, "end_s": end_s,
+                              "allow_mono": bool(allow_mono)}], quantize=quantize)
+        return {"ok": True, "report": result}
+
+    if target != "master" and not target.startswith("track:"):
+        raise ValidationError("target must be 'master', 'track:<name|guid>' or 'file:<path>'")
+    session = _session(project_id, bridge_session_id)
+    ctx = session.snapshot(include_fx_params=False)
+    timeline_text = None
+    if with_timeline:
+        from .analysis import timeline_context as tc
+        items, markers = _timeline_items_markers(ctx, start_s, end_s)
+        timeline_text = tc.build(ctx, start_s, end_s, items=items, markers=markers)
+        question = timeline_text + "\n\nQUESTION: " + question.strip()
+    meta: dict[str, Any] = {"target": target}
+    if target.startswith("track:"):
+        wav, tinfo = _render_isolated_track(session, ctx, target[6:], start_s, end_s)
+        meta["track"] = {"name": tinfo.get("name"), "guid": tinfo.get("guid"),
+                         "volume": tinfo.get("volume"), "pan": tinfo.get("pan"),
+                         "fx": [f.get("name") for f in (tinfo.get("fx") or [])]}
+    else:
+        wav = _flamingo_render(session, ctx, start_s, end_s)
+    try:
+        result = ms.analyze([{"wav": str(wav), "question": question.strip(),
+                              "start_s": 0.0, "end_s": None,
+                              "allow_mono": bool(allow_mono)}], quantize=quantize)
+    finally:
+        shutil.rmtree(wav.parent, ignore_errors=True)
+    result["target"] = meta
+    result["project"] = {"name": ctx.get("name"), "path": ctx.get("path"),
+                         "revision": ctx.get("revision"), "tempo": ctx.get("tempo")}
+    result["timeline_context"] = timeline_text
+    result["note"] = ("Temporary stereo render removed after analysis; the project was not "
+                      "modified. Spatial answers are model statements, not measurements: "
+                      "compare them with the pan/level values above.")
+    return {"ok": True, "report": result}
+
+
+@server.tool()
+@_guard
+def reaper_spatial_timeline(target: str = "master",
+                            start_s: float | None = None,
+                            end_s: float | None = None,
+                            window_s: float = 30.0,
+                            hop_s: float | None = None,
+                            project_id: str | None = None,
+                            bridge_session_id: str | None = None) -> dict[str, Any]:
+    """Measured width/balance profile across the timeline (no model, no GPU).
+
+    Stereo only: renders the master (or a track, or a file) and reports per-window RMS,
+    balance, correlation, side/mid and per-band correlation. This is the measured half
+    of "what happens over time"; a spatial-model caption can be compared against it later.
+    """
+    import shutil
+    from .analysis import spatial_timeline as st
+    if target.startswith("file:"):
+        return {"ok": True, "report": st.timeline(target[5:], window_s=window_s,
+                                                  hop_s=hop_s, start_s=start_s or 0.0,
+                                                  end_s=end_s)}
+    if target != "master" and not target.startswith("track:"):
+        raise ValidationError("target must be 'master', 'track:<name|guid>' or 'file:<path>'")
+    session = _session(project_id, bridge_session_id)
+    ctx = session.snapshot(include_fx_params=False)
+    if target.startswith("track:"):
+        wav, tinfo = _render_isolated_track(session, ctx, target[6:], start_s, end_s)
+    else:
+        wav = _flamingo_render(session, ctx, start_s, end_s)
+        tinfo = None
+    try:
+        report = st.timeline(wav, window_s=window_s, hop_s=hop_s)
+    finally:
+        shutil.rmtree(wav.parent, ignore_errors=True)
+    report["target"] = {"kind": "track", "track": tinfo.get("name")} if tinfo else "master"
+    report["project"] = {"name": ctx.get("name"), "revision": ctx.get("revision")}
+    report["note"] = ("Measured from a temporary stereo render that was deleted afterwards; "
+                      "the project was not modified. " + report.get("note", ""))
+    return {"ok": True, "report": report}
+
+
+def _timeline_items_markers(ctx: dict[str, Any], start_s: float | None,
+                            end_s: float | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Items overlapping the range and project markers, straight from the bridge."""
+    proj = {"$reaper_ref": {"kind": "ReaProject", "guid": ctx["revision"]["project_id"]}}
+    items: list[dict[str, Any]] = []
+    for t in ctx.get("tracks", []):
+        try:
+            handle = reaper_api_call(name="GetTrack", values=[proj, t["index"]],
+                                     project_id=ctx["revision"]["project_id"],
+                                     expected_revision=ctx["revision"])["returns"][0]
+            count = int(reaper_api_call(name="CountTrackMediaItems", values=[handle],
+                                        project_id=ctx["revision"]["project_id"],
+                                        expected_revision=ctx["revision"])["returns"][0])
+        except Exception:                       # noqa: BLE001
+            continue
+        for i in range(min(count, 20)):
+            try:
+                item = reaper_api_call(name="GetTrackMediaItem", values=[handle, i],
+                                       project_id=ctx["revision"]["project_id"],
+                                       expected_revision=ctx["revision"])["returns"][0]
+                pos = float(reaper_api_call(name="GetMediaItemInfo_Value",
+                                            values=[item, "D_POSITION"],
+                                            project_id=ctx["revision"]["project_id"],
+                                            expected_revision=ctx["revision"])["returns"][0])
+                length = float(reaper_api_call(name="GetMediaItemInfo_Value",
+                                               values=[item, "D_LENGTH"],
+                                               project_id=ctx["revision"]["project_id"],
+                                               expected_revision=ctx["revision"])["returns"][0])
+            except Exception:                   # noqa: BLE001
+                continue
+            if start_s is not None and (pos >= end_s or pos + length <= start_s):
+                continue
+            items.append({"track": t["name"], "start": round(pos, 2),
+                          "end": round(pos + length, 2)})
+    markers: list[dict[str, Any]] = []
+    try:
+        total = int(reaper_api_call(name="CountProjectMarkers", values=[proj],
+                                    project_id=ctx["revision"]["project_id"],
+                                    expected_revision=ctx["revision"])["returns"][0])
+        for i in range(min(total, 20)):
+            row = reaper_api_call(name="EnumProjectMarkers3", values=[proj, i],
+                                  project_id=ctx["revision"]["project_id"],
+                                  expected_revision=ctx["revision"])["returns"]
+            if isinstance(row, list) and len(row) >= 5:
+                markers.append({"time_s": float(row[2]), "name": row[4]})
+    except Exception:                           # noqa: BLE001
+        pass
+    return items, markers
+
+
+@server.tool()
+@_guard
+def reaper_timeline_context(start_s: float | None = None,
+                            end_s: float | None = None,
+                            project_id: str | None = None,
+                            bridge_session_id: str | None = None) -> dict[str, Any]:
+    """Arrangement context as text: tempo map, bar numbers, items, markers, pan/level.
+
+    This is the "timeline" that can be handed to an audio model together with the request.
+    No model and no GPU are involved; it only reads the open project.
+    """
+    from .analysis import timeline_context as tc
+    session = _session(project_id, bridge_session_id)
+    ctx = session.snapshot(include_fx_params=False)
+    items, markers = _timeline_items_markers(ctx, start_s, end_s)
+    text = tc.build(ctx, start_s, end_s, items=items, markers=markers)
+    return {"ok": True, "context": text,
+            "project": {"name": ctx.get("name"), "revision": ctx.get("revision")},
+            "counts": {"items": len(items), "markers": len(markers)}}
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=os.environ.get("REAPER_AUDIO_LOG_LEVEL", "WARNING"))
     server.run(transport="stdio")

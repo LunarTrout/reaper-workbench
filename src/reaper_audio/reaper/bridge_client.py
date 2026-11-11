@@ -271,7 +271,14 @@ class ReaperBridge:
         response: dict | None = None
         for _ in range(200):
             try:
-                response = json.loads(response_path.read_text(encoding="utf-8"))
+                raw = response_path.read_bytes()
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    # The resident ReaScript writes JSON in the local code page;
+                    # non-ASCII track/plugin names corrupt it for a UTF-8 reader.
+                    text = raw.decode("cp1251", errors="replace")
+                response = json.loads(text)
                 break
             except (PermissionError, FileNotFoundError, json.JSONDecodeError,
                     OSError) as exc:
