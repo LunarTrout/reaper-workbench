@@ -2228,6 +2228,10 @@ local function apply_edit(project, inspected)
   elseif kind == "fx.insert" then
     local index = reaper.TrackFX_AddByName(target, values.name, false,
                                            values.position or -1)
+    if (not finite_number(index) or index < 0) and values.position == nil then
+      -- A cold VST cache can miss on the first lookup; one retry costs nothing.
+      index = reaper.TrackFX_AddByName(target, values.name, false, -1)
+    end
     if not finite_number(index) or index < 0 then
       fail("transaction_apply_failed", "REAPER could not insert the FX",
            { name = values.name })
@@ -2719,15 +2723,21 @@ local function transaction_apply(arguments)
     else
       local after_failure = project_identity(project, path)
       if after_failure.change_count ~= current.change_count then
+        local detail = type(failure) == "table" and
+                       (failure.message or failure.code or "table error") or
+                       tostring(failure)
         fail("transaction_rollback_failed", "The edit failed and no matching undo record was available",
-             { plan_id = plan.plan_id, reason = tostring(failure),
+             { plan_id = plan.plan_id, reason = detail,
                undo_description = last_undo, revision = after_failure })
       end
     end
     if type(failure) == "table" and failure.bridge_error then
       fail(failure.code, failure.message, failure.details)
     end
-    fail("transaction_apply_failed", tostring(failure), { plan_id = plan.plan_id })
+    local detail = type(failure) == "table" and
+                   (failure.message or failure.code or "table error") or
+                   tostring(failure)
+    fail("transaction_apply_failed", detail, { plan_id = plan.plan_id })
   end
 
   local after = outcome.after
