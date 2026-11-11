@@ -195,9 +195,14 @@ PYTHONPATH=src $PY scripts/corpus_benchmark.py \
   --corpus C:/Users/epicc/Desktop/PROJECTS/vers1/_refs/corpus_ex \
   --out work/corpus_benchmark.json
 
-# сквозной цикл (нужен открытый REAPER с бриджем; проект-черновик)
+# отчёт по файлу: расстояние, перцентиль, вклад признаков, гейты
+PYTHONPATH=src $PY scripts/corpus_assess.py --corpus work/corpus_tracks   --audio work/preview_full_master.wav
+
+# измеренный цикл EQ на треке открытого проекта (по имени или GUID)
+PYTHONPATH=src $PY scripts/eq_cycle.py --features work/corpus_features.npz   --track "EQ CYCLE" --end 30 --out work/cycle
+
+# сквозной смоук API (создание трека/айтема/FX, undo)
 PYTHONPATH=src $PY work/e2e_api.py
-PYTHONPATH=src $PY work/eq_cycle.py
 ```
 
 REAPER запускается как обычно; `__startup.lua` поднимает мост. MCP-сервер для
