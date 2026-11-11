@@ -20,14 +20,21 @@ from reaper_audio.corpus.report import assess_file, corpus_matrix_from_dir  # no
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--corpus", required=True)
+    ap.add_argument("--corpus")
+    ap.add_argument("--features", help="cached .npz matrix (x) instead of --corpus")
     ap.add_argument("--audio", required=True)
     ap.add_argument("--out")
     ap.add_argument("--window", type=float, default=10.0)
     ap.add_argument("--policy", help="JSON file with gate thresholds")
     args = ap.parse_args()
 
-    matrix = corpus_matrix_from_dir(args.corpus, window_s=args.window)
+    if args.features:
+        import numpy as np
+        matrix = np.load(args.features)["x"]
+    elif args.corpus:
+        matrix = corpus_matrix_from_dir(args.corpus, window_s=args.window)
+    else:
+        ap.error("either --corpus or --features is required")
     model = CorpusModel.fit(matrix, FEATURE_NAMES)
     policy = json.loads(Path(args.policy).read_text()) if args.policy else {}
     report = assess_file(model, matrix, args.audio, policy=policy)
