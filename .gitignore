@@ -1,0 +1,48 @@
+# Python build and test output
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+*.log
+htmlcov/
+build/
+dist/
+
+# Local Python environments and credentials
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Local REAPER projects, renders, and validation profiles
+/work/
+# Local research and parity notes are not part of the public product docs.
+/docs/AI-INTERFACE.ru.md
+/docs/ANALYSIS-DEPENDENCIES.ru.md
+/docs/FEATURE-PARITY.ru.md
+/docs/FLCTRL-PARITY.ru.md
+/docs/INTELLIGENT-WORKFLOW.ru.md
+/docs/REAPER-MCP-AUDIT.ru.md
+/docs/STATUS.ru.md
+# Superseded bridge snapshot kept locally for comparison.
+/scripts/reaper_bridge.full.lua
+*.RPP
+*.RPP-bak
+*.RPP-UNDO
+*.wav
+*.wave
+*.flac
+*.aiff
+*.aif
+*.mp3
+
+# Platform/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
