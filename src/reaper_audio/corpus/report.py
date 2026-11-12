@@ -67,9 +67,21 @@ def assess_file(model: CorpusModel, matrix: np.ndarray, path: str | Path, *,
 
 
 def corpus_matrix_from_dir(directory: str | Path, *, window_s: float = 10.0,
-                           max_seconds: float | None = None) -> np.ndarray:
+                           max_seconds: float | None = None,
+                           manifest=None, stage: str | None = None) -> np.ndarray:
+    """Measure every excerpt in a directory.
+
+    When a manifest and a stage are given, only excerpts whose manifest entry
+    has that stage are used: a distance over masters and rough mixes at once is
+    an average of two different targets, not a target.
+    """
+    allowed = None
+    if manifest is not None and stage is not None:
+        allowed = {Path(e.file).name for e in manifest.by_stage(stage)}
     rows = []
     for path in sorted(Path(directory).glob("*.wav")):
+        if allowed is not None and path.name not in allowed:
+            continue
         info = sf.info(str(path))
         frames = info.frames if max_seconds is None else min(info.frames,
                                                              int(max_seconds * info.samplerate))

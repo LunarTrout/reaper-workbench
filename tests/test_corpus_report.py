@@ -39,6 +39,21 @@ def test_policy_violation_is_reported():
     assert "clipping" in result.violations
 
 
+def test_stage_filter_uses_manifest(tmp_path):
+    import soundfile as sf
+    from reaper_audio.corpus.manifest import Entry, Manifest
+    rng = np.random.default_rng(8)
+    for i in range(3):
+        sf.write(str(tmp_path / f"t{i}.wav"), rng.normal(0, 0.05, (32000 * 2, 2)), 32000)
+    manifest = Manifest([
+        Entry(file="t0.wav", source="t0", stage="master"),
+        Entry(file="t1.wav", source="t1", stage="master"),
+        Entry(file="t2.wav", source="t2", stage="mix"),
+    ])
+    masters = corpus_matrix_from_dir(tmp_path, window_s=1.0, manifest=manifest, stage="master")
+    assert masters.shape[0] == 4
+
+
 def test_corpus_matrix_from_dir(tmp_path):
     import soundfile as sf
     rng = np.random.default_rng(7)

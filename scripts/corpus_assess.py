@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from reaper_audio.corpus.measure import FEATURE_NAMES  # noqa: E402
 from reaper_audio.corpus.model import CorpusModel  # noqa: E402
+from reaper_audio.corpus.manifest import Manifest  # noqa: E402
 from reaper_audio.corpus.report import assess_file, corpus_matrix_from_dir  # noqa: E402
 
 
@@ -26,13 +27,17 @@ def main() -> int:
     ap.add_argument("--out")
     ap.add_argument("--window", type=float, default=10.0)
     ap.add_argument("--policy", help="JSON file with gate thresholds")
+    ap.add_argument("--manifest", help="manifest JSON with stage/source facts")
+    ap.add_argument("--stage", help="use only entries with this stage")
     args = ap.parse_args()
 
     if args.features:
         import numpy as np
         matrix = np.load(args.features)["x"]
     elif args.corpus:
-        matrix = corpus_matrix_from_dir(args.corpus, window_s=args.window)
+        manifest = Manifest.load(args.manifest) if args.manifest else None
+        matrix = corpus_matrix_from_dir(args.corpus, window_s=args.window,
+                                        manifest=manifest, stage=args.stage)
     else:
         ap.error("either --corpus or --features is required")
     model = CorpusModel.fit(matrix, FEATURE_NAMES)
