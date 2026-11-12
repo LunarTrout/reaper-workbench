@@ -16,7 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from reaper_audio.corpus.measure import FEATURE_NAMES  # noqa: E402
 from reaper_audio.corpus.model import CorpusModel  # noqa: E402
 from reaper_audio.corpus.manifest import Manifest  # noqa: E402
-from reaper_audio.corpus.report import assess_file, corpus_matrix_from_dir  # noqa: E402
+from reaper_audio.corpus.report import (assess_file, corpus_matrix_from_dir,  # noqa: E402
+                                        distance_timeline)
 
 
 def main() -> int:
@@ -29,6 +30,8 @@ def main() -> int:
     ap.add_argument("--policy", help="JSON file with gate thresholds")
     ap.add_argument("--manifest", help="manifest JSON with stage/source facts")
     ap.add_argument("--stage", help="use only entries with this stage")
+    ap.add_argument("--timeline", type=float, metavar="WINDOW_S",
+                    help="also print the distance timeline with this window")
     args = ap.parse_args()
 
     if args.features:
@@ -53,6 +56,16 @@ def main() -> int:
         print(f"  {name:<22} z {z:+.2f}  share {share:+.2f}")
     print("gates:", {k: round(v, 3) for k, v in report.gates.items()})
     print("violations:", report.violations or "none")
+    if args.timeline:
+        import soundfile as sf
+        info = sf.info(args.audio)
+        audio, sr = sf.read(args.audio, dtype="float64", always_2d=True)
+        timeline = distance_timeline(model, matrix, audio, sr, window_s=args.timeline)
+        worst = sorted(timeline, key=lambda row: -row["distance"])[:5]
+        print("worst windows:")
+        for row in worst:
+            print(f"  {row['start_s']:6.1f}-{row['end_s']:6.1f}s  {row['distance']:6.2f}"
+                  f"  pct {row['percentile']:.2f}")
 
     if args.out:
         Path(args.out).write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
