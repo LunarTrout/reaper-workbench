@@ -48,6 +48,30 @@ def test_reconstruction_reports_a_bad_stem_set(tmp_path):
     assert result.residual_db > -12
 
 
+def test_silent_windows_are_skipped(tmp_path):
+    sr = 32000
+    silent_then_signal = np.zeros((sr * 4, 2))
+    silent_then_signal[sr:] = np.random.default_rng(3).normal(0, 0.05, (sr * 3, 2))
+    _write(tmp_path / "vocals.wav", silent_then_signal, sr)
+    matrix = role_matrix([tmp_path / "vocals.wav"], window_s=1.0)
+    assert matrix.shape[0] == 3
+
+
+def test_silent_signal_still_gives_finite_features():
+    from reaper_audio.corpus import measure_signal
+    values = measure_signal(np.zeros((32000, 2)), 32000).values
+    assert np.all(np.isfinite(values))
+
+
+def test_model_rejects_non_finite_matrix():
+    import pytest
+    from reaper_audio.corpus import CorpusModel
+    matrix = np.zeros((4, 3))
+    matrix[1, 1] = np.nan
+    with pytest.raises(ValueError):
+        CorpusModel.fit(matrix)
+
+
 def test_role_matrix_shape(tmp_path):
     sr = 32000
     _write(tmp_path / "drums.wav", np.random.default_rng(2).normal(0, 0.05, (sr * 5, 2)), sr)
