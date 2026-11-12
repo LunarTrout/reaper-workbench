@@ -111,12 +111,20 @@ def level_jumps(x: np.ndarray, sr: int, *, window_s: float = 1.0) -> dict[str, f
             "level_range_db": float(db.max() - db.min())}
 
 
+def true_peak(x: np.ndarray, sr: int) -> dict[str, float]:
+    """True peak as defined by BS.1770 Annex 2 (4x oversampling)."""
+    from phonometry.broadcast import program_loudness
+    data = x.T if x.ndim == 2 else x
+    return {"true_peak_dbtp": float(program_loudness(data, float(sr)).true_peak)}
+
+
 def gate_values(x: np.ndarray, sr: int) -> dict[str, float]:
     values: dict[str, float] = {}
     values.update(clipping(x))
     values.update(dc_offset(x))
     values.update(dropouts(x, sr))
     values.update(level_jumps(x, sr))
+    values.update(true_peak(x, sr))
     return values
 
 
@@ -132,6 +140,9 @@ def violations(values: dict[str, float], policy: dict[str, float]) -> tuple[str,
         out.append("dropout")
     if values.get("level_jump_db", 0.0) > policy.get("max_level_jump_db", float("inf")):
         out.append("level_jump")
+    if values.get("true_peak_dbtp", -float("inf")) > policy.get("max_true_peak_dbtp",
+                                                               float("inf")):
+        out.append("true_peak")
     return tuple(out)
 
 
