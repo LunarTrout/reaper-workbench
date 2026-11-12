@@ -66,6 +66,28 @@ def assess_file(model: CorpusModel, matrix: np.ndarray, path: str | Path, *,
     return assess(model, matrix, x, sr, policy=policy)
 
 
+def distance_timeline(model: CorpusModel, matrix: np.ndarray, x: np.ndarray, sr: int,
+                      *, window_s: float = 10.0) -> list[dict]:
+    """Distance per window: where along the track the mix leaves the corpus.
+
+    Sections are not labelled here; the timeline only says *where* the
+    deviation is, leaving the interpretation to the project map.
+    """
+    loo = model.loo_distances(matrix)
+    step = int(window_s * sr)
+    out = []
+    for start in range(0, x.shape[0] - step + 1, step):
+        values = measure_signal(x[start:start + step], sr).values
+        distance = float(model.distance(values)[0])
+        out.append({
+            "start_s": start / sr,
+            "end_s": (start + step) / sr,
+            "distance": distance,
+            "percentile": float(np.mean(loo <= distance)),
+        })
+    return out
+
+
 def corpus_matrix_from_dir(directory: str | Path, *, window_s: float = 10.0,
                            max_seconds: float | None = None,
                            manifest=None, stage: str | None = None) -> np.ndarray:

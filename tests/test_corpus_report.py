@@ -54,6 +54,18 @@ def test_stage_filter_uses_manifest(tmp_path):
     assert masters.shape[0] == 4
 
 
+def test_distance_timeline_covers_every_window():
+    import numpy as np
+    from reaper_audio.corpus.report import distance_timeline
+    matrix, model = _corpus()
+    rng = np.random.default_rng(9)
+    audio = rng.normal(0.0, 0.05, size=(32000 * 4, 2))
+    timeline = distance_timeline(model, matrix, audio, 32000, window_s=1.0)
+    assert len(timeline) == 4
+    assert all(0.0 <= row["percentile"] <= 1.0 for row in timeline)
+    assert timeline[0]["start_s"] == 0.0 and timeline[-1]["end_s"] == 4.0
+
+
 def test_corpus_matrix_from_dir(tmp_path):
     import soundfile as sf
     rng = np.random.default_rng(7)
