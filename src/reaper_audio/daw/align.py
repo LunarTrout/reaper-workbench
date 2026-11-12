@@ -119,6 +119,44 @@ def correlation(a: AudioBuffer, b: AudioBuffer) -> float:
     return float(np.sum(x * y) / denom) if denom > 0 else 0.0
 
 
+def align_group(reference: AudioBuffer, targets: dict[str, AudioBuffer], **kwargs) -> dict[str, Alignment]:
+    """Estimate one alignment per take, keyed by the caller's names."""
+    return {name: estimate_alignment(reference, target, **kwargs)
+            for name, target in targets.items()}
+
+
+def plan_group_alignment(session, *, moves: dict[str, int], sample_rate: int,
+                         reason: str):
+    """Plan item moves for several takes in one transaction.
+
+    ``moves`` maps item GUID to the estimated lag of that take; every take is
+    moved by ``-lag`` with a plain position change, so nothing is stretched.
+    """
+    from .session import EditOperation
+    context = session.snapshot(include_items=True)
+    positions = {item["guid"]: float(item["position_s"])
+                 for track in context["tracks"] for item in track.get("items", [])}
+    ops = []
+    for item_guid, lag in moves.items():
+        if not lag:
+            continue
+        if item_guid not in positions:
+            raise ValueError(f"item {item_guid} is not in the project")
+        position = positions[item_guid] - lag / float(sample_rate)
+        if position < 0:
+            # Sub-sample rounding can land a few microseconds below zero when
+            # the item already starts exactly at the alignment offset.
+            if position > -1.0 / sample_rate:
+                position = 0.0
+            else:
+                raise ValueError("a shift would move an item before the project start")
+        ops.append(EditOperation(kind="item.set", target_guid=item_guid,
+                                 values={"position_s": round(position, 6)}))
+    if not ops:
+        raise ValueError("no non-zero moves to apply")
+    return session.plan(ops, reason=reason)
+
+
 def item_alignment_plan(session, *, track_guid: str, item_guid: str,
                         lag_samples: int, sample_rate: int, reason: str):
     """Plan moving an item by ``-lag_samples`` without stretching it.
