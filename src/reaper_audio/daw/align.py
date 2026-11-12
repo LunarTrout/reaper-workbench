@@ -33,6 +33,9 @@ class Alignment:
     median_lag: int
     mad_samples: float
     median_correlation: float
+    slope_samples_per_s: float = 0.0
+    slope_stderr: float = 0.0
+    span_s: float = 0.0
 
     @property
     def lag_ms(self) -> float:
@@ -44,10 +47,31 @@ class Alignment:
             "median_lag_ms": self.lag_ms,
             "mad_samples": self.mad_samples,
             "median_correlation": self.median_correlation,
+            "slope_samples_per_s": self.slope_samples_per_s,
+            "slope_stderr": self.slope_stderr,
+            "span_s": self.span_s,
             "offsets": [{"time_s": o.time_s, "lag_samples": o.lag_samples,
                          "lag_ms": o.lag_ms, "correlation": o.correlation}
                         for o in self.offsets],
         }
+
+
+def _slope(times: np.ndarray, lags: np.ndarray) -> tuple[float, float]:
+    """Least-squares drift in samples per second, with its standard error.
+
+    A constant offset has slope 0; a take that slowly runs late or early has a
+    significant slope, and the median alone would hide exactly that.
+    """
+    n = times.size
+    if n < 3 or np.ptp(times) <= 0:
+        return 0.0, 0.0
+    design = np.stack([times, np.ones_like(times)], axis=1)
+    coef, *_ = np.linalg.lstsq(design, lags, rcond=None)
+    residual = lags - design @ coef
+    dof = max(n - 2, 1)
+    sigma2 = float(residual @ residual) / dof
+    cov = sigma2 * np.linalg.inv(design.T @ design)
+    return float(coef[0]), float(np.sqrt(max(cov[0, 0], 0.0)))
 
 
 def _mono(audio: AudioBuffer) -> np.ndarray:
@@ -90,12 +114,42 @@ def estimate_alignment(reference: AudioBuffer, target: AudioBuffer, *,
                               correlation=float(normalized[index])))
     if not offsets:
         return Alignment(offsets=(), median_lag=0, mad_samples=0.0, median_correlation=0.0)
-    lags = np.array([o.lag_samples for o in offsets])
+    lags = np.array([o.lag_samples for o in offsets], dtype=float)
+    times = np.array([o.time_s for o in offsets], dtype=float)
     median = int(np.median(lags))
     mad = float(np.median(np.abs(lags - median)))
     corr = float(np.median([o.correlation for o in offsets]))
+    slope, stderr = _slope(times, lags)
     return Alignment(offsets=tuple(offsets), median_lag=median, mad_samples=mad,
-                     median_correlation=corr)
+                     median_correlation=corr, slope_samples_per_s=slope,
+                     slope_stderr=stderr, span_s=float(times.max() - times.min()))
+
+
+def segment_offsets(result: Alignment, *, segment_s: float) -> list[dict]:
+    """Group attack offsets into time segments.
+
+    A single median hides drift; this shows, per segment, how far the take is
+    from the reference.  No stretching is implied — the caller decides whether
+    to move items or to leave a performance that genuinely varies alone.
+    """
+    if segment_s <= 0:
+        raise ValueError("segment_s must be positive")
+    buckets: dict[int, list[Offset]] = {}
+    for offset in result.offsets:
+        buckets.setdefault(int(offset.time_s // segment_s), []).append(offset)
+    out = []
+    for index in sorted(buckets):
+        items = buckets[index]
+        lags = [o.lag_samples for o in items]
+        out.append({
+            "start_s": index * segment_s,
+            "end_s": (index + 1) * segment_s,
+            "onsets": len(items),
+            "median_lag_samples": int(np.median(lags)),
+            "mad_samples": float(np.median(np.abs(np.array(lags) - np.median(lags)))),
+            "median_correlation": float(np.median([o.correlation for o in items])),
+        })
+    return out
 
 
 def apply_offset(audio: AudioBuffer, lag_samples: int) -> AudioBuffer:
@@ -180,13 +234,32 @@ def item_alignment_plan(session, *, track_guid: str, item_guid: str,
                         reason=reason)
 
 
-def alignment_report(reference: AudioBuffer, target: AudioBuffer, **kwargs) -> dict:
-    """Estimate, apply, and report the correlation before and after."""
+def alignment_report(reference: AudioBuffer, target: AudioBuffer, *,
+                     policy: dict | None = None, **kwargs) -> dict:
+    """Measure offsets and report them; never classify without a policy.
+
+    The report always contains the slope with its standard error, the per-onset
+    offsets, the per-segment offsets, and the correlation of the global shift.
+    Whether a slope means "drifting" and whether a correlation is too low to
+    trust is a project setting: pass ``policy`` with
+    ``alignment.max_slope_sigma`` and ``alignment.min_correlation`` to obtain
+    an ``action`` field.  Without a policy no decision is made here.
+    """
     result = estimate_alignment(reference, target, **kwargs)
     before = correlation(reference, target)
-    aligned = apply_offset(target, result.median_lag)
-    after = correlation(reference, aligned)
+    shifted = apply_offset(target, result.median_lag)
+    after = correlation(reference, shifted)
     report = result.to_dict()
-    report.update({"correlation_before": before, "correlation_after": after,
-                   "improved": after >= before})
+    report["segments"] = segment_offsets(result, segment_s=max(result.span_s / 4.0, 0.5))
+    report["correlation_before"] = before
+    report["correlation_after_global_shift"] = after
+    if policy:
+        sigma = policy.get("alignment.max_slope_sigma")
+        min_corr = policy.get("alignment.min_correlation")
+        drifting = (sigma is not None and result.slope_stderr > 0.0 and
+                    abs(result.slope_samples_per_s) > float(sigma) * result.slope_stderr)
+        unreliable = (min_corr is not None and
+                      result.median_correlation < float(min_corr))
+        report["action"] = ("refuse" if unreliable else
+                            "per_segment" if drifting else "global_shift")
     return report
