@@ -62,6 +62,27 @@ def _fake_bands():
     }
 
 
+class _NoSession:
+    def plan(self, *args, **kwargs):
+        raise AssertionError("plan must not be reached with an invalid value")
+
+
+def test_non_finite_calibration_is_rejected_before_any_write():
+    from reaper_audio.daw.eq import apply_moves
+    from reaper_audio.errors import ValidationError
+    nan = float("nan")
+    calibration = {
+        "band 2": {
+            "freq": Calibration(3, [(0.0, 100.0), (1.0, 100.0)], log_y=True),
+            "gain": Calibration(4, [(0.0, 0.0), (1.0, nan)], log_y=False),
+        }
+    }
+    with pytest.raises(ValidationError):
+        apply_moves(_NoSession(), "track", "fx", calibration,
+                    [{"band": "band 2", "freq_hz": 100.0, "gain_db": 3.0}],
+                    reason="test")
+
+
 def test_plan_moves_skips_shelves_and_filters():
     # plan_moves reads frequencies from calibration values; give it real ones.
     cal = {
