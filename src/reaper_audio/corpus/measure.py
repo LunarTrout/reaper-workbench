@@ -179,7 +179,12 @@ def measure_signal(x: np.ndarray, sr: int) -> Measurement:
 
     loud_stereo = _loudness(x, sr)
     loud_mono = _loudness(_to_mono(x), sr)
-    mono_loss = float(loud_mono.integrated - loud_stereo.integrated)
+    # A silent stem has no loudness at all (-inf); the width loss is undefined,
+    # not enormous.  Keep the feature finite and let the caller skip silence.
+    if np.isfinite(loud_mono.integrated) and np.isfinite(loud_stereo.integrated):
+        mono_loss = float(loud_mono.integrated - loud_stereo.integrated)
+    else:
+        mono_loss = 0.0
 
     coarse: list[float] = []
     for lo, hi in COARSE_BANDS:

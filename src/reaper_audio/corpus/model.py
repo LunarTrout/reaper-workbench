@@ -38,6 +38,10 @@ class CorpusModel:
             raise ValueError("matrix must be (n_samples, n_features)")
         if x.shape[0] < 2:
             raise ValueError("need at least two references to estimate a scale")
+        if not np.all(np.isfinite(x)):
+            bad = [name for name, ok in zip(names or (), np.all(np.isfinite(x), axis=0))
+                   if not ok]
+            raise ValueError(f"corpus matrix contains non-finite values: {bad or 'unnamed'}")
         center = np.median(x, axis=0)
         scale = MAD_TO_SIGMA * np.median(np.abs(x - center), axis=0)
         # A feature that does not vary inside the corpus carries no distance

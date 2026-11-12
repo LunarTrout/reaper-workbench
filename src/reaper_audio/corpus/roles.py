@@ -78,7 +78,10 @@ def role_matrix(paths: list[Path], *, window_s: float = 10.0,
             x = x[: int(max_seconds * sr)]
         step = int(window_s * sr)
         for start in range(0, x.shape[0] - step + 1, step):
-            rows.append(measure_signal(x[start:start + step], sr).values)
+            window = x[start:start + step]
+            if not np.any(window):
+                continue  # a stem that is silent here says nothing about production
+            rows.append(measure_signal(window, sr).values)
     if not rows:
         raise ValueError(f"no windows in {paths[:1]}")
     return np.stack(rows)
