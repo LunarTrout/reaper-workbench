@@ -50,6 +50,17 @@ def test_level_jump_is_detected():
     assert values["level_jump_db"] > 20.0
 
 
+def test_true_peak_gate_flags_hot_master():
+    sr = 48000
+    t = np.arange(sr, dtype=np.float64) / sr
+    hot = np.stack([0.99 * np.sin(2 * np.pi * 997 * t)] * 2, axis=1)
+    quiet = hot * 0.3
+    hot_result = check(hot, sr, {"max_true_peak_dbtp": -1.0})
+    quiet_result = check(quiet, sr, {"max_true_peak_dbtp": -1.0})
+    assert "true_peak" in hot_result.violations
+    assert "true_peak" not in quiet_result.violations
+
+
 def test_policy_turns_measurements_into_violations():
     x, sr = _music()
     clipped = np.clip(x * 8, -0.3, 0.3)
