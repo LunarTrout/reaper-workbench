@@ -41,10 +41,14 @@ def run_benchmark(
     window_s: float = 10.0,
     max_seconds: float = 60.0,
     include_invariant: bool = True,
+    only: list[str] | None = None,
+    limit_files: int | None = None,
 ) -> dict:
     if len(paths) < 3:
         raise ValueError("the leave-one-track-out protocol needs at least three excerpts")
 
+    if limit_files is not None:
+        paths = paths[:limit_files]
     loaded = []
     for p in paths:
         x, sr = _load(p, max_seconds)
@@ -56,6 +60,8 @@ def run_benchmark(
 
     results: dict[str, dict] = {}
     for deg in DEGRADATIONS:
+        if only is not None and deg.name not in only:
+            continue
         if deg.expect == "invariant" and not include_invariant:
             continue
         wins, margins, ratios, orig_d, deg_d = 0, [], [], [], []

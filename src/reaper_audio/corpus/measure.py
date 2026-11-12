@@ -105,6 +105,25 @@ def _onset_density(x: np.ndarray, sr: int) -> float:
     return float(peaks.sum() / seconds) if seconds > 0 else 0.0
 
 
+def _short_crest(x: np.ndarray, sr: int, *, frame_s: float = 0.1) -> tuple[float, float]:
+    """Crest distribution over short frames: p50 and p95, in dB.
+
+    A single crest value over ten seconds hides compression: the loud frames
+    lose their peaks while the quiet ones keep theirs.  The distribution is the
+    level-invariant description of that loss.
+    """
+    mono = _to_mono(x)
+    hop = max(1, int(sr * frame_s))
+    usable = (mono.shape[0] // hop) * hop
+    if usable < hop:
+        return (0.0, 0.0)
+    frames = mono[:usable].reshape(-1, hop)
+    peak = np.max(np.abs(frames), axis=1) + _EPS
+    rms = np.sqrt(np.mean(frames ** 2, axis=1)) + _EPS
+    crest = 20.0 * np.log10(peak / rms)
+    return (float(np.percentile(crest, 50)), float(np.percentile(crest, 95)))
+
+
 def _loudness(x: np.ndarray, sr: int):
     # phonometry follows the channel-first convention used by the standard.
     data = x.T if x.ndim == 2 else x
@@ -124,7 +143,7 @@ def feature_names() -> tuple[str, ...]:
     names += ["tilt", "side_mid", "correlation", "mono_loss_db"]
     for lo, hi in COARSE_BANDS:
         names += [f"sm_{int(lo)}_{int(hi)}", f"crest_{int(lo)}_{int(hi)}"]
-    names += ["onset_density"]
+    names += ["onset_density", "crest_short_p50", "crest_short_p95"]
     return tuple(names)
 
 
@@ -170,8 +189,10 @@ def measure_signal(x: np.ndarray, sr: int) -> Measurement:
 
     crests = [_band_crest(x, sr, lo, hi) for lo, hi in COARSE_BANDS]
     onset = _onset_density(x, sr)
+    short = _short_crest(x, sr)
 
-    values = np.concatenate([clr, [tilt, side_mid, correlation, mono_loss], coarse, crests, [onset]])
+    values = np.concatenate([clr, [tilt, side_mid, correlation, mono_loss], coarse,
+                             crests, [onset, short[0], short[1]]])
     extras = {
         "integrated_lufs": float(loud_stereo.integrated),
         "lra": float(getattr(loud_stereo, "loudness_range", float("nan"))),

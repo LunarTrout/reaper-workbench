@@ -24,6 +24,8 @@ def main() -> int:
     ap.add_argument("--out", default="work/corpus_benchmark.json")
     ap.add_argument("--window", type=float, default=10.0)
     ap.add_argument("--seconds", type=float, default=60.0)
+    ap.add_argument("--only", help="comma-separated degradation names")
+    ap.add_argument("--limit-files", type=int)
     args = ap.parse_args()
 
     paths = sorted(p for p in Path(args.corpus).iterdir() if p.suffix.lower() in AUDIO_SUFFIXES)
@@ -31,7 +33,9 @@ def main() -> int:
         print(f"need at least three excerpts, found {len(paths)}", file=sys.stderr)
         return 2
 
-    report = run_benchmark(paths, window_s=args.window, max_seconds=args.seconds)
+    only = [name.strip() for name in args.only.split(",")] if args.only else None
+    report = run_benchmark(paths, window_s=args.window, max_seconds=args.seconds,
+                           only=only, limit_files=args.limit_files)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
