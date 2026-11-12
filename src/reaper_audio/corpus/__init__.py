@@ -19,6 +19,7 @@ from .degrade import DEGRADATIONS, degrade
 from .benchmark import run_benchmark
 from .gates import check, gate_values
 from .manifest import Entry, Manifest
+from .roles import Reconstruction, discover, reconstruction, role_matrix, role_models
 from .report import Assessment, assess, assess_file, corpus_matrix_from_dir
 
 __all__ = [
@@ -33,6 +34,11 @@ __all__ = [
     "gate_values",
     "Entry",
     "Manifest",
+    "Reconstruction",
+    "discover",
+    "reconstruction",
+    "role_matrix",
+    "role_models",
     "Assessment",
     "assess",
     "assess_file",
