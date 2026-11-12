@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
+import pytest
+
 from reaper_audio.daw.align import (Alignment, align_group, apply_offset,
                                     alignment_report, correlation, estimate_alignment,
                                     plan_group_alignment)
@@ -100,8 +102,74 @@ def test_group_plan_rejects_moving_before_zero():
         plan_group_alignment(session, moves={"a": 4800}, sample_rate=48000, reason="test")
 
 
+def _saturated(x: AudioBuffer, delay: int, seed: int = 2) -> AudioBuffer:
+    """Same performance, different timbre and noise — a realistic double."""
+    rng = np.random.default_rng(seed)
+    y = np.tanh(x.samples * 3.0) * 0.5
+    y = y + 0.002 * rng.normal(size=y.shape)
+    y = np.roll(y, delay, axis=0)
+    if delay > 0:
+        y[:delay] = 0.0
+    return AudioBuffer(samples=y, sample_rate=x.sample_rate)
+
+
+def test_alignment_survives_a_different_timbre_and_noise():
+    reference = _clicks()
+    target = _saturated(reference, 64)
+    result = estimate_alignment(reference, target, search_ms=10)
+    assert abs(result.median_lag - 64) <= 3
+    assert abs(result.slope_samples_per_s) < 5.0
+
+
+def test_drift_is_reported_as_a_slope():
+    reference = _clicks()
+    samples = reference.samples.copy()
+    rate = 20.0  # samples per second
+    for start in range(0, samples.shape[0], int(0.25 * SR)):
+        block = samples[start:start + int(0.25 * SR)].copy()
+        shift = int(rate * (start / SR))
+        samples[start:start + block.shape[0]] = np.roll(block, shift, axis=0)
+    drifting = AudioBuffer(samples=samples, sample_rate=SR)
+    result = estimate_alignment(reference, drifting, search_ms=40)
+    assert result.slope_samples_per_s == pytest.approx(rate, rel=0.35)
+    assert result.slope_stderr < abs(result.slope_samples_per_s)
+
+
+def test_report_makes_no_decision_without_a_policy():
+    report = alignment_report(_clicks(), _saturated(_clicks(), 64), search_ms=10)
+    assert "action" not in report
+
+
+def test_policy_decides_between_shift_segments_and_refusal():
+    reference = _clicks()
+    shifted = alignment_report(reference, _saturated(reference, 64), search_ms=10,
+                               policy={"alignment.max_slope_sigma": 3.0,
+                                       "alignment.min_correlation": 0.8})
+    unrelated = alignment_report(reference, _clicks(delay=0, seed=99), search_ms=10,
+                                 policy={"alignment.min_correlation": 0.8})
+    assert shifted["action"] == "global_shift"
+    assert unrelated["action"] in ("global_shift", "refuse")
+
+
+def test_segment_offsets_show_where_the_take_drifts():
+    from reaper_audio.daw.align import segment_offsets
+    reference = _clicks()
+    samples = reference.samples.copy()
+    for start in range(0, samples.shape[0], int(0.5 * SR)):
+        shift = int(10 * start / SR)
+        block = samples[start:start + int(0.5 * SR)].copy()
+        samples[start:start + block.shape[0]] = np.roll(block, shift, axis=0)
+    drifting = AudioBuffer(samples=samples, sample_rate=SR)
+    result = estimate_alignment(reference, drifting, search_ms=40)
+    segments = segment_offsets(result, segment_s=0.5)
+    medians = [s["median_lag_samples"] for s in segments]
+    assert medians == sorted(medians)
+    assert medians[-1] > medians[0]
+    assert result.slope_samples_per_s > 0
+
+
 def test_report_contains_before_and_after():
     report = alignment_report(_clicks(), _clicks(delay=12), search_ms=10)
     assert set(report) >= {"median_lag_samples", "correlation_before",
-                           "correlation_after", "offsets"}
-    assert report["correlation_after"] >= report["correlation_before"]
+                           "correlation_after_global_shift", "offsets", "segments"}
+    assert report["correlation_after_global_shift"] >= report["correlation_before"]
