@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from ..corpus.gates import gate_values, violations
 from ..corpus.measure import BAND_CENTERS, measure_signal
 from ..corpus.model import CorpusModel
 from . import eq
@@ -33,6 +34,8 @@ class CycleResult:
     accepted: list[dict] = field(default_factory=list)
     rejected: list[dict] = field(default_factory=list)
     contributions: list[tuple[str, float, float]] = field(default_factory=list)
+    gate_values: dict = field(default_factory=dict)
+    gate_violations: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -69,7 +72,17 @@ def _render(session, output_dir: str | Path, job: str, start_s: float, end_s: fl
 
 def _measure(path: Path):
     x, sr = sf.read(str(path), dtype="float64", always_2d=True)
-    return measure_signal(x, sr)
+    return measure_signal(x, sr), gate_values(x, sr)
+
+
+def new_violations(before: dict, after: dict, policy: dict) -> tuple[str, ...]:
+    """Violations that the candidate introduced, under the project policy.
+
+    Distance rewards conformity: a degraded outlier can land closer to the
+    corpus than the clean one.  A candidate may therefore never add a gate
+    violation; the distance is only consulted among defect-free candidates.
+    """
+    return tuple(v for v in violations(after, policy) if v not in violations(before, policy))
 
 
 def _band_deltas(model: CorpusModel, values: np.ndarray) -> dict[float, float]:
@@ -104,7 +117,8 @@ def _calibrate_output_gain(session, track_guid: str, fx_guid: str):
 def run_eq_cycle(session, *, track_guid: str, model: CorpusModel,
                  output_dir: str | Path, section_start_s: float, section_end_s: float,
                  plugin: str = "VST: ReaEQ (Cockos)", eq_count: int = 2,
-                 max_moves: int | None = None) -> CycleResult:
+                 max_moves: int | None = None,
+                 policy: dict | None = None) -> CycleResult:
     """Run one measured EQ pass on a track and report the verdict.
 
     ``max_moves`` is a budget, not a method constant: the caller decides how
@@ -140,7 +154,8 @@ def run_eq_cycle(session, *, track_guid: str, model: CorpusModel,
                                        "normalized": gain.to_normalized(0.0)})],
                 reason="cycle: reset output gain"), dry_run=False)
 
-    before = _measure(_render(session, output_dir, "before", section_start_s, section_end_s))
+    before, before_gates = _measure(_render(session, output_dir, "before",
+                                            section_start_s, section_end_s))
     distance_before = float(model.distance(before.values)[0])
     ordered = sorted(_band_deltas(model, before.values).items(), key=lambda kv: -abs(kv[1]))
     if max_moves is not None:
@@ -162,9 +177,24 @@ def run_eq_cycle(session, *, track_guid: str, model: CorpusModel,
         for move in moves:
             eq.apply_moves(session, track_guid, fx_guid, calibration, [move],
                            reason="cycle: candidate", flatten=False)
-            probe = _measure(_render(session, output_dir, "probe",
-                                     section_start_s, section_end_s))
+            probe, probe_gates = _measure(_render(session, output_dir, "probe",
+                                                  section_start_s, section_end_s))
             distance = float(model.distance(probe.values)[0])
+            if policy:
+                introduced = new_violations(before_gates, probe_gates, policy)
+                if introduced:
+                    record = {"fx": fx_guid, "band": move["band"],
+                              "freq_hz": move["freq_hz"], "gain_db": move["gain_db"],
+                              "distance": distance, "violations": list(introduced)}
+                    rejected.append(record)
+                    gain = calibration[move["band"]]["gain"]
+                    session.apply(session.plan(
+                        [EditOperation(kind="fx.set_parameter", target_guid=track_guid,
+                                       values={"fx_guid": fx_guid,
+                                               "parameter_index": gain.index,
+                                               "normalized": gain.to_normalized(0.0)})],
+                        reason="cycle: revert defect"), dry_run=False)
+                    continue
             record = {"fx": fx_guid, "band": move["band"],
                       "freq_hz": move["freq_hz"], "gain_db": move["gain_db"],
                       "distance": distance}
@@ -182,7 +212,8 @@ def run_eq_cycle(session, *, track_guid: str, model: CorpusModel,
                 rejected.append(record)
         cursor += len(moves)
 
-    after = _measure(_render(session, output_dir, "after", section_start_s, section_end_s))
+    after, after_gates = _measure(_render(session, output_dir, "after",
+                                          section_start_s, section_end_s))
     distance_after = float(model.distance(after.values)[0])
 
     gain = _calibrate_output_gain(session, track_guid, fx_guids[0])
@@ -203,7 +234,8 @@ def run_eq_cycle(session, *, track_guid: str, model: CorpusModel,
                                        "parameter_index": gain.index,
                                        "normalized": mid})],
                 reason="cycle: loudness search"), dry_run=False)
-            probe = _measure(_render(session, output_dir, "gain", section_start_s, section_end_s))
+            probe, _ = _measure(_render(session, output_dir, "gain",
+                                        section_start_s, section_end_s))
             best = probe
             lufs = probe.extras["integrated_lufs"]
             if abs(lufs - target) <= 0.1:
@@ -225,4 +257,6 @@ def run_eq_cycle(session, *, track_guid: str, model: CorpusModel,
         accepted=accepted,
         rejected=rejected,
         contributions=contributions,
+        gate_values=after_gates,
+        gate_violations=violations(after_gates, policy or {}),
     )

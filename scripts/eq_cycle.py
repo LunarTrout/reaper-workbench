@@ -35,6 +35,7 @@ def main() -> int:
     ap.add_argument("--plugin", default="VST: ReaEQ (Cockos)")
     ap.add_argument("--eq-count", type=int, default=2)
     ap.add_argument("--max-moves", type=int, default=None)
+    ap.add_argument("--policy", help="JSON file with gate thresholds")
     args = ap.parse_args()
 
     if args.features:
@@ -59,7 +60,8 @@ def main() -> int:
     result = run_eq_cycle(session, track_guid=guid, model=model, output_dir=args.out,
                           section_start_s=args.start, section_end_s=args.end,
                           plugin=args.plugin, eq_count=args.eq_count,
-                          max_moves=args.max_moves)
+                          max_moves=args.max_moves,
+                          policy=json.loads(Path(args.policy).read_text()) if args.policy else None)
     print(f"before: {result.lufs_before:.2f} LUFS, distance {result.distance_before:.3f}")
     for move in result.accepted:
         print(f"  accepted {move['freq_hz']:.0f} Hz {move['gain_db']:+.1f} dB "
@@ -70,6 +72,8 @@ def main() -> int:
     print(f"after:  {result.lufs_after:.2f} LUFS, distance {result.distance_after:.3f} "
           f"(ratio {result.distance_after / result.distance_before:.3f})")
     print("remaining:", [(n, round(z, 2)) for n, z, _ in result.contributions[:5]])
+    if result.gate_violations:
+        print("gate violations:", result.gate_violations)
 
     out = Path(args.out) / "cycle.json"
     out.parent.mkdir(parents=True, exist_ok=True)
