@@ -119,6 +119,29 @@ def correlation(a: AudioBuffer, b: AudioBuffer) -> float:
     return float(np.sum(x * y) / denom) if denom > 0 else 0.0
 
 
+def item_alignment_plan(session, *, track_guid: str, item_guid: str,
+                        lag_samples: int, sample_rate: int, reason: str):
+    """Plan moving an item by ``-lag_samples`` without stretching it.
+
+    The item's own position is read from the live project; the edit is a plain
+    ``item.set position_s`` so the audio content is untouched.
+    """
+    from .session import EditOperation
+    context = session.snapshot(include_items=True)
+    track = next((t for t in context["tracks"] if t["guid"] == track_guid), None)
+    if track is None:
+        raise ValueError("track_guid is not in the project")
+    item = next((i for i in track.get("items", []) if i["guid"] == item_guid), None)
+    if item is None:
+        raise ValueError("item_guid is not on that track")
+    position = float(item["position_s"]) - lag_samples / float(sample_rate)
+    if position < 0:
+        raise ValueError("the shift would move the item before the project start")
+    return session.plan([EditOperation(kind="item.set", target_guid=item_guid,
+                                       values={"position_s": round(position, 6)})],
+                        reason=reason)
+
+
 def alignment_report(reference: AudioBuffer, target: AudioBuffer, **kwargs) -> dict:
     """Estimate, apply, and report the correlation before and after."""
     result = estimate_alignment(reference, target, **kwargs)
