@@ -32,6 +32,23 @@ The bridge and Python client communicate through local request and response file
 
 The catalog is a discovery surface, not a claim that every API function has been exercised or has a safe transaction wrapper. Generic API calls and Actions are low-level operations; they are not automatically covered by the library's preview/undo guarantees.
 
+### Reference-driven assessment and the measured cycle
+
+- `reaper_audio.corpus` measures excerpts against a reference corpus: standard
+  loudness (BS.1770-5 via `phonometry`), level-invariant production features,
+  a distance whose centre, scale and covariance are estimated from the corpus
+  at runtime, leave-one-source-out benchmarks, and defect gates (clipping with
+  flat tops, DC, drop-outs, level jumps, true peak).
+- `reaper_audio.daw.cycle` runs one measurable EQ pass: corpus deltas, one move
+  per render, accept only when the measured distance improves **and** no gate
+  violation is introduced, then loudness restoration found by bisection on the
+  rendered file.
+- Commands: `scripts/corpus_benchmark.py`, `scripts/corpus_assess.py`,
+  `scripts/role_assess.py`, `scripts/eq_cycle.py`.
+- Method and measured numbers: [ROADMAP](docs/ROADMAP.md); thresholds are a
+  project setting, not code: [POLICY](docs/POLICY.md); the measurement method
+  without a quality formula: [MIX-QUALITY-METHODOLOGY](docs/MIX-QUALITY-METHODOLOGY.ru.md).
+
 ### Audio analysis
 
 - Capture separate track render outputs and a separate master output through REAPER's offline render mechanism.
