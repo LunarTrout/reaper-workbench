@@ -202,6 +202,14 @@ def apply_moves(session, track_guid: str, fx_guid: str, calibration: dict[str, d
                 moves: list[dict], *, reason: str, flatten: bool = True) -> dict:
     from .session import EditOperation
     ops = []
+
+    def checked(value: float, band: str, kind: str) -> float:
+        if not math.isfinite(value) or value < 0.0 or value > 1.0:
+            raise ValidationError(
+                "EQ calibration produced a non-finite or out-of-range value",
+                details={"band": band, "kind": kind, "normalized": value})
+        return float(value)
+
     moved = {move["band"] for move in moves}
     # Start from a flat chain: any calibrated peaking/shelf band that is not
     # part of this move set is returned to 0 dB so runs do not accumulate.
@@ -218,8 +226,10 @@ def apply_moves(session, track_guid: str, fx_guid: str, calibration: dict[str, d
                                          "normalized": gain.to_normalized(0.0)}))
     for move in moves:
         band = calibration[move["band"]]
-        freq_norm = band["freq"].to_normalized(move["freq_hz"])
-        gain_norm = band["gain"].to_normalized(move["gain_db"])
+        freq_norm = checked(band["freq"].to_normalized(move["freq_hz"]),
+                            move["band"], "freq")
+        gain_norm = checked(band["gain"].to_normalized(move["gain_db"]),
+                            move["band"], "gain")
         ops.append(EditOperation(kind="fx.set_parameter", target_guid=track_guid,
                                  values={"fx_guid": fx_guid,
                                          "parameter_index": band["freq"].index,
