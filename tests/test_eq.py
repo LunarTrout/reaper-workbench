@@ -62,6 +62,16 @@ def _fake_bands():
     }
 
 
+def test_new_violations_only_reports_introduced_defects():
+    from reaper_audio.daw.cycle import new_violations
+    before = {"clip_runs": 0.0, "clip_flat_runs": 0.0, "true_peak_dbtp": -2.0,
+              "dc_max": 0.0, "silence_longest_s": 0.0, "level_jump_db": 0.0}
+    after = dict(before, clip_flat_runs=12.0)
+    policy = {"max_clip_runs": 0, "max_true_peak_dbtp": -1.0}
+    assert new_violations(before, after, policy) == ("clipping",)
+    assert new_violations(before, dict(before), policy) == ()
+
+
 class _NoSession:
     def plan(self, *args, **kwargs):
         raise AssertionError("plan must not be reached with an invalid value")
