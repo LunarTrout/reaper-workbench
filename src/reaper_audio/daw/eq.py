@@ -167,6 +167,25 @@ def calibrate(session, track_guid: str, fx_guid: str, *, samples: int = 5,
     return out
 
 
+def calibrate_parameter(session, track_guid: str, fx_guid: str, index: int,
+                        *, samples: int = 5, log_y: bool = False) -> Calibration:
+    """Calibrate one parameter by reading the plugin's own displayed values."""
+    original, _ = _read_value(session, track_guid, fx_guid, index)
+    grid = [i / (samples - 1) for i in range(samples)] if samples > 1 else [0.5]
+    points: list[tuple[float, float]] = []
+    for norm in grid:
+        _set(session, track_guid, fx_guid, index, norm)
+        _, formatted = _read_value(session, track_guid, fx_guid, index)
+        value = _parse_float(formatted)
+        if value is not None and math.isfinite(value):
+            points.append((norm, value))
+    _set(session, track_guid, fx_guid, index, original)
+    if len(points) < 2:
+        raise ValidationError("a parameter could not be calibrated",
+                              details={"index": index, "points": points})
+    return Calibration(index, sorted(points), log_y=log_y)
+
+
 def plan_moves(deltas: dict[float, float], calibration: dict[str, dict[str, Calibration]],
                *, max_bands: int) -> list[dict]:
     """Assign each requested band correction to the nearest free EQ band.
