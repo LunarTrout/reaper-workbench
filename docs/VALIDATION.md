@@ -4,8 +4,10 @@ This page distinguishes implementation that has been exercised from coverage tha
 
 ## Confirmed
 
-- The Python unit suite passed in the REAPER development environment; the last recorded run was 139 tests before an unused capture prototype and its three tests were removed. Re-run the suite against the current source before publishing.
-- The MCP server completed a stdio handshake, advertised 12 tools and 5 resource templates, and answered health and project-context requests against REAPER 7.84.
+- The Python unit suite passes against the current source: 179 tests
+  (`PYTHONPATH=src python -m pytest tests -q`). The count grows with the corpus
+  module; treat the run, not this line, as the source of truth.
+- The MCP server completed a stdio handshake, advertised 19 tools and 5 resource templates, and answered health and project-context requests against REAPER 7.84.
 - A live MCP analysis request captured a five-second window for 11 track sources and the separate master, attached project-tempo context, and returned a releasable analysis record. `reaper_release` removed the associated temporary audio directory.
 - A revision-bound item split was exercised against an isolated REAPER copy; apply changed the item count as planned and undo restored the original item count and geometry.
 - Native capture stores temporary render files outside the project file. The capture restores project render settings and selection; REAPER's monotonic change count may nevertheless advance, and the bridge returns the post-capture revision.

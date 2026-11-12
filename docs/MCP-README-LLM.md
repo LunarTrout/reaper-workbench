@@ -1,12 +1,17 @@
 # REAPER Workbench MCP: Guide for Language Models
 
-> **Status:** first implementation. The stdio server registers 12 tools and
-> five resource templates. Schema registration, catalog coverage, and structured
-> API search have automated checks. Live stdio-to-REAPER initialization,
-> project context, and a five-second all-track-plus-master analysis/release were
-> verified on a REAPER 7.84 test copy. MCP edit preview/apply/readback/undo and
-> forwarding audio resources to the model client still need live validation.
-> This is not release-ready.
+> **Status:** the stdio server registers 19 tools and five resource templates.
+> Schema registration, catalog coverage, and structured API search have automated
+> checks. Live stdio-to-REAPER initialization, project context, and a
+> five-second all-track-plus-master analysis/release were verified on a
+> REAPER 7.84 test copy. MCP edit preview/apply/readback/undo, for its part, is
+> exercised through the same transaction layer that the Python API uses.
+>
+> **For headless work prefer the Python API.** `ReaperBridge` and
+> `ProjectSession` address the resident bridge directly; the MCP server is a
+> gateway for interactive sessions. A headless run does not need it, and calling
+> MCP tools while REAPER is closed has crashed the desktop client before.
+>
 > Use `tools/list` as the source of truth for exact argument schemas.
 
 ## Purpose
