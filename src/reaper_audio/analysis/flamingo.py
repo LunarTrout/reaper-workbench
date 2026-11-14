@@ -26,12 +26,14 @@ import numpy as np
 
 from ..errors import ReaperAudioError
 
-MODEL_DIR = Path(os.environ.get("FLAMINGO_MODEL_DIR",
-                                r"C:/Users/epicc/Documents/Codex/model-store/music-flamingo-q5_1"))
+_LIB_ROOT = Path(__file__).resolve().parents[3]
+MODEL_DIR = Path(os.environ.get(
+    "FLAMINGO_MODEL_DIR") or _LIB_ROOT / "work" / "models" / "music-flamingo-q5_1")
 MODEL_FILE = MODEL_DIR / "music-flamingo-Q5_1.gguf"
 MMPROJ_FILE = MODEL_DIR / "mmproj-music-flamingo-bf16.gguf"
 LLAMA_BIN = os.environ.get("FLAMINGO_LLAMA_BIN", "llama-mtmd-cli")
-_LLAMA_FALLBACK_DIR = Path(r"C:/Users/epicc/tools/llama.cpp")
+_LLAMA_FALLBACK_DIR = Path(os.environ.get(
+    "FLAMINGO_LLAMA_DIR") or _LIB_ROOT / "work" / "tools" / "llama.cpp")
 WINDOW_S = 30.0
 MAX_TOTAL_S = 600.0          # documented ceiling; longer material is reported, not cut
 SR = 16000

@@ -52,7 +52,8 @@ def split_points(db: np.ndarray, sr: int, hop_s: float = 0.1) -> list[int]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--corpus", default="C:/Users/epicc/Desktop/PROJECTS/vers1/_refs/corpus")
+    ap.add_argument("--corpus", required=True,
+                    help="directory containing the source MP3 corpus")
     ap.add_argument("--out", default="work/corpus_tracks")
     args = ap.parse_args()
     out = Path(args.out)

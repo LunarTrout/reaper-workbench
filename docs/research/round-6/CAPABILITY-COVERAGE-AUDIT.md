@@ -101,7 +101,7 @@ session's “bus has 0 FX” statement is accurate.
 - `PYTHONPATH=src python -m pytest -q tests/test_panorama_lifecycle.py tests/test_mcp_server.py tests/test_capture_panorama.py` — 41 passed at that point.
 - `PYTHONPATH=src python -m pytest -q` — **897 passed, 2 skipped** after the
   lifecycle, idempotency and cross-archive base tests.
-- `PYTHONPATH=src <local-tooling>/flstudio-mcp/.venv313/Scripts/python.exe -m pytest -q`
+- `PYTHONPATH=src <path-to-library-venv-python> -m pytest -q`
   — **897 passed, 2 skipped** in the MCP server environment.
 - `hermes mcp test reaper-panorama` — connected, **29 tools discovered**,
   including `reaper_panorama_delta_ack`.

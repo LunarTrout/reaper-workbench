@@ -13,13 +13,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 
 SR = 16000
-OUT = Path(r"C:/Users/epicc/AppData/Local/hermes/cache/scratch/spatial_scenes")
+OUT = Path(os.environ.get(
+    "REAPER_WORKBENCH_SCENE_DIR") or
+    Path(__file__).resolve().parents[1] / "work" / "spatial_scenes")
 
 
 def tone(freq: float, seconds: float, amp: float = 0.5) -> np.ndarray:

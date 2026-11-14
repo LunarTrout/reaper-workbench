@@ -361,3 +361,132 @@ def test_overlap_timing_reports_only_measured_values() -> None:
     assert timing["analysis_render_overlap_s"] == 30.0
     assert timing["results_before_render_end"] == 0
     assert timing["renders_finished_before_analysis_end"] == 3
+
+# --------------------------------------------------------------------------- #
+# Mute restore after the capture's own isolation sweep (regression cover).
+# --------------------------------------------------------------------------- #
+_PROJECT_ID = "reaper:{TEST}:C:/fixtures/project.rpp"
+_PROJECT_PATH = "C:/fixtures/project.rpp"
+
+
+class _MuteSession:
+    """Session double whose counter moves while the capture isolates tracks."""
+
+    def __init__(self, *, change_count: int, mutes: dict[str, bool],
+                 project_id: str = _PROJECT_ID,
+                 snapshot_error: BaseException | None = None,
+                 omit: set[str] | None = None,
+                 drop_mute_field: str | None = None) -> None:
+        self.change_count = change_count
+        self.mutes = dict(mutes)
+        self.project_id = project_id
+        self.snapshot_error = snapshot_error
+        self.omit = omit or set()
+        self.drop_mute_field = drop_mute_field
+        self.snapshot_calls = 0
+        self.bridge: Any = None
+
+    def snapshot(self, **_kwargs: Any) -> dict[str, Any]:
+        self.snapshot_calls += 1
+        if self.snapshot_error is not None:
+            raise self.snapshot_error
+        tracks = []
+        for index, (guid, muted) in enumerate(self.mutes.items()):
+            if guid in self.omit:
+                continue
+            row: dict[str, Any] = {"guid": guid, "index": index, "name": f"t{index}"}
+            if guid != self.drop_mute_field:
+                row["mute"] = muted
+            tracks.append(row)
+        return {"revision": {"project_id": self.project_id,
+                             "change_count": self.change_count,
+                             "path": _PROJECT_PATH,
+                             "instance_id": "test", "epoch": 1,
+                             "epoch_basis": "bridge_session_project_generation"},
+                "tracks": tracks}
+
+
+class _MuteBridge:
+    """Bridge double: every mute write bumps the counter and is recorded."""
+
+    def __init__(self, session: _MuteSession) -> None:
+        self.session = session
+        self.handles: list[tuple[int, str]] = []
+        self.writes: list[tuple[str, float]] = []
+
+    def apply(self, stable_id: str, value: float) -> None:
+        self.session.mutes[stable_id] = bool(value)
+        self.session.change_count += 1
+
+    def call_api(self, name: str, handle: Any, field: str, value: float
+                 ) -> SimpleNamespace:
+        assert name == "SetMediaTrackInfo_Value"
+        assert field == "B_MUTE"
+        self.handles.append((handle.change_count, handle.stable_id))
+        self.writes.append((handle.stable_id, value))
+        self.apply(handle.stable_id, value)
+        return SimpleNamespace(project_after={
+            "project_id": self.session.project_id,
+            "change_count": self.session.change_count,
+            "path": _PROJECT_PATH,
+        })
+
+
+def _mute_service(tmp_path: Path, session: _MuteSession
+                  ) -> tuple[FullCaptureService, _MuteBridge]:
+    bridge = _MuteBridge(session)
+    session.bridge = bridge
+    service = FullCaptureService(session, tmp_path / "archive")  # type: ignore[arg-type]
+    service._profile = {"mute_rpc_s": 0.0, "mute_rpc_calls": 0,
+                        "mute_bridge_calls": 0, "mute_track_mutations": 0}
+    return service, bridge
+
+
+def _revision(change_count: int):
+    from reaper_audio.daw.session import ProjectRevision
+    return ProjectRevision(project_id=_PROJECT_ID, change_count=change_count,
+                           path=_PROJECT_PATH)
+
+
+def test_restore_uses_the_live_revision_after_the_capture_sweep(tmp_path: Path
+                                                                ) -> None:
+    """Isolation/render advanced the counter; the restore must still apply."""
+    session = _MuteSession(change_count=70, mutes={"{A}": True, "{B}": False})
+    service, bridge = _mute_service(tmp_path, session)
+    original = {"{A}": 0, "{B}": 0}
+
+    restored = service._restore_original_mutes(_revision(4), original)
+
+    assert session.snapshot_calls == 1
+    assert session.mutes == {"{A}": False, "{B}": False}
+    # Only the track that actually differed was written, and it used the live
+    # revision (70), not the stale one carried from before the sweep (4).
+    assert bridge.writes == [("{A}", 0.0)]
+    assert bridge.handles == [(70, "{A}")]
+    assert restored.change_count == 71
+
+
+@pytest.mark.parametrize(
+    "session_kwargs, reason",
+    [
+        ({"snapshot_error": OSError("bridge timeout")}, "snapshot_failed"),
+        ({"omit": {"{B}"}}, "mute_state_incomplete"),
+        ({"drop_mute_field": "{A}"}, "mute_missing"),
+        ({"project_id": "reaper:{OTHER}:C:/fixtures/project.rpp"},
+         "project_mismatch"),
+    ],
+)
+def test_restore_fails_closed_instead_of_skipping_silently(
+        tmp_path: Path, session_kwargs: dict[str, Any], reason: str) -> None:
+    """An unreadable or foreign state must fail the capture, never pass."""
+    mutes = {"{A}": True, "{B}": False}
+    session = _MuteSession(change_count=70, mutes=mutes, **session_kwargs)
+    service, bridge = _mute_service(tmp_path, session)
+
+    with pytest.raises(BridgeUnavailable) as raised:
+        service._restore_original_mutes(_revision(4), {"{A}": 0, "{B}": 0})
+
+    assert raised.value.details.get("reason") == reason, raised.value.details
+    # Nothing was restored and nothing was claimed as restored.
+    assert bridge.writes == []
+    assert session.mutes == mutes

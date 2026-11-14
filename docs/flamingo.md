@@ -25,8 +25,9 @@ scripts/fetch_flamingo.sh /path/to/model-store/music-flamingo-q5_1
 
 Environment:
 
-* `FLAMINGO_MODEL_DIR` — directory with the two files (default: the path above in this repo's docs).
-* `FLAMINGO_LLAMA_BIN` — `llama-mtmd-cli` with Music Flamingo support (build after llama.cpp PR b7593, CUDA enabled).
+* `FLAMINGO_MODEL_DIR` — directory with the two files (default: `work/models/music-flamingo-q5_1` inside the checkout).
+* `FLAMINGO_LLAMA_BIN` — `llama-mtmd-cli` with Music Flamingo support (default executable name: `llama-mtmd-cli`, resolved on `PATH`).
+* `FLAMINGO_LLAMA_DIR` — optional fallback directory for the llama.cpp binaries (default: `work/tools/llama.cpp` inside the checkout).
 
 ## GPU policy
 

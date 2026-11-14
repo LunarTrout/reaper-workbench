@@ -129,7 +129,9 @@ def test_render_candidate_tool_schema_is_transport_visible() -> None:
                                "tail_ms", "max_duration_s"}
     assert properties["tail_ms"]["default"] == 0
     assert properties["channels"]["default"] == "stereo"
-    assert len(tools) == 29
+    # 29 project tools plus the lifecycle call and the checkpoint save.
+    assert len(tools) == 31
+    assert {"reaper_bridge_reload"} <= {tool.name for tool in tools}
 
 
 def test_render_candidate_returns_plan_bound_audio_and_releases_lease(

@@ -41,7 +41,7 @@
 
 - README.md, README.ru.md, docs/VALIDATION.md, docs/VALIDATION.ru.md, docs/GAP-ANALYSIS.md.
 - docs/ANALYSIS-DEPENDENCIES.ru.md, docs/AI-INTERFACE.ru.md, docs/AI-MIX-SURFACE.md, docs/MCP-README-LLM.md, docs/MCP-README-LLM.ru.md.
-- docs/ossicle.md, docs/flamingo.md, docs/flamingo-ab-render-proof.md.
+- docs/ossicle.md, docs/flamingo.md, docs/RENDER-CAPTURE-PARITY.md.
 - docs/TZ.md, docs/EDITING-ACCEPTANCE.md, docs/INTELLIGENT-WORKFLOW.ru.md, docs/REAPER-MCP-AUDIT.ru.md, docs/FEATURE-PARITY.ru.md, docs/FLCTRL-PARITY.ru.md.
 - src/reaper_audio/analysis/, src/reaper_audio/daw/, src/reaper_audio/reaper/, src/reaper_audio/mcp_server.py, scripts/reaper_bridge.lua, tests/.
 

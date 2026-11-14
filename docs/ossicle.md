@@ -17,7 +17,7 @@ It replaced **MiDashengLM-Spatial** (see the last section for why).
 | Audio in | mono or stereo, any sample rate, any length; stereo goes through a `StereoAdapter` fed with 72 interaural level/phase cues per token |
 | Token rate | 12.5 audio tokens per second |
 | Local path | `<library>/work/models/ossicle-4b` |
-| Interpreter | `<local-tooling>/flstudio-mcp/.venv-ossicle` (Python 3.12, torch 2.6.0+cu124, torchaudio 2.6, transformers 5.22.2) |
+| Interpreter | `OSSICLE_PYTHON` (defaults to the active library interpreter; set it to a separate CUDA environment only when the model dependencies require one) |
 
 ## Files
 

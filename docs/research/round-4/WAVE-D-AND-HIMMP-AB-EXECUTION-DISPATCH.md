@@ -35,7 +35,7 @@ The current source implements `ReaperSession.analyze(tail_ms, channels, sample_r
 
 The README, validation page, MCP guide, tests, and source disagree on the MCP tool count/status. Reconcile them from the live `tools/list` response and actual source. In particular, do not leave a claim of 12 tools if the server advertises 19.
 
-The currently configured Hermes entry named `reaper-mcp` points to a Python executable under `<local-tooling>/flstudio-mcp/.venv313`. It is not proven to load this checkout. Do not overwrite or remove that existing entry. Create a separate temporary entry for this experiment (e.g. `reaper-workbench-benchmark`) and prove its loaded `reaper_audio.mcp_server.__file__` resolves to this checkout before claiming the model used this library. A verified Python 3.13 runtime is available at `$TEMP/reaper-audio-library-python313/python.exe`; it imports this MCP package with `PYTHONPATH` set to this checkout's `src`. Do not make a lasting Hermes configuration point to a temporary interpreter; record and later remove the experiment-only entry or replace it with a stable install.
+The configured Hermes entry named `reaper-mcp` points to a Python environment outside this checkout; it is not proven to load this source tree. Do not overwrite or remove an existing entry. Create a separate temporary entry for the experiment and prove its loaded `reaper_audio.mcp_server.__file__` resolves to this checkout before claiming the model used this library. Use a stable Python 3.13 environment for the MCP process; do not leave a lasting configuration that points into a temporary directory.
 
 ## Work split
 

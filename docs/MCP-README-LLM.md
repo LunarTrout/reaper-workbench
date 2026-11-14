@@ -150,7 +150,8 @@ the task while keeping the project and audio evidence connected:
 
 | Tool | Use |
 |---|---|
-| `reaper_session` | Check bridge health, discover REAPER instances, list open projects. |
+| `reaper_session` | Check bridge health, discover REAPER instances, list open projects, or inspect unsaved-change state before a controlled restart. |
+| `reaper_bridge_reload` | Activate a newer resident bridge build in place, with project/session identity checks; refuses legacy bridges rather than trying action bootstrap. |
 | `reaper_capabilities` | Read the domain index or page through the 732 documented API functions. |
 | `reaper_api_search` | Find API functions or Actions using a structured object/operation card. |
 | `reaper_project` | Read one project's master, tracks, routing, tempo, items, FX, or MIDI context. |
@@ -162,6 +163,7 @@ the task while keeping the project and audio evidence connected:
 | `reaper_api_call` | Call a function in the bundled official ReaScript signature catalog. |
 | `reaper_action` | Search Actions or invoke one in the main or MIDI Editor section. |
 | `reaper_save` | Save the current project or save as a new `.RPP` path. |
+| `reaper_checkpoint_save` | Save the active project as a new, non-overwriting checkpoint inside the configured checkpoint root and verify project/media state. |
 | `reaper_release` | Release one analysis or candidate report and its temporary WAV files now. |
 | `reaper_capture_snapshot` | Create a complete linked capture and archive its self-describing panorama; return capture/archive metadata only, not the view. |
 | `reaper_capture_read` | Read one archived capture only with a complete-view receipt for that exact capture; otherwise fail closed with a next action. |
@@ -176,6 +178,13 @@ the task while keeping the project and audio evidence connected:
 The official API catalog and runtime support are different facts. A documented
 function may not exist in the installed REAPER version. The bridge checks its
 availability at call time and returns an explicit error.
+
+For bridge maintenance, `reaper_bridge_reload` is an in-place activation for a
+bridge that already implements the lifecycle contract. It proves one new
+session, the expected build, and the unchanged project identity. A legacy bridge
+returns `bootstrap_required`; do not try to invoke Actions or start a duplicate
+loop through MCP. Follow [the bridge lifecycle procedure](bridge-lifecycle.md)
+for the operator-managed cold start or legacy upgrade.
 
 ## Find an API capability
 
@@ -795,6 +804,13 @@ absolute `.RPP` path and does not overwrite an existing file unless
 `overwrite_existing=true` is explicitly supplied. Respect the user's request
 about which project versions to keep; do not create a new copy per iteration.
 
+`reaper_checkpoint_save` is the narrow recovery save: it requires the exact live
+project identity and revision, refuses an existing target, confines the path to
+`REAPER_CHECKPOINT_ROOT` (default `%USERPROFILE%\Documents\REAPER Workbench\versions`),
+and checks the rebound project id, dirty state and online audio media. Configure
+the root during installation before using this tool. A verified checkpoint
+proves persistence and media resolution, not audio quality.
+
 A save that moves the revision or path returns `context_invalidated: true` and
 no delta. Do not reuse the old context token after it: capture again (or
 refresh the structural context) before editing. A save is not evidence that
@@ -811,10 +827,20 @@ Tool errors use a stable structure:
     "code": "stale_context",
     "message": "...",
     "details": {},
-    "next_action": "..."
+    "next_action": "...",
+    "recovery": {
+      "contract": "reaper_mcp_recovery/1",
+      "policy": "bounded_context_recovery",
+      "retry_limit": 1,
+      "stop_after_repeat": true
+    }
   }
 }
 ```
+
+`recovery` is present for context/receipt gates and candidate-render mismatches.
+Follow its scope and retry limit; it does not override `details`, mint a token,
+or make stale audio current. A candidate mismatch sets `retry_limit` to `0`.
 
 For `stale_context`, refresh and replan. If the error details say
 `audio_state="stale"` or the gate is `audio_evidence_fresh`, the structural
@@ -825,6 +851,52 @@ and discover an alternative. For `validation_error`, correct the field in
 `details`. A tool result does not prove that the user's musical goal is
 complete: report what was read back, measured, and actually heard, and identify
 what remains unverified.
+
+### Bounded recovery and operational anti-patterns
+
+Keep one current context tuple together: `project_id`, bridge/instance identity,
+`epoch`, `change_count`, `capture_id`/fact root, and its `panorama_receipt`/
+`context_token`. Never combine a token, revision, or receipt from another project,
+REAPER instance, epoch, capture, or saved-as identity. After a successful edit,
+use the returned successor token for structural reads and edits; its delta may say
+that audio evidence is stale, which means the old measurements cannot justify a
+new audio conclusion or a project-target analysis.
+
+For `stale_context` or `audio_evidence_fresh`:
+
+1. Read the error's `details` and `next_action`; do not replay the rejected
+   arguments with an old token.
+2. Check `reaper_panorama_status` and the exact live project revision. If a
+   complete capture already matches it, finish or reuse that delivery instead of
+   rendering another copy.
+3. Otherwise make one fresh capture for that exact project/revision, open it,
+   fetch every announced page, acknowledge all hashes, and retry the refused
+   operation once. If it is refused again, stop and report the exact error; do
+   not repeat the capture/analyze cycle or invent a token.
+
+`reaper_analyze` is itself a native audio-render operation. Its
+`evidence_revision` binds the measured WAVs; `revision_after_capture` can differ
+because REAPER restores temporary render settings and advances its monotonic
+counter. Never call the latter the audio's revision. Do not start a duplicate
+synchronous analysis while one is running, and do not rerun analysis merely to
+chase counter churn. Use an existing capture's exact measurements when they
+answer the question; request another render only for missing evidence or a
+different interval/reference comparison.
+
+`render_candidate_mismatch` means candidate verification failed, even if the
+reported difference is an FX state chunk. Do not rerun blindly, suppress the
+mismatch, or assume that unchanged FX names/slots prove unchanged parameters.
+Read the affected chain and parameter values through MCP. If the tool cannot
+provide semantic before/after evidence, preserve the failure and label the audio
+verification unresolved. A successful save/checkpoint proves that a file was
+saved, not that the mix was measured after the final edit or sounds right. Report
+these states separately: **saved**, **state read back**, **audio measured after
+the last edit**, and **auditioned by a person**.
+
+Use MCP for all project inspection, edits, and audio analysis. Do not bypass a
+missing or failing MCP capability with a direct bridge call, script, GUI action,
+or hand-edited `.RPP`; report the coverage gap instead. These are reliability
+rules, not a prescribed order of musical decisions or a mixing recipe.
 
 Analysis is synchronous in this version; there is no job status/cancel tool yet.
 Use a short section when the task concerns an excerpt and do not start a duplicate

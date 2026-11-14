@@ -36,6 +36,17 @@ local registry_path = registry_dir .. "/" .. bridge_session_id .. ".json"
 local pulse_path = runtime_dir .. "/heartbeat"
 local request_path = runtime_dir .. "/request.json"
 local protocol_version = 1
+-- Bridge contract build. Bumped whenever the resident script's request surface
+-- or its guarantees change, so a client can prove which copy is actually
+-- running before it trusts a reload, a capture or an edit.
+local bridge_build = "b5-2026-11-14"
+-- A second boot inside the same REAPER Lua state must supersede the first:
+-- two loops would both keep heartbeating and the client would see two live
+-- bridges. Every loop compares this token before it reschedules; the newest
+-- boot owns it, so a reload converges to exactly one resident loop.
+local supersede_token = string.format("%s:%d", bridge_session_id,
+                                      math.floor(reaper.time_precise() * 1000))
+_G.reaper_bridge_supersede = supersede_token
 local max_request_bytes = 16 * 1024 * 1024
 local api_handles = {}
 local api_handle_order = {}
@@ -667,8 +678,8 @@ local digest_version = 1
 -- Bounds. Exceeding one degrades coverage instead of silently truncating.
 local digest_max_envelope_points = 50000
 local digest_max_automation_items = 5000
-local digest_max_fx_envelope_probes = 20000
-local digest_max_fx_chain_chars = 262144
+local digest_max_fx_envelope_probes = 2000000
+local digest_max_fx_chain_chars = 8388608
 
 -- Envelope chunks repeat two UI-only fields (lane visibility and lane height)
 -- that move when the arrange view is resized. Dropping them keeps a window
@@ -2034,7 +2045,10 @@ local function project_capture_render(arguments)
     for _, target in ipairs(capture_targets) do
       local name = target:match("([^/\\]+)$") or ""
       local rest = name:sub(#prefix + 1)
-      local number = tonumber(rest:match("^(%d+)%-")) or 0
+      -- $tracknumber-$track loses its separator when the track name is empty,
+      -- so the render lands as "<prefix>33.wav". A number-only match keeps that
+      -- track mapped instead of counting it as an extra master file.
+      local number = tonumber(rest:match("^(%d+)")) or 0
       local track_guid, track_name, track_index, is_master
       if number >= 1 and number <= track_count then
         local track = reaper.GetTrack(project, number - 1)
@@ -2045,6 +2059,9 @@ local function project_capture_render(arguments)
         local name_ok
         name_ok, track_name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
         if not name_ok then error("Could not read rendered track name") end
+        -- An unnamed track is legitimate; the render row still needs a label,
+        -- and an empty one is rejected by the client contract.
+        if track_name == "" then track_name = "Track " .. tostring(number) end
         track_index = number - 1
         if seen_tracks[track_guid] then error("Duplicate rendered track number") end
         seen_tracks[track_guid] = true
@@ -2069,9 +2086,52 @@ local function project_capture_render(arguments)
     local expected_master_count = master_only and 1 or (includes_master and 1 or 0)
     if master_count ~= expected_master_count or
        (not master_only and seen_track_count ~= target_track_count) then
-      error("Rendered files could not be mapped one-to-one to requested tracks and master: " ..
-            "tracks=" .. tostring(seen_track_count) .. "/" .. tostring(target_track_count) ..
-            ", masters=" .. tostring(master_count) .. "/" .. tostring(expected_master_count))
+      -- A mismatch is a hard failure, but the counts alone cannot say which
+      -- target was wrong. Return the whole mapping evidence so the caller can
+      -- name the missing track or the extra master instead of guessing.
+      local expected_rows = json.array()
+      for index = 0, track_count - 1 do
+        local track = reaper.GetTrack(project, index)
+        local guid = reaper.GetTrackGUID(track)
+        if subset == nil or subset[guid] == true then
+          local name_ok, track_name_value =
+            reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
+          local selected = reaper.IsTrackSelected(track)
+          expected_rows[#expected_rows + 1] = {
+            guid = guid, number = index + 1, index = index,
+            name = name_ok and track_name_value or "",
+            selected = selected,
+            item_count = reaper.CountTrackMediaItems(track),
+          }
+        end
+      end
+      local actual_rows = json.array()
+      for _, target in ipairs(capture_targets) do
+        local file_name = target:match("([^/\\]+)$") or ""
+        local rest = file_name:sub(#prefix + 1)
+        local bytes = -1
+        local handle = io.open(target, "rb")
+        if handle then bytes = handle:seek("end") or -1; handle:close() end
+        actual_rows[#actual_rows + 1] = {
+          path = target, file = file_name,
+          number = tonumber(rest:match("^(%d+)")) or 0,
+          bytes = bytes,
+        }
+      end
+      fail("render_mapping_mismatch",
+           "Rendered files could not be mapped one-to-one to requested tracks " ..
+           "and master: tracks=" .. tostring(seen_track_count) .. "/" ..
+           tostring(target_track_count) .. ", masters=" .. tostring(master_count) ..
+           "/" .. tostring(expected_master_count),
+           { tracks_mapped = seen_track_count, tracks_expected = target_track_count,
+             masters_mapped = master_count, masters_expected = expected_master_count,
+             job_id = job_id, prefix = prefix, output_dir = output_dir,
+             master_only = master_only, includes_master = includes_master,
+             selected_tracks_via_master = selected_tracks_via_master,
+             parallel_via_master = parallel_via_master,
+             subset_count = subset_count or 0, project_track_count = track_count,
+             settings = settings_used, targets = capture_targets,
+             expected = expected_rows, actual = actual_rows })
     end
     local capture_point = master_only and "native_render_master_only" or
                           (selected_tracks_via_master and
@@ -2160,6 +2220,7 @@ local function write_instance_registry()
   local payload = {
     protocol = protocol_version,
     bridge_session_id = bridge_session_id,
+    bridge_build = bridge_build,
     reaper_version = reaper.GetAppVersion(),
     started_epoch = tonumber(bridge_session_id:match("^(%x+)"), 16),
     last_seen_epoch = os.time(),
@@ -4399,11 +4460,59 @@ local function project_sample_tracks(arguments)
   return result
 end
 
+-- Narrow lifecycle surface. It compiles the on-disk script before this loop
+-- stops, so a broken file leaves the running bridge untouched instead of
+-- killing the only loop; it never saves, closes or reloads a project and it
+-- never evaluates arbitrary code: the only thing it loads is this same file.
+local pending_reload = nil
+
+local function bridge_lifecycle(arguments)
+  local action = arguments.action
+  if action ~= "reload" then
+    fail("validation_error", "lifecycle action must be 'reload'",
+         { action = tostring(action) })
+  end
+  local expected = arguments.expected_build
+  if type(expected) ~= "string" or expected == "" then
+    fail("validation_error",
+         "expected_build is required so a stale caller cannot reload the bridge")
+  end
+  if expected ~= bridge_build then
+    fail("stale_context", "The caller expected a different running bridge build",
+         { expected = expected, running = bridge_build,
+           session = bridge_session_id })
+  end
+  local chunk, compile_error = loadfile(script_path)
+  if not chunk then
+    fail("reload_rejected",
+         "The bridge script on disk does not compile; the running copy was left untouched",
+         { script = script_path, error = tostring(compile_error) })
+  end
+  local file = io.open(script_path, "rb")
+  if not file then
+    fail("reload_rejected", "The bridge script on disk is unreadable",
+         { script = script_path })
+  end
+  local size = file:seek("end") or 0
+  file:close()
+  if size < 1024 then
+    fail("reload_rejected", "The bridge script on disk is implausibly small",
+         { script = script_path, bytes = size })
+  end
+  pending_reload = { chunk = chunk, script = script_path, bytes = size }
+  return { accepted = true, action = "reload", session = bridge_session_id,
+           running_build = bridge_build, script = script_path,
+           script_bytes = size }
+end
+
 local operations = {
+  ["bridge.lifecycle"] = bridge_lifecycle,
   health = function()
     local project, path = active_project()
     return { service = "reaper-workbench", protocol = protocol_version,
              bridge_session = bridge_session_id,
+             bridge_build = bridge_build,
+             script_path = script_path,
              reaper_version = reaper.GetAppVersion(),
              project = project_identity_state(project, path),
              open_projects = projects_list() }
@@ -4529,6 +4638,27 @@ local function loop()
                               tostring(error_message) .. "\n")
       end
     end
+  end
+  if _G.reaper_bridge_supersede ~= supersede_token then
+    -- A newer boot owns the mailbox; stop without rescheduling.
+    return
+  end
+  if pending_reload then
+    local reload = pending_reload
+    pending_reload = nil
+    reaper.ShowConsoleMsg(string.format(
+      "REAPER Workbench: activating %s (%d bytes) over session %s\n",
+      reload.script, reload.bytes, bridge_session_id))
+    -- The compiled chunk starts the new resident loop and returns; this loop
+    -- then ends without rescheduling, so exactly one loop survives. A runtime
+    -- failure here leaves no loop at all, which the client reports as a failed
+    -- activation instead of silently keeping the old code.
+    local reloaded, reload_error = pcall(reload.chunk)
+    if not reloaded then
+      reaper.ShowConsoleMsg("REAPER Workbench reload failed: " ..
+                            tostring(reload_error) .. "\n")
+    end
+    return
   end
   reaper.defer(loop)
 end

@@ -307,7 +307,7 @@ one release behind, and A found no render-API change between them in the changel
 
 Repo-internal measured documents used as evidence (not external sources):
 
-* `docs/flamingo-ab-render-proof.md` — A/B proof of the capture path against REAPER's own render;
+* `docs/RENDER-CAPTURE-PARITY.md` — A/B proof of the capture path against REAPER's own render;
   contains the only recorded statement in this repo about the render/bridge interaction:
   *"`Main_OnCommandEx` returns `bridge_timeout` because the render blocks the bridge defer loop, and
   the library's retry re-issues the command — the second render hits an existing file and REAPER opens
@@ -339,9 +339,9 @@ Repo-internal measured documents used as evidence (not external sources):
 | M12 | Render action name resolved at runtime | "File: Render project, using the most recent render settings, auto-close render dialog" (recorded in an analysis report) |
 | M13 | Timeout headroom | 600 s budget vs 98.47 s observed batch = 6.1× |
 | M14 | Bridge liveness beacon period | ≤ 2 s, written by the same defer loop (`reaper_bridge.lua:4143`) |
-| M15 | Prior full-mix render is not deterministic | native-vs-native residual −46.82 dBFS, depth −28.18 dB (`flamingo-ab-render-proof.md` §4) |
+| M15 | Prior full-mix render is not deterministic | native-vs-native residual −46.82 dBFS, depth −28.18 dB (`RENDER-CAPTURE-PARITY.md` §4) |
 | M16 | FX-free control is deterministic | native vs native and native vs capture both null to −240.00 dBFS (exact zero) |
-| M17 | Render blocks the defer loop | recorded pitfall in `flamingo-ab-render-proof.md` §6: "the render blocks the bridge defer loop" |
+| M17 | Render blocks the defer loop | recorded pitfall in `RENDER-CAPTURE-PARITY.md` §6: "the render blocks the bridge defer loop" |
 | M18 | A modal overwrite prompt can block the bridge indefinitely | same pitfall, same section |
 | M19 | 13:33 capture failed on master silence | `capture_status:"invalid_master"`, 2 attempts, both peak −160.0 |
 | M20 | 13:53 capture is valid but its wrapper reported failure | record `valid`; `optimized-capture.json` `ok:false`, 703.072 s |
@@ -609,7 +609,7 @@ and (b) in 4 batches of 10/10/11/11. Decode and compare per track.
 
 | Metric | Pass | Fail |
 |---|---|---|
-| Per-track max abs difference | 0.0 FS for deterministic projects; ≤ the session's own native-vs-native floor otherwise (measure it in the same session, as `flamingo-ab-render-proof.md` did) | above the floor |
+| Per-track max abs difference | 0.0 FS for deterministic projects; ≤ the session's own native-vs-native floor otherwise (measure it in the same session, as `RENDER-CAPTURE-PARITY.md` did) | above the floor |
 | Frame counts | identical | any mismatch |
 | Event lists / metrics | identical, or differences bounded by the already-documented tolerances | any new field drift |
 

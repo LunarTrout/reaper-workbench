@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Iterable
@@ -38,9 +39,9 @@ MODEL_DIR = Path(os.environ.get("OSSICLE_MODEL_DIR",
 REVISION = "d4def766b7465b31ee93853acd38964f699d652e"
 MANIFEST = MODEL_DIR / "manifest.json"
 WORKER = Path(__file__).resolve().parents[3] / "scripts" / "ossicle_worker.py"
-PYTHON = os.environ.get(
-    "OSSICLE_PYTHON",
-    r"C:/Users/epicc/mcp/flstudio-mcp/.venv-ossicle/Scripts/python.exe")
+# Use the active library environment by default. A separate model environment
+# remains configurable without binding the package to another local project.
+PYTHON = os.environ.get("OSSICLE_PYTHON") or sys.executable
 SR = 16000
 MIN_S = 1.0
 MAX_S = 120.0        # beyond this the model streams pieces and stops using stereo cues

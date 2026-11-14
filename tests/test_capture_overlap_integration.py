@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pytest
 import soundfile as sf
 
 from reaper_audio.context.full_capture import CaptureArchive
@@ -36,6 +37,8 @@ class _FakeBridge:
         self.render_calls: list[dict[str, Any]] = []
         self.api_calls: list[tuple[str, Any, str, float]] = []
         self.fail_track_batch: int | None = None
+        self.extra_master_in_track_batch = False
+        self.mute_after_render: str | None = None
         self._track_batches = 0
 
     def project_digest(self, project_id: str | None = None) -> dict[str, Any]:
@@ -74,6 +77,20 @@ class _FakeBridge:
                     "track_index": track["index"], "is_master": False,
                     "path": str(path), "bytes": path.stat().st_size,
                 })
+            if self.extra_master_in_track_batch:
+                # REAPER emitted an extra master target for a stems-only batch:
+                # 6 files for 5 planned tracks. The capture must refuse it.
+                extra = output / f"rali-{job}-0-MASTER.wav"
+                _wav(extra, 90.0)
+                files.append({
+                    "source_guid": self.master["guid"], "name": "MASTER",
+                    "track_index": -1, "is_master": True,
+                    "path": str(extra), "bytes": extra.stat().st_size,
+                })
+            if self.mute_after_render:
+                for track in self.tracks:
+                    if track["guid"] == self.mute_after_render:
+                        track["mute"] = True
         self.revision = dict(self.revision,
                              change_count=self.revision["change_count"] + 1)
         return {
@@ -100,6 +117,10 @@ class _FakeBridge:
     def call_api(self, name: str, handle: Any, parameter: str,
                  value: float) -> SimpleNamespace:
         self.api_calls.append((name, handle, parameter, value))
+        if parameter == "B_MUTE":
+            for track in self.tracks:
+                if handle is not None and track["guid"] == getattr(handle, "stable_id", None):
+                    track["mute"] = bool(value)
         return SimpleNamespace(project_after=dict(self.revision))
 
 
@@ -223,9 +244,11 @@ def test_capture_renders_master_first_overlaps_batches_and_maps_analysis(
     assert stored.timings["master_attempts"][0]["sha256"] == (
         result["master_attempts"][0]["sha256"])
 
-    # The fake bridge restored every track mute after the capture.
-    assert len(bridge.api_calls) == 8
-    assert all(call[2] == "B_MUTE" for call in bridge.api_calls)
+    # The restore is a state guarantee, not a rewrite: a mute that already
+    # matches the pre-capture value is not written again, because every write
+    # advances the project counter the restore handle is bound to.
+    assert bridge.api_calls == []
+    assert all(track["mute"] is False for track in tracks)
     assert all(call[3] == 0.0 for call in bridge.api_calls)
     digest_after = bridge.digest
     assert digest_after == digest
@@ -259,6 +282,7 @@ def test_capture_failure_cancels_analysis_and_cleans_the_incoming_job(
               "sends": 0, "receives": 0, "hardware_sends": 1, "selected": False}
     bridge = _FakeBridge(tracks, master, _digest(tracks))
     bridge.fail_track_batch = 2
+    bridge.mute_after_render = "{TRACK-3}"
     service = FullCaptureService(
         _FakeSession(bridge, _context(tracks, master)),  # type: ignore[arg-type]
         tmp_path / "archive",
@@ -274,7 +298,44 @@ def test_capture_failure_cancels_analysis_and_cleans_the_incoming_job(
     assert archive.list_index() == []
     incoming = tmp_path / "archive" / ".incoming"
     assert not list(incoming.glob("job-*"))
-    # The failure path still restores every mute through the bridge.
-    assert len(bridge.api_calls) == len(tracks)
-    assert all(call[2] == "B_MUTE" and call[3] == 0.0
-               for call in bridge.api_calls)
+    # The failure path restores the mute the isolation sweep left behind, and
+    # writes nothing else: the live state already matches for every other track.
+    assert len(bridge.api_calls) == 1
+    assert bridge.api_calls[0][2] == "B_MUTE"
+    assert bridge.api_calls[0][3] == 0.0
+    assert all(track["mute"] is False for track in tracks)
+
+
+def test_six_targets_for_five_planned_tracks_fail_closed(tmp_path: Path) -> None:
+    """REAPER returning a master target inside a stems-only batch is fatal.
+
+    Six rendered files for five planned tracks must abort the capture before any
+    record is committed, and the finally-path must still restore the mute that
+    the isolation sweep left behind.
+    """
+    tracks = _tracks()
+    master = {"guid": "{MASTER}", "index": -1, "name": "", "is_master": True,
+              "folder_depth": 0, "items": [], "fx": [], "mute": False,
+              "solo": 0, "volume": 0.85, "pan": 0.0,
+              "sends": 0, "receives": 0, "hardware_sends": 1, "selected": False}
+    bridge = _FakeBridge(tracks, master, _digest(tracks))
+    bridge.extra_master_in_track_batch = True
+    bridge.mute_after_render = "{TRACK-0}"
+    service = FullCaptureService(
+        _FakeSession(bridge, _context(tracks, master)),  # type: ignore[arg-type]
+        tmp_path / "archive",
+    )
+
+    with pytest.raises(BridgeUnavailable) as raised:
+        service.capture(section=(0.0, 1.0), analysis_workers=2)
+
+    assert "master file" in str(raised.value).lower(), str(raised.value)
+    # Nothing committed: no index record, no capture directory, no leftover job.
+    archive = CaptureArchive(tmp_path / "archive")
+    assert archive.list_index() == []
+    assert not list((tmp_path / "archive" / "captures").glob("*"))
+    # The isolation mute was restored despite the failure.
+    assert bridge.api_calls == [
+        call for call in bridge.api_calls if call[2] == "B_MUTE" and call[3] == 0.0]
+    assert len(bridge.api_calls) == 1
+    assert all(track["mute"] is False for track in tracks)

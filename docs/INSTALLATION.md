@@ -60,6 +60,17 @@ The runtime directory keeps its original internal name for compatibility. It con
 
 The MCP server does not choose a project based on a filename. Query `reaper_session(action="health")` and `reaper_project` first. If multiple REAPER instances are bridged, use the returned bridge session ID on subsequent calls so a request is bound to the intended instance.
 
+### Checkpoint directory
+
+`reaper_checkpoint_save` writes a new `.RPP` file and refuses to overwrite an
+existing one. Its allowed root defaults to
+`%USERPROFILE%\Documents\REAPER Workbench\versions`; create that directory
+before the first save. To keep versions beside a particular project, set
+`REAPER_CHECKPOINT_ROOT` in the MCP server process environment to an existing
+dedicated directory. For an MCP client configuration, add it under that server's
+`env` object. The requested checkpoint path must remain inside the configured
+root.
+
 To stop the bridge, use REAPER's Actions window and stop the running deferred script. Cockos documents that deferred ReaScripts remain in the background until stopped from the running-scripts list: [ReaScript: running and stopping scripts](https://www.reaper.fm/sdk/reascript/reascript.php).
 
 ## 4. Configure an MCP client
