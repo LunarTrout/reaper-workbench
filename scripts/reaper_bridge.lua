@@ -164,12 +164,19 @@ local function project_path_for(project)
   end
 end
 
+local function normalize_project_id(value)
+  if type(value) ~= "string" then return value end
+  local lowered = string.lower(value)
+  return (string.gsub(lowered, "\\", "/"))
+end
+
 local function find_project(project_id)
   local index = 0
   while true do
     local project, path = reaper.EnumProjects(index, "")
     if not project then return nil end
-    if project_identity(project, path or "").project_id == project_id then
+    if normalize_project_id(project_identity(project, path or "").project_id)
+        == normalize_project_id(project_id) then
       return project, path or ""
     end
     index = index + 1

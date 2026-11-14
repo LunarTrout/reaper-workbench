@@ -33,7 +33,8 @@ from ..errors import StaleContext, ValidationError
 from .changes import (DELTA_SCHEMA, build_structural_delta, delta_hash as _delta_hash,
                      digest_facts, next_view_root)
 from .full_capture import CaptureArchive, FullCaptureRecord
-from .identity import identity_from_mapping, same_identity_values
+from .identity import (identity_from_mapping, normalize_project_id,
+                       same_identity_values)
 from .details import DEFAULT_DETAIL_BYTES, resolve_details
 from .panorama import (PANORAMA_SCHEMA_VERSION, build_panorama, load_panorama,
                        panorama_path_for_record)
@@ -391,9 +392,9 @@ def revisions_match(left: Mapping[str, Any] | None,
     """
     a = _normalise_revision(left)
     b = _normalise_revision(right)
-    if (a["project_id"] != b["project_id"] or
+    if (normalize_project_id(a["project_id"]) != normalize_project_id(b["project_id"]) or
             a["change_count"] != b["change_count"] or
-            a["path"] != b["path"]):
+            normalize_project_id(a["path"]) != normalize_project_id(b["path"])):
         return False
     for key in ("instance_id", "epoch"):
         if a[key] is not None or b[key] is not None:
@@ -818,7 +819,7 @@ class PanoramaLifecycle:
 
     def latest_capture(self, project_id: str) -> dict[str, Any] | None:
         rows = [row for row in self.archive.list_index()
-                if str(row.get("project_id")) == project_id and row.get("capture_id")]
+                if normalize_project_id(row.get("project_id")) == normalize_project_id(project_id) and row.get("capture_id")]
         if not rows:
             return None
         rows.sort(key=lambda row: str(row["capture_id"]), reverse=True)
@@ -827,7 +828,7 @@ class PanoramaLifecycle:
     def _capture_by_revision(self, project_id: str,
                              revision: Mapping[str, Any] | None) -> str | None:
         for row in self.archive.list_index():
-            if str(row.get("project_id")) != project_id:
+            if normalize_project_id(row.get("project_id")) != normalize_project_id(project_id):
                 continue
             for key in ("revision_before", "revision_after"):
                 candidate = row.get(key)
@@ -1081,7 +1082,7 @@ class PanoramaLifecycle:
                                   details={"project_id": project_id})
         capture_id = str(latest["capture_id"])
         capture_row = self._index_row(capture_id)
-        if capture_row is None or str(capture_row.get("project_id")) != project_id:
+        if capture_row is None or normalize_project_id(capture_row.get("project_id")) != normalize_project_id(project_id):
             raise ValidationError("Requested capture is not in this project archive",
                                   details={"capture_id": capture_id})
         document = self._document(capture_id)
@@ -1279,7 +1280,7 @@ class PanoramaLifecycle:
                                   details={"project_id": project_id})
         capture = str(latest["capture_id"])
         row = self._index_row(capture)
-        if row is None or str(row.get("project_id")) != project_id:
+        if row is None or normalize_project_id(row.get("project_id")) != normalize_project_id(project_id):
             raise ValidationError("Requested capture is not in this project archive",
                                   details={"capture_id": capture})
         document = self._document(capture)
@@ -1913,7 +1914,7 @@ class PanoramaLifecycle:
             return {"status": "not_modified", "project_id": project_id,
                     "revision": base_revision_value, "fact_root": base_root}
         rows = [row for row in self.archive.list_index()
-                if str(row.get("project_id")) == project_id and row.get("capture_id")]
+                if normalize_project_id(row.get("project_id")) == normalize_project_id(project_id) and row.get("capture_id")]
         rows.sort(key=lambda row: str(row["capture_id"]))
         ids = [str(row["capture_id"]) for row in rows]
         if base_capture_id not in ids or target_capture_id not in ids:

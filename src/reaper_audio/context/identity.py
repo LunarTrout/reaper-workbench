@@ -29,6 +29,7 @@ from .errors import ContractValidationError
 
 __all__ = [
     "EPOCH_BASIS_BRIDGE",
+    "normalize_project_id",
     "IDENTITY_SCHEMA",
     "ProjectIdentity",
     "identity_complete",
@@ -37,6 +38,17 @@ __all__ = [
     "require_same_identity",
     "same_identity_values",
 ]
+
+def normalize_project_id(value: Any) -> str:
+    """Separator- and case-insensitive form of a project id, for matching only.
+
+    REAPER reports Windows paths with backslashes while archives written on
+    other platforms (or by older capture code) may carry forward slashes.  The
+    stored id is never rewritten; comparisons use this canonical form so the
+    same open project resolves regardless of which side supplied the id.
+    """
+    return str(value).replace("\\", "/").lower()
+
 
 IDENTITY_SCHEMA = "reaper-workbench.project-identity/1"
 
