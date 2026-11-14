@@ -271,6 +271,19 @@ evidence of any later project edits. Capture mode rejects requests to change
 sample rate, channel layout, or add a render tail rather than silently creating
 a new render.
 
+**Capacity error recovery:** `reaper_capture_snapshot` can return
+`ok=false` / `panorama_capacity_exceeded` after it has durably archived the
+capture. If the error includes `details.capture_id` and says the canonical
+record remains archived, only one-shot panorama delivery failed; the capture
+and its audio are available. Do not call `reaper_capture_snapshot` again for
+that state. Use the same `project_id` and `archive_root` with
+`reaper_panorama_open(..., capture_id=...)`, fetch every page in its manifest,
+and acknowledge every page hash. Then use archive-mode `reaper_analyze` with
+that capture ID, archive root, and receipt. This evidence describes only the
+archived capture revision; compare it with the live revision before calling it
+current. If the error does not include a capture ID or does not confirm archive
+retention, inspect the complete structured error before choosing a recovery.
+
 Both modes can analyze a project-time section (`start_s`, `end_s`), compare full
 reference files through `reference_paths`, select reference-file-local excerpts
 with `reference_windows`, request selected phase comparisons, or request all
