@@ -887,7 +887,7 @@ class FullCaptureService:
         finally:
             # A failed restore must surface, never leave a silent solo state.
             try:
-                current = self._set_every_mute(current, original_mute, None)
+                current = self._restore_original_mutes(current, original_mute)
             finally:
                 if pipeline is not None and not pipeline_closed:
                     try:
@@ -932,6 +932,81 @@ class FullCaptureService:
                                        details={"guid": guid, "expected": mutes[str(guid)],
                                                 "actual": entry.get("mute")})
         return ProjectRevision.from_dict(dict(after))
+
+    def _restore_original_mutes(self, current: ProjectRevision,
+                                original_mute: Mapping[str, int]) -> ProjectRevision:
+        """Restore the pre-capture mute map, or fail; never skip silently.
+
+        The capture's own isolation sweep advances the project change counter,
+        so a revision carried from before the sweep is stale by exactly two
+        counts per touched track and the bridge rejects every restore handle
+        built from it. The live revision is therefore re-read here, and only the
+        mutes that actually differ are written.
+        """
+        current, live_mute = self._live_mute_state(current, original_mute)
+        pending = {guid: value for guid, value in original_mute.items()
+                   if bool(live_mute[guid]) != bool(value)}
+        if pending:
+            current = self._set_every_mute(current, pending, None)
+        return current
+
+    def _live_mute_state(self, fallback: ProjectRevision,
+                         required: Mapping[str, int]
+                         ) -> tuple[ProjectRevision, dict[str, int]]:
+        """Read the live revision and GUID->mute map without mutating anything.
+
+        Fail-closed: an unreadable snapshot, a revision that does not match the
+        captured project, or a track whose mute state is missing must raise. A
+        partial map would make ``live_mute[guid]`` look already restored and
+        leave the project muted while the capture reports success.
+        """
+        try:
+            context = self.session.snapshot(include_items=False,
+                                            include_fx_params=False)
+        except Exception as error:
+            raise BridgeUnavailable(
+                "Cannot read the live mute state before restoring the capture",
+                details={"reason": "snapshot_failed", "error": str(error)}) from error
+        if not isinstance(context, Mapping):
+            raise BridgeUnavailable(
+                "REAPER returned no project context before the mute restore",
+                details={"reason": "context_missing"})
+        revision_row = context.get("revision")
+        if not isinstance(revision_row, Mapping):
+            raise BridgeUnavailable(
+                "REAPER returned no revision before the mute restore",
+                details={"reason": "revision_missing"})
+        revision = ProjectRevision.from_dict(dict(revision_row))
+        if not revision.project_id or not revision.path:
+            raise BridgeUnavailable(
+                "REAPER returned an incomplete revision before the mute restore",
+                details={"reason": "revision_incomplete",
+                         "project_id": revision.project_id, "path": revision.path})
+        if revision.project_id != fallback.project_id:
+            raise BridgeUnavailable(
+                "The active project changed before the mute restore",
+                details={"reason": "project_mismatch",
+                         "expected": fallback.project_id,
+                         "current": revision.project_id})
+        mutes: dict[str, int] = {}
+        for track in context.get("tracks") or []:
+            if not isinstance(track, Mapping):
+                continue
+            guid = track.get("guid")
+            if not isinstance(guid, str) or not guid:
+                continue
+            if "mute" not in track:
+                raise BridgeUnavailable(
+                    "A track has no mute state before the mute restore",
+                    details={"reason": "mute_missing", "guid": guid})
+            mutes[guid] = 1 if track.get("mute") else 0
+        missing = sorted(set(required) - set(mutes))
+        if missing:
+            raise BridgeUnavailable(
+                "The mute state of a captured track could not be read",
+                details={"reason": "mute_state_incomplete",
+                         "missing_count": len(missing), "guids": missing[:8]})
+        return revision, mutes
 
     def _set_mute(self, revision: ProjectRevision, guid: str, value: int | None) -> ProjectRevision:
         if value is None:

@@ -10,6 +10,7 @@ pytest.importorskip("mcp")
 
 from reaper_audio import mcp_server
 from reaper_audio.daw.session import ProjectRevision
+from reaper_audio.errors import RenderCandidateMismatch, StaleContext, ValidationError
 from reaper_audio.reaper.api_catalog import get_api_catalog
 from reaper_audio.reaper.handles import ReaperHandle
 
@@ -83,6 +84,43 @@ def test_errors_are_returned_as_typed_tool_results() -> None:
     assert result["error"]["next_action"]
 
 
+def test_audio_stale_error_includes_bounded_recovery_contract() -> None:
+    result = mcp_server._error_payload(StaleContext(
+        "Audio evidence is stale",
+        details={"gate": "audio_evidence_fresh", "audio_state": "stale"},
+    ))
+
+    recovery = result["error"]["recovery"]
+    assert recovery["contract"] == "reaper_mcp_recovery/1"
+    assert recovery["failure_scope"] == "audio_evidence"
+    assert recovery["retry_limit"] == 1
+    assert recovery["stop_after_repeat"] is True
+    assert any("matching capture" in step for step in recovery["steps"])
+
+
+def test_panorama_gate_validation_includes_recovery_contract() -> None:
+    result = mcp_server._error_payload(ValidationError(
+        "Panorama receipt required",
+        details={"gate": "panorama_interpretation"},
+    ))
+
+    recovery = result["error"]["recovery"]
+    assert recovery["failure_scope"] == "project_context_or_receipt"
+    assert recovery["retry_limit"] == 1
+
+
+def test_candidate_render_mismatch_forbids_automatic_retry() -> None:
+    result = mcp_server._error_payload(RenderCandidateMismatch(
+        "FX state changed during render", details={"field": "fx_state"},
+    ))
+
+    recovery = result["error"]["recovery"]
+    assert recovery["policy"] == "preserve_failed_verification"
+    assert recovery["retry_limit"] == 0
+    assert any("parameter values through MCP" in step
+               for step in recovery["required"])
+
+
 def test_project_reference_becomes_revision_bound_host_handle() -> None:
     revision = ProjectRevision(project_id="project-id", change_count=7,
                                path="C:/music/test.RPP")
@@ -107,8 +145,12 @@ def test_mcp_surface_is_bounded_and_has_discovery_resources() -> None:
     names = {tool.name for tool in tools}
     uris = {resource.uri_template for resource in templates}
 
-    assert len(names) == 29
+    # 29 project tools plus the lifecycle call that activates a new bridge build
+    # and the narrow checkpoint save that persists unsaved state before it.
+    assert len(names) == 31
+    assert {"reaper_bridge_reload", "reaper_checkpoint_save"} <= names
     assert {"reaper_capabilities", "reaper_api_search", "reaper_api_call",
+            "reaper_bridge_reload", "reaper_checkpoint_save",
             "reaper_project", "reaper_analyze", "reaper_edit",
             "reaper_render_candidate", "reaper_edit_map", "reaper_mix_evidence",
             "reaper_action", "reaper_save", "reaper_release", "reaper_session",

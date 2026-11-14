@@ -44,7 +44,13 @@ from .errors import (BridgeUnavailable, PanoramaBindingError,
                      ValidationError)
 from .models import Section
 from .reaper.api_catalog import get_api_catalog
+from .daw.checkpoint import checkpoint_root, save_checkpoint
 from .reaper.bridge_client import ReaperBridge
+from .reaper.bridge_lifecycle import (
+    activate_bridge,
+    bridge_script_path,
+    script_build,
+)
 from .reaper.handles import ReaperHandle
 
 _LOG = logging.getLogger("reaper_audio.mcp")
@@ -169,10 +175,9 @@ def _require_interpretation_receipt(receipt: str | None, project_id: str,
         raise ValidationError(
             "A complete, delivered panorama is required before interpreting "
             "project audio or project measurements",
-            details={"next_action": ("call reaper_capture_snapshot once to create "
-                                     "the evidence document, then reaper_panorama_open, "
-                                     "fetch every page with reaper_panorama_page, and "
-                                     "reaper_panorama_ack with all page hashes"),
+            details={"next_action": ("check reaper_panorama_status first; reuse and open a complete capture "
+                                     "for this exact revision if one exists, otherwise capture once, "
+                                     "open it, fetch every page, and acknowledge all hashes"),
                      "gate": "panorama_interpretation"})
     return _require_panorama_receipt(receipt, project_id, expected_revision,
                                      archive_root, expected_fact_root,
@@ -259,7 +264,24 @@ server = MCPServer(
         "expected_revision. The generic API and Actions remain available for documented "
         "REAPER functions beyond convenience edits. Audio analysis uses native REAPER render "
         "capture; raw AudioAccessor samples are pre-FX and are not processed mix stems. "
-        "Temporary audio is outside the project and has a bounded lease."
+        "Temporary audio is outside the project and has a bounded lease. "
+        "Operational anti-patterns: keep project_id, bridge/instance identity, epoch, "
+        "change_count, capture_id and its receipt/context_token together; never combine "
+        "tokens from different identities or revisions. After a mutation, use the returned "
+        "successor token for structural work; if audio_evidence is stale, do not analyze old "
+        "audio with it. For reaper_analyze, evidence_revision binds the measured WAV; "
+        "revision_after_capture may include render-restoration counter churn and is not the "
+        "audio revision. On stale_context/audio_evidence_fresh, inspect details and "
+        "next_action, check whether an exact-revision capture already exists, then make at "
+        "most one fresh capture/open/fetch-all-pages/ack cycle and retry the refused call "
+        "once. If it still fails, stop and report the exact blocker; never loop captures or "
+        "launch duplicate synchronous analysis. render_candidate_mismatch is failed "
+        "verification: do not retry blindly or call an FX-chunk difference harmless. Read "
+        "the affected project and FX parameters through MCP; without semantic before/after "
+        "evidence, leave verification unresolved. A saved checkpoint proves persistence, "
+        "not audio quality: distinguish saved, read back, measured after the last edit, "
+        "and auditioned. Use MCP for all project reads, edits and analysis; never bypass "
+        "its gates with direct bridge calls, scripts, GUI operations or hand-edited RPP files."
     ),
 )
 
@@ -284,7 +306,8 @@ def _jsonable(value: Any) -> Any:
 
 def _next_action(code: str) -> str:
     return {
-        "stale_context": "Refresh the project context, inspect what changed, then prepare a new plan.",
+        "stale_context": ("Read the recovery contract and current project state; reuse an exact matching capture "
+                          "before creating one. Refresh once and retry once; stop if it is still stale."),
         "bridge_unavailable": "Check that REAPER is open and its resident ReaScript bridge is running.",
         "bridge_timeout": "Check the REAPER bridge status before retrying; the operation may still have completed.",
         "validation_error": "Correct the named field or use capability/API search to confirm the signature.",
@@ -298,10 +321,56 @@ def _next_action(code: str) -> str:
         "artifact_cleanup_failed": "Do not delete the directory manually; inspect the manifest and preserved paths.",
         "render_budget_exceeded": "Choose a shorter interval or a lower sample rate; the candidate is not delivered over budget.",
         "render_provenance_incomplete": "Do not use this candidate; fix the missing render settings, FX state or routing provenance first.",
-        "render_candidate_mismatch": "Re-read the applied plan and revision; do not treat a mismatched or content-changing render as the candidate.",
+        "render_candidate_mismatch": ("Do not retry the render. Read back the affected project and FX parameters "
+                                       "through MCP; keep verification unresolved unless semantic state matches."),
         "render_unsupported": "Update the resident bridge so it supports the native master-only render contract.",
         "render_candidate_refused": "Inspect the typed refusal details; no candidate audio was delivered.",
     }.get(code, "Inspect the structured error details and verify current REAPER state before retrying.")
+
+
+def _error_recovery(code: str, details: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Add a bounded recovery contract to context and candidate-render failures.
+
+    This tells the model how to recover without weakening fail-closed gates.
+    It never authorizes a retry or makes stale audio evidence current.
+    """
+    gate = str(details.get("gate") or "")
+    if code == "render_candidate_mismatch":
+        return {
+            "contract": "reaper_mcp_recovery/1",
+            "policy": "preserve_failed_verification",
+            "retry_limit": 0,
+            "required": [
+                "Do not run another candidate render for this mismatch.",
+                "Read back affected FX chains and parameter values through MCP.",
+                "If semantic before/after state cannot be established, report audio verification as unresolved.",
+            ],
+        }
+    if code != "stale_context" and gate not in {
+            "panorama_interpretation", "panorama_completion", "panorama_capture_read"}:
+        return None
+    audio_stale = (details.get("audio_state") == "stale" or
+                   details.get("audio_evidence") == "stale" or
+                   gate == "audio_evidence_fresh")
+    return {
+        "contract": "reaper_mcp_recovery/1",
+        "policy": "bounded_context_recovery",
+        "failure_scope": "audio_evidence" if audio_stale else "project_context_or_receipt",
+        "steps": [
+            "Read this error's details and next_action; do not replay rejected arguments with an old token.",
+            "Read the current project identity/revision and panorama status through MCP.",
+            "Reuse or finish a complete capture only if it matches the exact current project identity and revision.",
+            "If audio evidence is stale and no matching capture exists, create one capture, deliver every page, and acknowledge it.",
+            "Retry the originally refused operation at most once; if refused again, stop and report the exact blocker.",
+        ],
+        "retry_limit": 1,
+        "stop_after_repeat": True,
+        "do_not": [
+            "Do not start duplicate synchronous capture/analyze calls while one is running.",
+            "Do not create a new capture merely because a render advanced change_count if evidence_revision still matches.",
+            "Do not use a structural successor token to claim audio evidence is fresh.",
+        ],
+    }
 
 
 def _error_payload(exc: Exception) -> dict[str, Any]:
@@ -318,9 +387,13 @@ def _error_payload(exc: Exception) -> dict[str, Any]:
         code = "internal_error"
         message = "The MCP tool failed unexpectedly. No success is being reported."
         details = {"exception_type": type(exc).__name__}
-    return {"ok": False, "error": {"code": code, "message": message,
-                                     "details": _jsonable(details),
-                                     "next_action": _next_action(code)}}
+    error = {"code": code, "message": message,
+             "details": _jsonable(details),
+             "next_action": _next_action(code)}
+    recovery = _error_recovery(code, details)
+    if recovery is not None:
+        error["recovery"] = recovery
+    return {"ok": False, "error": error}
 
 
 def _guard(function):
@@ -735,20 +808,131 @@ def _analysis_windows(report: dict[str, Any], section: Section | None,
 @server.tool()
 @_guard
 def reaper_session(action: str = "health",
-                   bridge_session_id: str | None = None) -> dict[str, Any]:
+                   bridge_session_id: str | None = None,
+                   project_id: str | None = None) -> dict[str, Any]:
     """Inspect the REAPER connection or list live instances/projects.
 
-    action: health, list_instances, or list_projects. When several REAPER
-    instances are live, pass bridge_session_id to bind subsequent calls.
+    action: health, list_instances, list_projects, or dirty. When several
+    REAPER instances are live, pass bridge_session_id to bind subsequent calls.
+    ``dirty`` is a read-only gate: it reports whether the active project holds
+    unsaved changes, which is what a controlled restart must not discard.
     """
-    if action not in {"health", "list_instances", "list_projects"}:
-        raise ValidationError("action must be health, list_instances, or list_projects")
+    if action not in {"health", "list_instances", "list_projects", "dirty"}:
+        raise ValidationError(
+            "action must be health, list_instances, list_projects, or dirty")
     bridge = ReaperBridge(bridge_session_id=bridge_session_id)
     if action == "list_instances":
         return {"instances": bridge.discover_instances()}
     if action == "list_projects":
         return bridge.list_projects()
+    if action == "dirty":
+        # One tab when project_id is given, every open tab otherwise: a
+        # controlled restart must not discard unsaved state from ANY of them.
+        if project_id:
+            state = bridge.call("project.render_settings.read",
+                                {"project_id": project_id}, timeout_s=5.0)
+            dirty = state.get("dirty") if isinstance(state, dict) else None
+            if not isinstance(dirty, (int, float)) or isinstance(dirty, bool):
+                raise BridgeUnavailable("REAPER returned no project dirty state",
+                                        details={"project_id": project_id, "state": state})
+            return {"dirty": bool(dirty), "project_id": project_id,
+                    "revision": state.get("revision"),
+                    "render_targets": state.get("render_targets")}
+        listing = bridge.list_projects()
+        rows: list[dict[str, Any]] = []
+        for entry in listing.get("projects") or []:
+            revision = entry.get("revision") or {}
+            pid = revision.get("project_id")
+            if not isinstance(pid, str) or not pid:
+                raise BridgeUnavailable("REAPER returned a project without an id",
+                                        details={"entry": entry})
+            state = bridge.call("project.render_settings.read",
+                                {"project_id": pid}, timeout_s=5.0)
+            dirty = state.get("dirty") if isinstance(state, dict) else None
+            if not isinstance(dirty, (int, float)) or isinstance(dirty, bool):
+                raise BridgeUnavailable("REAPER returned no project dirty state",
+                                        details={"project_id": pid, "state": state})
+            rows.append({"project_id": pid, "name": entry.get("name"),
+                         "active": bool(entry.get("is_active")),
+                         "change_count": revision.get("change_count"),
+                         "dirty": bool(dirty)})
+        return {"projects": rows,
+                "clean": all(not row["dirty"] for row in rows),
+                "dirty_count": sum(1 for row in rows if row["dirty"])}
     return bridge.health(timeout_s=3.0)
+
+
+@server.tool()
+@_guard
+def reaper_checkpoint_save(path: str, project_id: str,
+                           expected_revision: dict[str, Any],
+                           verify_media: bool = True,
+                           bridge_session_id: str | None = None) -> dict[str, Any]:
+    """Save the active project to a new .RPP checkpoint and verify the result.
+
+    Narrow by design: save-as only, an existing file is refused (never
+    overwritten), and the call only accepts the active project at the exact
+    revision the caller read. This is not a substitute for the capture gate; it
+    stores unsaved state before a controlled restart. The answer is verified —
+    new path, rebound project id, ``dirty == 0`` and every audio source online —
+    and any mismatch raises even though the file was written.
+    """
+    bridge = ReaperBridge(bridge_session_id=bridge_session_id)
+    return save_checkpoint(
+        path=path,
+        project_id=project_id,
+        root=checkpoint_root(),
+        expected_revision=expected_revision,
+        call=bridge.call,
+        health=lambda: bridge.health(timeout_s=3.0),
+        context=lambda: bridge.call(
+            "project.context",
+            {"include_items": True, "include_fx_params": False},
+            timeout_s=120.0),
+        verify_media=verify_media,
+    )
+
+
+@server.tool()
+@_guard
+def reaper_bridge_reload(timeout_s: float = 45.0,
+                         bridge_session_id: str | None = None) -> dict[str, Any]:
+    """Activate the bridge build that is already on disk, without touching the project.
+
+    This is a lifecycle call, not a project edit: it compiles the on-disk bridge
+    script first (a broken file is refused and the running copy is left alone),
+    then asks the resident loop to hand the mailbox to the new copy. It never
+    saves, closes or reloads a project. The result names the previous and the
+    new session and their builds, and it fails closed when exactly one new
+    session with the expected build cannot be proven. A legacy bridge without
+    this lifecycle contract is refused; this tool never attempts action bootstrap.
+    """
+    path = bridge_script_path()
+    build = script_build(path)
+    if not build:
+        raise ValidationError(
+            "The on-disk bridge script declares no build; refusing to activate it",
+            details={"path": str(path)})
+    bridge = ReaperBridge(bridge_session_id=bridge_session_id)
+
+    initial = bridge.health(timeout_s=3.0)
+    project = initial.get("project") if isinstance(initial, Mapping) else None
+    expected_project_id = (project.get("project_id")
+                           if isinstance(project, Mapping) else None)
+    result = activate_bridge(
+        health=lambda session: ReaperBridge(
+            bridge_session_id=session or bridge_session_id).health(timeout_s=3.0),
+        discover=bridge.discover_instances,
+        request_reload=lambda expected: bridge.call(
+            "bridge.lifecycle",
+            {"action": "reload", "expected_build": expected},
+            timeout_s=10.0),
+        expected_project_id=expected_project_id,
+        build=build,
+        timeout_s=timeout_s,
+    )
+    result["script_path"] = str(path)
+    return result
 
 
 @server.tool()

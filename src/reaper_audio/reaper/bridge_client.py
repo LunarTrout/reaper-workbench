@@ -97,6 +97,15 @@ def default_runtime_dir() -> Path:
     return Path(root) / "REAPER-Audio-Library" / "runtime"
 
 
+def _render_row_name_ok(name: Any) -> bool:
+    """A rendered track row needs a string label, not necessarily a non-empty one.
+
+    REAPER allows unnamed tracks; the bridge substitutes a ``Track <n>`` label
+    for them, but the contract must not reject an empty string on its own.
+    """
+    return isinstance(name, str)
+
+
 class ReaperBridge:
     """Synchronous client for a single resident ReaScript service.
 
@@ -724,7 +733,7 @@ class ReaperBridge:
             index, is_master = item.get("track_index"), item.get("is_master")
             bytes_count, target = item.get("bytes"), item.get("path")
             if (not isinstance(guid, str) or not guid or guid in seen_guids or
-                    not isinstance(name, str) or not name or
+                    not _render_row_name_ok(name) or
                     not isinstance(is_master, bool) or
                     isinstance(index, bool) or not isinstance(index, int) or
                     isinstance(bytes_count, bool) or not isinstance(bytes_count, int) or

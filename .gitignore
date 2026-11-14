@@ -31,6 +31,7 @@ env/
 /docs/STATUS.ru.md
 # Superseded bridge snapshot kept locally for comparison.
 /scripts/reaper_bridge.full.lua
+/scripts/reaper_bridge.lua.bak_*
 *.RPP
 *.RPP-bak
 *.RPP-UNDO
