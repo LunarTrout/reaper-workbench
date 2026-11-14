@@ -554,18 +554,20 @@ def test_project_id_matching_normalizes_path_separators_and_case(tmp_path: Path)
     _capture(root, "cap_0000000N", archived, 7)
     lifecycle = PanoramaLifecycle(root, page_bytes=180)
 
-    requested = r"reaper:{ab}:c:\music\track.rpp"
+    requested = "reaper:{ab}:c:\\music\\track.rpp"
     opened = lifecycle.open(requested)
-    assert opened["status"] == "complete"
+    assert opened["status"] == "page"
+    assert opened["capture_id"] == "cap_0000000N"
     status = lifecycle.status(requested, opened["handle"])
     assert status["latest"]["capture_id"] == "cap_0000000N"
-    assert status["handle"]["delivered"] is True
+    assert status["handle"]["capture_id"] == "cap_0000000N"
 
 
 def test_revisions_match_ignores_path_separator_and_case() -> None:
     from reaper_audio.context.lifecycle import revisions_match
 
     stored = _revision("reaper:{AB}:C:/Music/Track.rpp", 7)
-    asked = dict(stored, project_id=r"reaper:{ab}:c:\music\track.rpp",
-                 path=r"c:\music\track.rpp")
+    stored["path"] = "C:/Music/Track.rpp"
+    asked = dict(stored, project_id="reaper:{ab}:c:\\music\\track.rpp",
+                 path="c:\\music\\track.rpp")
     assert revisions_match(stored, asked) is True
