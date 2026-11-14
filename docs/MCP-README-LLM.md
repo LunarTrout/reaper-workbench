@@ -488,7 +488,16 @@ The normal sequence has three steps:
    rendering (`page_target_bytes` defaults to 30,000 and `max_page_bytes` to
    46,000). These are not UTF-8 wire-byte counts or the complete MCP transport
    envelope, so the actual response limit of the connected host must be checked
-   separately.
+   separately. Keep these defaults unless a larger response has been verified
+   in this exact host. Do not request a very large single page to avoid
+   pagination: Hermes may move a large tool result to spillover, leaving only a
+   notice and preview in the model's context. If any panorama page is replaced
+   by a spillover/persisted-output notice, do not acknowledge it or treat it as
+   read. Re-open the same `capture_id` with smaller page sizes, fetch every full
+   page, and acknowledge only after the page text itself is present in the
+   conversation context. A receipt proves that the server served every page;
+   it does not prove that the host exposed the complete text to the model or
+   that the model understood it.
 3. Fetch every page with `reaper_panorama_page(handle, revision, archive_root,
    page_id)`, then call `reaper_panorama_ack(handle, revision, archive_root,
    page_hashes)` with the hashes in manifest order. The server checks that every
