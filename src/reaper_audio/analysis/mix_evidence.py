@@ -82,20 +82,29 @@ def build_mix_evidence(report: Mapping, *, masking_db: float = 6.0,
             })
 
     partial = report.get("partial_loudness")
-    if isinstance(partial, Mapping):
+    partial_block = None
+    if isinstance(partial, Mapping) and partial.get("status") == "available":
+        # Raw model shares, reported descriptively. No threshold, no
+        # too-quiet/exposed flag and no severity: a share is relative to the
+        # supplied sources, not an audibility measurement or a defect.
+        shares = {}
         for source_id, item in (partial.get("sources") or {}).items():
             share = (item.get("summary") or {}).get("share_of_partial_loudness_pct")
-            if not isinstance(share, (int, float)):
-                continue
-            if share < 5.0 or share > 45.0:
-                issues.append({
-                    "id": "partial_audibility",
-                    "severity": round(min(3.0, abs(share - 20.0) / 10.0), 2),
-                    "sources": [_name(sources, source_id)],
-                    "evidence": {"share_of_partial_loudness_pct": share},
-                    "question": ("Is this source too exposed or too buried for "
-                                 "the section, and what should mask it?"),
-                })
+            if isinstance(share, (int, float)):
+                shares[_name(sources, source_id)] = share
+        partial_block = {
+            "status": "available",
+            "node": partial.get("node"),
+            "stage": partial.get("stage"),
+            "window": partial.get("window"),
+            "n_sources": partial.get("n_sources"),
+            "share_denominator": partial.get("share_denominator"),
+            "equal_share_baseline_pct": partial.get("equal_share_baseline_pct"),
+            "shares_pct": shares,
+            "gate": (partial.get("gate") or {}).get("status"),
+            "interpretation": ("Raw model shares after the reconstruction gate. Not "
+                               "audibility, no classification, no threshold applied."),
+        }
 
     phase = report.get("pairwise_phase")
     if isinstance(phase, Mapping):
@@ -125,10 +134,11 @@ def build_mix_evidence(report: Mapping, *, masking_db: float = 6.0,
     total_issues = len(issues)
     issues.sort(key=lambda item: -item["severity"])
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "issues": issues[:max_issues],
         "total_issues": total_issues,
         "truncated": total_issues > max_issues,
+        "partial_loudness": partial_block,
         "source_levels": {
             _name(sources, source_id): {
                 "rms_dbfs": _value(source, "rms_dbfs"),

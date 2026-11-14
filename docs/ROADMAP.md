@@ -306,14 +306,14 @@ final:   -12.74 LUFS, distance 7.950  (ratio 0.772)
 
 ```bash
 # интерпретатор библиотеки
-PY=C:/Users/epicc/mcp/flstudio-mcp/.venv313/Scripts/python.exe
+PY=<local-tooling>/flstudio-mcp/.venv313/Scripts/python.exe
 
 # тесты
 PYTHONPATH=src $PY -m pytest tests -q          # 164 passed
 
 # бенчмарк оценки на корпусе
 PYTHONPATH=src $PY scripts/corpus_benchmark.py \
-  --corpus C:/Users/epicc/Desktop/PROJECTS/vers1/_refs/corpus_ex \
+  --corpus <local-projects>/vers1/_refs/corpus_ex \
   --out work/corpus_benchmark.json
 
 # отчёт по файлу: расстояние, перцентиль, вклад признаков, гейты

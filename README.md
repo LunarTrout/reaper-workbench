@@ -32,22 +32,17 @@ The bridge and Python client communicate through local request and response file
 
 The catalog is a discovery surface, not a claim that every API function has been exercised or has a safe transaction wrapper. Generic API calls and Actions are low-level operations; they are not automatically covered by the library's preview/undo guarantees.
 
-### Reference-driven assessment and the measured cycle
+### Reference-corpus research tools
 
-- `reaper_audio.corpus` measures excerpts against a reference corpus: standard
-  loudness (BS.1770-5 via `phonometry`), level-invariant production features,
-  a distance whose centre, scale and covariance are estimated from the corpus
-  at runtime, leave-one-source-out benchmarks, and defect gates (clipping with
-  flat tops, DC, drop-outs, level jumps, true peak).
-- `reaper_audio.daw.cycle` runs one measurable EQ pass: corpus deltas, one move
-  per render, accept only when the measured distance improves **and** no gate
-  violation is introduced, then loudness restoration found by bisection on the
-  rendered file.
-- Commands: `scripts/corpus_benchmark.py`, `scripts/corpus_assess.py`,
-  `scripts/role_assess.py`, `scripts/eq_cycle.py`.
-- Method and measured numbers: [ROADMAP](docs/ROADMAP.md); thresholds are a
-  project setting, not code: [POLICY](docs/POLICY.md); the measurement method
-  without a quality formula: [MIX-QUALITY-METHODOLOGY](docs/MIX-QUALITY-METHODOLOGY.ru.md).
+The optional `corpus` package compares declared reference material using
+measured signal features, controlled-degradation benchmarks and explicit defect
+gates. A separate experimental EQ cycle can test one measured candidate change
+and reject it if the measurement moves the wrong way or a defect gate regresses.
+These research tools are not part of the default capture path, do not prescribe
+a mix workflow, and do not produce a universal quality verdict. Their dataset
+scope, method, measured results and limits are documented in the
+[roadmap](docs/ROADMAP.md), [policy](docs/POLICY.md), and
+[measurement methodology](docs/MIX-QUALITY-METHODOLOGY.ru.md).
 
 ### Audio analysis
 
@@ -57,9 +52,11 @@ The catalog is a discovery surface, not a claim that every API function has been
 - Compare a project source with another file or a selected time window from a reference file.
 - Produce structured mix evidence and edit evidence from measurements without encoding a fixed order of operations.
 
-REAPER's Audio Accessor is a different signal tap: its samples are pre-FX and must not be described as processed mix stems. The current project-analysis path uses REAPER rendering. Capture details and known limits are documented with the validation status; never infer signal stage from a filename alone.
+REAPER's Audio Accessor is a different signal tap: its samples are pre-FX and must not be described as processed mix stems. The current project-analysis path uses REAPER rendering. See [full-capture and analysis details](docs/FULL-CAPTURE.md) and the [validation status](docs/VALIDATION.md); never infer signal stage from a filename alone.
 
 Analysis audio is stored outside the `.RPP` in a bounded job directory. It is leased for the analysis request and cleaned up on release or by the stale-job policy. The capture path may temporarily change render settings or track selection and restore them afterward; callers must use the returned revision rather than assuming the project's change counter is unchanged.
+
+Full-capture master renders are silence-aware and fail-closed. The library checks the rendered master peak/RMS and classifies the result using the rendered source stems and captured REAPER state. A silent section, all sources muted, or an intentionally muted/zeroed master is accepted with `capture_status="valid_expected_silence"` and `master_validation.status="expected_silence"`. A silent master with audible sources and an audible signal path is unexpected: the library allows one bounded retry and preserves every failed attempt as archived evidence referenced by `timings.master_attempts`. If both attempts are unexpectedly silent, the capture is still archived for chronological evidence but the call returns the structured `capture_master_invalid` failure; `ok=true` is never returned with an unexplained invalid master. A successful retry returns `capture_status="valid_after_retry"` and keeps the failed attempt's hash/archive path. Production DSP analysis has a hard cap of 8 workers: windows up to 30 seconds may use up to 8, subject to source count and available memory; long or unknown windows default to 4. Counts of 12 and 16 are benchmark-only, not production settings.
 
 #### What is measured, and what the model receives
 
@@ -67,7 +64,9 @@ One reaper_analyze request captures every non-master track and the master as sep
 
 Every source is tied to its project revision, track GUID, time window, sample rate, capture method, and available track context. That context includes the track's current fader, pan, mute/solo state and available FX/routing information; the project tempo map is looked up at each point on the analysis timeline. A separate rendered master is analyzed in the same request. A track render and the master answer different questions, so neither is used as a substitute for the other.
 
-The report contains measurements at several time scales:
+The detailed analysis record contains measurements at several time scales. The roughly 100 ms feature tape belongs to that detailed record; it is not all copied into the initial model-facing panorama. The panorama shows a bounded, multi-resolution project-wide view and declares its time coverage and aggregation. For example, its cross-source RMS map has at most 24 timeline buckets; exact RMS, band-level and temporal-profile series remain in the capture record and can be retrieved with a revision-bound semantic query. The summaries do not replace or delete those source series.
+
+The detailed report contains measurements at several time scales:
 
 | Analysis | What it reports | How to interpret it |
 |---|---|---|
@@ -94,7 +93,7 @@ Optional partial-loudness attribution estimates how each aligned stem contribute
 
 The analysis is DSP-based: it measures levels, spectra, envelopes, periodicity and stereo relationships. It does not run an instrument-recognition model, identify a guitar or drum part by genre, judge whether a mix is good, or prescribe EQ, panning, compression or mastering targets. Any edit decision must combine these measurements with the actual audio, the project state and the user's stated goal. In dense or heavily distorted metal, transient and pitch candidates need particular care: fast attacks, cymbals, distortion and layered performances can confuse simple signal features.
 
-The MCP result returns a compact per-source summary and URIs for the detailed report and captured audio. A source row contains its GUID, name, master-track flag, fader, pan, mute state, capture metadata, summary metrics and audio URI; the full report adds track context, time curves, event candidates, coverage, comparisons and provenance. In outline, the model sees a revisioned project summary and a list of records shaped like this:
+The MCP result returns a per-source summary and URIs for the detailed report and captured audio. A source row contains its GUID, name, master-track flag, fader, pan, mute state, capture metadata, summary metrics and audio URI; the full report adds track context, time curves, event candidates, coverage, comparisons and provenance. In outline, the model sees a revisioned project summary and a list of records shaped like this:
 
 ~~~json
 {
@@ -114,9 +113,36 @@ The actual report also carries project tempo at each timeline cell, FX/routing c
 
 ### LLM-facing interface
 
-The MCP server currently exposes a compact set of **12 tools** and **5 resource templates**. It does not publish one tool per ReaScript function. The model can inspect project context, browse capability domains, search an operation by structured object/operation qualifiers, request integrated analysis, prepare and apply supported edit batches, and call lower-level API functions or Actions when needed.
+The MCP server currently exposes **29 tools** and **5 resource templates**. The interface covers project-context delivery (open, page, acknowledge, exact query, status, delta and refresh), a plan-bound candidate render (`reaper_render_candidate`), capability discovery, integrated analysis, supported edit batches, listener/spatial diagnostics, timeline context, and lower-level REAPER API functions or Actions. Candidate rendering uses REAPER's native master path and checks settings restoration and project state; if the check detects a mismatch, the WAV is deleted and the request fails closed. Live comparison against a normal REAPER render is still an open validation item; see [Validation status](docs/VALIDATION.md). The server does not publish one tool per ReaScript function.
 
-The model-facing contract is intentionally broader than preset musical workflows. Mixing, editing, arranging, MIDI authoring, and other tasks are expressed as goals assembled from project inspection, analysis, and REAPER operations; the interface does not impose genre rules or a fixed processing chain. See the [model guide](docs/MCP-README-LLM.md) for tool semantics and context handling.
+Project context is a paged delivery of one view fixed to one capture and revision. `reaper_panorama_open` returns page 1 plus a manifest of every page id, payload hash and measured page size; `reaper_panorama_page` fetches the rest and `reaper_panorama_ack` verifies every page hash, reconstructs the exact `view_sha256` and mints the receipt plus context token. Pagination preserves that view without further truncation; the view itself is a bounded projection, so dense time series are summarized and linked to exact archived data. Page count adapts to the configured serialized-response budget; larger projects yield more pages. Mutating tools (`reaper_edit` apply/undo, `reaper_api_call`, `reaper_action` invoke, `reaper_save`) and project-target analysis/read tools (`reaper_analyze`, spatial/Flamingo project targets, `reaper_mix_evidence`, `reaper_edit_map`, `reaper_panorama_query`, and `reaper_capture_read`) reject a missing, stale or mismatched token. The bootstrap `reaper_capture_snapshot` is the only no-receipt capture operation and returns capture/archive metadata only, not the view. Exact high-frequency rows — relation edges, series cells, MIDI notes, envelope points — come from one generic semantic query (`reaper_panorama_query`) that returns a coherent fragment whole or reports `query_too_large` with its measured size. Deltas are bound to an exact base capture/fact root and their successor token is delivered in the same response; `refresh` is the normal recovery path after loss or staleness. The receipt guarantees delivery of these exact pages (view hash, revision, fact root), never that a model read or understood them.
+
+The page parameters are named `*_bytes` for compatibility, but the current implementation measures the character count of an indented JSON rendering of each result; this is not a UTF-8 wire-byte count or the complete MCP transport envelope, and host-specific limits still need validation. Defaults are 30,000 characters target and 46,000 characters maximum per page. On the archived 41-track / 42-source reference capture the full model view is 46,977 compact bytes and is delivered in 5 pages (31,691 / 27,681 / 14,266 / 38,084 / 25,890 measured characters, max 38,084); the 101-source synthetic fixture (80,717-byte view) needs 12 pages, max 45,185. There is no page-count cap. A section larger than one page is split only at list-element boundaries with its head repeated; a single element that cannot fit raises with its measured size. The view keeps every track/master and all 24 scalar metric columns with units, window, stage and method provenance; exact item/take/audio rows, series cells, relation edges, MIDI notes and envelope points stay addressable by one semantic query. Inline scalar values are explicitly rounded, and `reaper_panorama_query(data=["analysis"], objects=[...], metrics=[...])` returns the unrounded stored values.
+
+The model-facing contract is intentionally broader than preset musical workflows. Mixing, editing, arranging, MIDI authoring, and other tasks are expressed as goals assembled from project inspection, analysis, and REAPER operations; the interface does not impose genre rules or a fixed processing chain. See the [model guide](docs/MCP-README-LLM.md) for tool semantics and context handling, and [the decision record](docs/DECISION-single-response-panorama.md) for the delivery-history decisions.
+
+### Working principles (not a mixing pipeline)
+
+- Begin from the delivered whole-project view for the exact revision: fetch
+  every page in the manifest and acknowledge them. Until `reaper_panorama_ack`
+  returns `complete`, the map is partial and no analysis or edit is allowed.
+  Exact queries fetch detail behind the map; they never replace it.
+- Choose capabilities from the user's goal and the observed evidence. A full
+  capability surface is not an instruction to run every analyzer or add FX.
+- Keep project facts, measured signal properties, model hypotheses and the
+  user's aesthetic judgment separate. Cite units, stage, window and provenance.
+- Treat missing, stale, invalidated or incomparable evidence as a stated gap,
+  not as silence or “no change”.
+- After an edit, read the actual state back; if the change affects signal or
+  arrangement, recapture before reusing old audio/measurement conclusions.
+- Preserve alternatives and uncertainty; do not infer role or quality from a
+  track name, one metric or a genre recipe.
+
+Anti-patterns: treating a spill preview or a hand-reassembled set of query
+answers as the full project view; mutating on a stale context token; applying a
+delta to a different base; labeling a reduced projection “full”; hiding an
+over-budget outcome; or inventing a better/worse verdict without listening and
+evidence.
 
 ## Installation and connection
 
@@ -157,6 +183,7 @@ The server speaks MCP over stdio. It expects the REAPER bridge to be running in 
 
 - [Installation and connection](docs/INSTALLATION.md)
 - [Architecture and data flow](docs/ARCHITECTURE.md)
+- [Full capture and analysis details](docs/FULL-CAPTURE.md)
 - [Safety and project-state guarantees](docs/SAFETY.md)
 - [MCP guide for language models](docs/MCP-README-LLM.md)
 - [Validation status and release gates](docs/VALIDATION.md)

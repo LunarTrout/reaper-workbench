@@ -1,7 +1,7 @@
 # Music Flamingo — A/B proof that the captured master audio is complete and correct
 
 Date: 2026-11-11. Project used for the test: a byte-identical copy of the user's working
-mix, `C:/Users/epicc/Desktop/PROJECTS/vers1_reaper/vers1_abtest.RPP`
+mix, `<local-projects>/vers1_reaper/vers1_abtest.RPP`
 (md5 `5385ef2b7a36b1ef41de766763942512`, identical to `vers1_mix_20261111.RPP`;
 the copy was never saved, so the file on disk stayed unchanged).
 

@@ -19,6 +19,33 @@ LO = FC * 10 ** (-1 / 20)
 HI = FC * 10 ** (1 / 20)
 
 PITCH_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+_WINDOW_CACHE: dict[int, np.ndarray] = {}
+
+
+def _hann_window(n: int) -> np.ndarray:
+    """Reuse Hann windows across the thousands of equally sized cells."""
+    window = _WINDOW_CACHE.get(n)
+    if window is None:
+        window = np.hanning(n)
+        _WINDOW_CACHE[n] = window
+    return window
+
+
+def _linear_slope(times: np.ndarray, values: np.ndarray) -> float:
+    """Least-squares slope for evenly sampled decay quarters.
+
+    Equivalent to the historical first-degree ``np.polyfit`` call, without
+    constructing a Vandermonde matrix for every cell and band.
+    """
+    times = np.asarray(times, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    t_mean = float(times.mean())
+    v_mean = float(values.mean())
+    denom = float(np.sum((times - t_mean) ** 2))
+    if denom <= 0:
+        return 0.0
+    return float(np.sum((times - t_mean) * (values - v_mean)) / denom)
+
 
 
 def _bands_matrix(nfft: int, fs: int) -> np.ndarray:
@@ -34,14 +61,90 @@ def _bands_matrix(nfft: int, fs: int) -> np.ndarray:
     return M
 
 
+_ERB_MATRIX_CACHE: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+
+
+def _erb_matrix(nfft: int, fs: int) -> tuple[np.ndarray, np.ndarray]:
+    """Reuse the fixed 24-band ERB masks for every temporal cell."""
+    key = (nfft, fs)
+    cached = _ERB_MATRIX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    freqs = np.fft.rfftfreq(nfft, 1.0 / fs)
+    lo = ERB_FC / 10 ** (1 / 24)
+    hi = ERB_FC * 10 ** (1 / 24)
+    matrix = np.zeros((len(ERB_FC), len(freqs)), dtype=np.float64)
+    any_band = np.zeros(len(ERB_FC), dtype=bool)
+    for index, (a, b) in enumerate(zip(lo, hi)):
+        mask = (freqs >= a) & (freqs < b)
+        matrix[index] = mask
+        any_band[index] = bool(mask.any())
+    cached = (matrix, any_band)
+    _ERB_MATRIX_CACHE[key] = cached
+    return cached
+
+
+def _decay_and_coherence(seg_l, seg_r, fs):
+    """Compute decay and coherence from one quarter-spectrum pass.
+
+    The historical helpers used the same quarter windows but computed the FFTs
+    twice (once per channel for decay and once per channel for coherence).
+    Reusing those spectra is exact when every quarter has the same length; the
+    mixed-length edge case falls back to the original helpers.
+    """
+    channels = np.column_stack((seg_l, seg_r))
+    parts = np.array_split(channels, 4, axis=0)
+    lengths = {len(part) for part in parts}
+    if any(len(part) < 32 for part in parts) or len(lengths) != 1:
+        return _band_decay(seg_l, seg_r, fs), _coherence(seg_l, seg_r, fs)
+    n = len(parts[0])
+    window = _hann_window(n)
+    f = np.fft.rfftfreq(n, 1.0 / fs)
+    stacked = np.stack([part * window[:, None] for part in parts], axis=0)
+    spectra = np.fft.rfft(stacked, axis=1)
+    powers = np.mean(np.abs(spectra) ** 2, axis=2)
+    edges = ((20, 200), (200, 2000), (2000, 16000))
+    e_by_edge = []
+    sxy_by_edge = []
+    sxx_by_edge = []
+    syy_by_edge = []
+    for lo, hi in edges:
+        mask = (f >= lo) & (f < hi)
+        e = [float(power[mask].sum()) + 1e-20 for power in powers]
+        left = spectra[:, :, 0]
+        right = spectra[:, :, 1]
+        sxy = (left[:, mask] * np.conj(right[:, mask])).sum()
+        sxx = float((np.abs(left[:, mask]) ** 2).sum())
+        syy = float((np.abs(right[:, mask]) ** 2).sum())
+        e_by_edge.append(e)
+        sxy_by_edge.append(sxy)
+        sxx_by_edge.append(sxx)
+        syy_by_edge.append(syy)
+    decay = []
+    for e in e_by_edge:
+        db = 10 * np.log10(np.array(e))
+        t = np.arange(len(db)) * (n / fs)
+        slope = _linear_slope(t, db) if len(db) > 1 else 0.0
+        decay.append(round(float(slope), 0))
+    coherence = []
+    for sxy, sxx, syy in zip(sxy_by_edge, sxx_by_edge, syy_by_edge):
+        denom = sxx * syy
+        coherence.append(round(float(abs(sxy) ** 2 / denom) if denom > 0 else 0.0, 3))
+    return decay, coherence
+
+
 def _active(x: np.ndarray, n: int = 2048) -> np.ndarray:
     """Самый громкий кусок клетки: там и живёт тон, а не в хвосте затухания."""
     if x.size <= n:
         return x
-    e = np.convolve(np.abs(x), np.ones(n) / n, mode="same")
-    i = int(np.argmax(e))
-    s = max(0, min(i - n // 2, x.size - n))
-    return x[s:s + n]
+    # The original used a same-mode moving average.  Its maximum over full
+    # windows is exactly the maximum of the window sums; prefix sums avoid the
+    # O(N*n) direct convolution without changing the selected window.
+    magnitudes = np.abs(x)
+    csum = np.concatenate(([0.0], np.cumsum(magnitudes, dtype=np.float64)))
+    window_sums = csum[n:] - csum[:-n]
+    i = int(np.argmax(window_sums))
+    return x[i:i + n]
 
 
 def _f0_and_hnr(x: np.ndarray, fs: int, fmin: float = 40.0, fmax: float = 1200.0):
@@ -155,14 +258,14 @@ def _band_decay(seg_l, seg_r, fs, nquart=4):
     for lo, hi in edges:
         e = []
         for p in parts:
-            spectrum = np.fft.rfft(p[:n] * np.hanning(n)[:, None], axis=0)
+            spectrum = np.fft.rfft(p[:n] * _hann_window(n)[:, None], axis=0)
             sp = np.mean(np.abs(spectrum) ** 2, axis=1)
             f = np.fft.rfftfreq(n, 1.0 / fs)
             m = (f >= lo) & (f < hi)
             e.append(float(sp[m].sum()) + 1e-20)
         db = 10 * np.log10(np.array(e))
         t = np.arange(len(db)) * (n / fs)
-        slope = np.polyfit(t, db, 1)[0] if len(db) > 1 else 0.0
+        slope = _linear_slope(t, db) if len(db) > 1 else 0.0
         vals.append(round(float(slope), 0))
     return vals
 
@@ -185,14 +288,26 @@ def _coherence(seg_l, seg_r, fs, edges=((20, 200), (200, 2000), (2000, 16000))):
         sxx = 0.0
         syy = 0.0
         for pl, pr in zip(parts_l, parts_r):
-            L = np.fft.rfft(pl * np.hanning(len(pl)))
-            R = np.fft.rfft(pr * np.hanning(len(pr)))
+            window = _hann_window(len(pl))
+            L = np.fft.rfft(pl * window)
+            R = np.fft.rfft(pr * window)
             sxy += (L[m] * np.conj(R[m])).sum()
             sxx += float((np.abs(L[m]) ** 2).sum())
             syy += float((np.abs(R[m]) ** 2).sum())
         denom = sxx * syy
         out.append(round(float(abs(sxy) ** 2 / denom) if denom > 0 else 0.0, 3))
     return out
+
+
+def _window_rms(x: np.ndarray, win: int, hop: int) -> np.ndarray:
+    """Windowed RMS for the exact start sequence used by the tape scanners."""
+    if x.size == 0:
+        return np.array([], dtype=float)
+    starts = np.arange(0, max(1, x.size - win), hop, dtype=np.int64)
+    if x.size < win:
+        return np.asarray([float(np.sqrt(np.mean(x[0:win] ** 2)))])
+    windows = np.lib.stride_tricks.sliding_window_view(x, win)[starts]
+    return np.sqrt(np.mean(windows ** 2, axis=1))
 
 
 def _modulation(x, fs: int) -> dict:
@@ -202,12 +317,11 @@ def _modulation(x, fs: int) -> dict:
         x = np.sqrt(np.mean(x ** 2, axis=1))
     hop = max(1, int(0.005 * fs))
     win = max(32, int(0.02 * fs))
-    env = np.array([float(np.sqrt(np.mean(x[i:i + win] ** 2)))
-                    for i in range(0, max(1, len(x) - win), hop)])
+    env = _window_rms(x, win, hop).astype(float)
     if env.size < 16 or env.max() <= 0:
         return {"rate_hz": 0.0, "depth": 0.0}
     env = env - env.mean()
-    spec = np.abs(np.fft.rfft(env * np.hanning(env.size)))
+    spec = np.abs(np.fft.rfft(env * _hann_window(env.size)))
     freqs = np.fft.rfftfreq(env.size, hop / fs)
     m = (freqs >= 2) & (freqs <= 12)
     if not m.any():
@@ -221,12 +335,14 @@ def _modulation(x, fs: int) -> dict:
 
 def analyze_cell(seg_l: np.ndarray, seg_r: np.ndarray, fs: int = 44100,
                  prev_rms_db: float | None = None, M: np.ndarray | None = None,
-                 nfft: int | None = None) -> dict:
+                 nfft: int | None = None,
+                 erb_matrix: np.ndarray | None = None,
+                 erb_present: np.ndarray | None = None) -> dict:
     """Все признаки одного отрезка (клетки ленты)."""
     nfft = nfft or len(seg_l)
     if M is None:
         M = _bands_matrix(nfft, fs)
-    win = np.hanning(nfft)
+    win = _hann_window(nfft)
     channels = np.column_stack((seg_l, seg_r))
     if len(channels) < nfft:
         pad = nfft - len(channels)
@@ -312,6 +428,7 @@ def analyze_cell(seg_l: np.ndarray, seg_r: np.ndarray, fs: int = 44100,
     midb = float(10 * np.log10(float(spec[(freqs >= 200) & (freqs < 2000)].sum()) + 1e-20))
     high = float(10 * np.log10(float(spec[(freqs >= 2000) & (freqs < 16000)].sum()) + 1e-20))
 
+    decay_bands, coherence = _decay_and_coherence(seg_l, seg_r, fs)
     cell = {
         "rms_db": round(rms_db, 1), "peak": round(peak, 4), "crest_db": round(crest_db, 1),
         "attack_s": attack_s, "decay_db": decay_db, "flux_db": flux_db, "zcr": round(zcr, 3),
@@ -322,13 +439,13 @@ def analyze_cell(seg_l: np.ndarray, seg_r: np.ndarray, fs: int = 44100,
         "note": (PITCH_NAMES[int(np.argmax(chroma))] if f0 > 0 else ""),
         "hnr_db": round(hnr, 1), "chroma": chroma,
         "harm": harm, "inharm": inharm, "formants": formants,
-        "decay_bands": _band_decay(seg_l, seg_r, fs),
-        "coherence": _coherence(seg_l, seg_r, fs),
+        "decay_bands": decay_bands,
+        "coherence": coherence,
         "corr": round(corr, 3), "width": round(width, 3), "pan": round(pan, 3),
         "low_db": round(low, 1), "mid_db": round(midb, 1), "high_db": round(high, 1),
         "hits": hits,
     }
-    cell["erb"] = _erb_bands(spec, freqs)
+    cell["erb"] = _erb_bands(spec, freqs, erb_matrix, erb_present)
     cell["wall"] = _wall(cell)
     return cell
 
@@ -340,11 +457,7 @@ def technique(stereo: np.ndarray, fs: int = 44100, cell_s: float = 0.1) -> dict:
         x = np.sqrt(np.mean(x ** 2, axis=1))
     hop = max(1, int(0.005 * fs))
     win = max(64, int(0.01 * fs))
-    env = []
-    for start in range(0, max(0, len(x) - win), hop):
-        seg = x[start:start + win]
-        env.append(float(np.sqrt(np.mean(seg ** 2))))
-    env = np.asarray(env)
+    env = _window_rms(x, win, hop)
     if env.size < 8:
         return {"per_cell": [], "rate_hz": 0.0}
     d = np.diff(env, prepend=env[0])
@@ -371,8 +484,12 @@ def technique(stereo: np.ndarray, fs: int = 44100, cell_s: float = 0.1) -> dict:
 
 
 def analyze(stereo: np.ndarray, fs: int = 44100, hop_s: float = 0.1,
-            nfft: int = 4096) -> dict:
-    """Compute time-local signal features and track-level summaries."""
+            nfft: int = 4096, loudness: dict | None = None) -> dict:
+    """Compute time-local signal features and track-level summaries.
+
+    ``loudness`` is an optional per-call reuse of already measured momentary
+    blocks/integrated loudness/LRA; it never persists between calls.
+    """
     x = np.asarray(stereo, dtype=float)
     if x.ndim == 1:
         x = x[:, None]
@@ -389,13 +506,15 @@ def analyze(stereo: np.ndarray, fs: int = 44100, hop_s: float = 0.1,
     left, right = x[:, 0], x[:, 1]
     hop = max(1, int(round(hop_s * fs)))
     M = _bands_matrix(nfft, fs)
+    erb_matrix, erb_present = _erb_matrix(nfft, fs)
 
     cells = []
     times = []
     prev = None
     for start in range(0, max(0, len(left) - hop // 2), hop):
         cell = analyze_cell(left[start:start + nfft], right[start:start + nfft], fs,
-                            prev_rms_db=prev, M=M, nfft=nfft)
+                            prev_rms_db=prev, M=M, nfft=nfft,
+                            erb_matrix=erb_matrix, erb_present=erb_present)
         if not has_stereo:
             cell["coherence"] = None
             cell["corr"] = None
@@ -424,7 +543,7 @@ def analyze(stereo: np.ndarray, fs: int = 44100, hop_s: float = 0.1,
            "onsets": len(onsets), "technique": technique(stereo, fs, hop_s),
            "mod_rate_hz": mod["rate_hz"], "mod_depth": mod["depth"],
            "jitter_pct": round(jitter, 2)}
-    out.update(extras(profile_audio, fs, cells))
+    out.update(extras(profile_audio, fs, cells, loudness=loudness))
     return out
 
 
@@ -505,8 +624,13 @@ def picture(tp: dict, band_rows: int = 14, width: int = 100) -> str:
 ERB_FC = np.geomspace(25.0, 12000.0, 24)
 
 
-def _erb_bands(spec, freqs):
+def _erb_bands(spec, freqs, matrix: np.ndarray | None = None,
+               any_band: np.ndarray | None = None):
     """24 ERB-подобные полосы (геометрическая сетка 25 Гц…12 кГц)."""
+    if matrix is not None and any_band is not None:
+        values = matrix @ spec
+        return [round(float(10 * np.log10(float(v) + 1e-20)), 1) if present else -200.0
+                for v, present in zip(values, any_band)]
     out = []
     lo = ERB_FC / 10 ** (1 / 24)
     hi = ERB_FC * 10 ** (1 / 24)
@@ -526,8 +650,13 @@ def _wall(cell) -> float:
     return round(float(min(1.0, 0.6 * share + 0.4 * rough)), 3)
 
 
-def _loudness_blocks(stereo, fs):
-    """Measure 400 ms momentary and 3 s short-term blocks independently of LRA."""
+def _loudness_blocks(stereo, fs, loudness: dict | None = None):
+    """Measure 400 ms momentary and 3 s short-term blocks independently of LRA.
+
+    ``loudness`` may carry the already-computed momentary blocks, integrated
+    loudness and LRA from the caller.  The short-term 3 s blocks are still
+    measured here because they are a distinct window size.
+    """
     x = np.asarray(stereo, dtype=np.float64)
     if x.ndim == 1:
         x = x[:, None]
@@ -542,24 +671,37 @@ def _loudness_blocks(stereo, fs):
     try:
         import pyloudnorm as pyln
 
-        momentary_meter = pyln.Meter(fs, block_size=0.4, overlap=0.75)
-        integrated = float(momentary_meter.integrated_loudness(x))
-        momentary = np.asarray(momentary_meter.blockwise_loudness, dtype=np.float64)
-        short_term = empty
-        lra = None
-        if len(x) >= 3 * fs:
+        if loudness is not None:
+            integrated = loudness.get("lufs")
+            lra = loudness.get("lra")
+            momentary = np.asarray(loudness.get("momentary", empty),
+                                   dtype=np.float64)
+            provided_short_term = loudness.get("short_term")
+        else:
+            momentary_meter = pyln.Meter(fs, block_size=0.4, overlap=0.75)
+            integrated = float(momentary_meter.integrated_loudness(x))
+            momentary = np.asarray(momentary_meter.blockwise_loudness,
+                                   dtype=np.float64)
+            lra = None
+            provided_short_term = None
+            if len(x) >= 3 * fs:
+                lra_meter = pyln.Meter(fs)
+                lra_value = float(lra_meter.loudness_range(x))
+                lra = lra_value if np.isfinite(lra_value) else None
+        short_term = (np.asarray(provided_short_term, dtype=np.float64)
+                      if provided_short_term is not None else empty)
+        if not short_term.size and len(x) >= 3 * fs:
             short_meter = pyln.Meter(fs, block_size=3.0, overlap=0.97)
             short_meter.integrated_loudness(x)
-            short_term = np.asarray(short_meter.blockwise_loudness, dtype=np.float64)
-            lra_meter = pyln.Meter(fs)
-            lra_value = float(lra_meter.loudness_range(x))
-            lra = lra_value if np.isfinite(lra_value) else None
+            short_term = np.asarray(short_meter.blockwise_loudness,
+                                    dtype=np.float64)
     except (ImportError, ValueError, FloatingPointError):
         return {"lufs": None, "lra": None, "momentary": empty,
                 "short_term": empty, "coverage": "unavailable"}
     momentary = np.nan_to_num(momentary, nan=-200.0, neginf=-200.0, posinf=0.0)
     short_term = np.nan_to_num(short_term, nan=-200.0, neginf=-200.0, posinf=0.0)
-    lufs = integrated if np.isfinite(integrated) else None
+    lufs = integrated if integrated is not None and np.isfinite(integrated) else None
+    lra = lra if lra is not None and np.isfinite(lra) else None
     if lufs is None:
         coverage = "silent_or_unmeasurable"
     elif len(x) < 3 * fs:
@@ -618,12 +760,12 @@ def _sii(cells) -> float:
     return round(float(min(1.0, num / den)), 3)
 
 
-def extras(stereo, fs: int, cells: list) -> dict:
+def extras(stereo, fs: int, cells: list, loudness: dict | None = None) -> dict:
     """Add loudness, tonal, speech-proxy and signal-check summaries to the tape."""
     x = np.asarray(stereo, dtype=float)
     if x.ndim == 1:
         x = x[:, None]
-    loud = _loudness_blocks(x, fs)
+    loud = _loudness_blocks(x, fs, loudness=loudness)
     momentary = loud["momentary"]
     short_term = loud["short_term"]
     for i, c in enumerate(cells):

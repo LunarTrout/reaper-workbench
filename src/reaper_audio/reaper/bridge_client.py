@@ -13,11 +13,11 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 from ..errors import (ApiUnavailable, BridgeTimeout, BridgeUnavailable,
-                      ReaperAudioError, StaleContext, TransactionFailed,
-                      ValidationError)
+                      MediaUnresolved, ReaperAudioError, StaleContext,
+                      TransactionFailed, ValidationError)
 from .api_catalog import ApiCallResult, get_api_catalog
 from .handles import ReaperHandle
 
@@ -27,8 +27,46 @@ _REMOTE_ERRORS = {
     "stale_context": StaleContext,
     "transaction_failed": TransactionFailed,
     "validation_error": ValidationError,
+    "media_unresolved": MediaUnresolved,
 }
 _INSTANCE_STALE_AFTER_S = 12.0
+
+_DIGEST_VERSION = 1
+_DIGEST_FIELDS = ("project_id", "path", "change_count", "digest_version",
+                  "coverage", "missing", "fields")
+_DIGEST_GROUPS = ("tracks", "items", "tempo")
+
+# A capture response is one contract: either every field is present and
+# plausible, or the caller must not trust the rendered audio at all.
+_CAPTURE_RESPONSE_FIELDS = ("project_id", "revision", "revision_after",
+                            "capture_point", "render_action", "files",
+                            "render_settings_used", "channels", "sample_rate",
+                            "tail_s", "restore_report")
+_RENDER_SETTING_FIELDS = ("RENDER_CHANNELS", "RENDER_SRATE", "RENDER_TAILFLAG",
+                          "RENDER_TAILMS", "RENDER_SETTINGS",
+                          "RENDER_BOUNDSFLAG", "RENDER_ADDTOPROJ")
+_CAPTURE_CHANNELS = {"mono": 1, "stereo": 2}
+
+
+def _is_int(value: Any) -> bool:
+    """True for a JSON integer that is not a Python bool."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_finite_number(value: Any) -> TypeGuard[float]:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+def _json_safe(value: Any) -> Any:
+    """Describe an arbitrary bridge value without leaking non-JSON objects."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    return f"<{type(value).__name__}>"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -341,19 +379,163 @@ class ReaperBridge:
             raise BridgeUnavailable("REAPER returned an invalid project context")
         return result
 
+    def set_track_mutes(self, *, project_id: str, expected_revision: dict[str, Any],
+                       mutes: dict[str, bool], timeout_s: float = 30.0) -> dict[str, Any]:
+        """Set a whole GUID->mute map in one REAPER-side transaction.
+
+        The capture path uses this instead of one API round trip per track. The
+        response must carry a fresh revision and the read-back mute values.
+        """
+        if not isinstance(project_id, str) or not project_id:
+            raise ValidationError("project_id must be a non-empty string")
+        if not isinstance(expected_revision, dict):
+            raise ValidationError("expected_revision must be an object")
+        if not isinstance(mutes, dict) or not mutes:
+            raise ValidationError("mutes must be a non-empty GUID->bool map")
+        entries = []
+        for guid, mute in mutes.items():
+            if not isinstance(guid, str) or not guid or not isinstance(mute, bool):
+                raise ValidationError("mutes must map non-empty GUIDs to booleans")
+            entries.append({"guid": guid, "mute": mute})
+        result = self.call("project.set_track_mutes", {
+            "project_id": project_id,
+            "expected_revision": expected_revision,
+            "mutes": entries,
+        }, timeout_s=timeout_s)
+        if not isinstance(result, dict) or not isinstance(result.get("revision"), dict):
+            raise BridgeUnavailable("REAPER returned an invalid batched mute result")
+        applied = result.get("mutes")
+        if not isinstance(applied, list) or len(applied) != len(entries):
+            raise BridgeUnavailable("REAPER did not read back every batched mute")
+        return result
+
+    def project_digest(self, project_id: str | None = None, *,
+                       timeout_s: float = 10.0) -> dict:
+        """Read a structural digest of one open project (or the active project).
+
+        A digest is descriptive, not a hash: it carries the project identity,
+        the observed change count, the per-group coverage flags and the field
+        groups the bridge was able to read. Hashing or comparing digests is the
+        caller's job; this method only proves the answer matches the frozen
+        ``project.digest`` contract.
+        """
+        if project_id is not None and (not isinstance(project_id, str) or not project_id):
+            raise ValidationError("project_id must be a non-empty string when provided")
+        result = self.call("project.digest", {"project_id": project_id},
+                           timeout_s=timeout_s)
+        self._validate_project_digest(result)
+        return result
+
+    @staticmethod
+    def _validate_project_digest(result: Any) -> None:
+        if not isinstance(result, dict):
+            raise BridgeUnavailable(
+                "REAPER returned an invalid project digest",
+                details={"result_type": type(result).__name__})
+        absent = [name for name in _DIGEST_FIELDS if name not in result]
+        if absent:
+            raise BridgeUnavailable(
+                "REAPER returned a project digest without the required fields",
+                details={"missing_fields": absent,
+                         "operation": "project.digest"})
+
+        if not isinstance(result["project_id"], str) or not result["project_id"]:
+            raise BridgeUnavailable(
+                "REAPER returned a project digest without a project identity",
+                details={"field": "project_id",
+                         "received": _json_safe(result["project_id"])})
+        # An unsaved project legitimately has an empty path, so only the type
+        # is enforced here.
+        if not isinstance(result["path"], str):
+            raise BridgeUnavailable(
+                "REAPER returned a project digest with a non-string path",
+                details={"field": "path",
+                         "received": _json_safe(result["path"])})
+        if not _is_int(result["change_count"]) or result["change_count"] < 0:
+            raise BridgeUnavailable(
+                "REAPER returned a project digest with an invalid change count",
+                details={"field": "change_count",
+                         "received": _json_safe(result["change_count"])})
+        version = result["digest_version"]
+        if not _is_int(version) or version != _DIGEST_VERSION:
+            raise BridgeUnavailable(
+                "REAPER returned a project digest with an unsupported schema version",
+                details={"field": "digest_version",
+                         "expected": _DIGEST_VERSION,
+                         "received": _json_safe(version)})
+
+        coverage = result["coverage"]
+        if not isinstance(coverage, dict):
+            raise BridgeUnavailable(
+                "REAPER returned a project digest with an invalid coverage map",
+                details={"field": "coverage",
+                         "received_type": type(coverage).__name__})
+        for group, readable in coverage.items():
+            if not isinstance(group, str) or not group:
+                raise BridgeUnavailable(
+                    "REAPER returned a project digest with an unnamed coverage entry",
+                    details={"field": "coverage",
+                             "received_key": _json_safe(group)})
+            if not isinstance(readable, bool):
+                raise BridgeUnavailable(
+                    "REAPER returned a project digest with a non-boolean coverage flag",
+                    details={"field": "coverage",
+                             "group": group,
+                             "received": _json_safe(readable)})
+
+        missing = result["missing"]
+        if not isinstance(missing, list):
+            raise BridgeUnavailable(
+                "REAPER returned a project digest with an invalid missing list",
+                details={"field": "missing",
+                         "received_type": type(missing).__name__})
+        for entry in missing:
+            if not isinstance(entry, str) or not entry:
+                raise BridgeUnavailable(
+                    "REAPER returned a project digest with an unnamed missing entry",
+                    details={"field": "missing",
+                             "received": _json_safe(entry)})
+
+        fields = result["fields"]
+        if not isinstance(fields, dict):
+            raise BridgeUnavailable(
+                "REAPER returned a project digest with an invalid field map",
+                details={"field": "fields",
+                         "received_type": type(fields).__name__})
+        for group in _DIGEST_GROUPS:
+            if not isinstance(fields.get(group), list):
+                raise BridgeUnavailable(
+                    "REAPER returned a project digest with an invalid field group",
+                    details={"field": f"fields.{group}",
+                             "received_type": type(fields.get(group)).__name__})
+        return None
+
     def capture_render(self, *, expected_revision: dict[str, Any],
                        output_dir: str | os.PathLike[str], job_id: str,
                        expected_track_count: int,
                        timeout_s: float = 600.0,
                        section_start_s: float | None = None,
                        section_end_s: float | None = None,
-                       master_only: bool = False) -> dict:
+                       master_only: bool = False,
+                       selected_tracks_via_master: bool = False,
+                       parallel_via_master: bool = False,
+                       track_guids: list[str] | None = None,
+                       render_settings: int | None = None,
+                       channels: str = "stereo",
+                       sample_rate: int | None = None,
+                       tail_ms: int = 0) -> dict:
         """Render processed track stems plus the master through REAPER itself.
 
         The output directory must already exist and be owned by the caller's
         task workspace. This method never adds renders to the project. It
         verifies the returned mapping and direct-child paths before handing the
         files back to the caller for manifest registration and analysis.
+
+        ``channels`` selects a stereo or mono render, ``sample_rate`` overrides
+        the project rate (``None`` keeps it), and ``tail_ms`` asks REAPER for a
+        decay tail. Every one of those requests is read back from the bridge
+        response, so a render that silently ignored a setting is rejected
+        instead of analysed as if it matched the request.
         """
         if not isinstance(expected_revision, dict):
             raise ValidationError("expected_revision must be a project revision object")
@@ -374,6 +556,49 @@ class ReaperBridge:
         if (not isinstance(job_id, str) or
                 re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job_id) is None):
             raise ValidationError("job_id must contain 1 to 64 safe filename characters")
+        if not isinstance(selected_tracks_via_master, bool) or not isinstance(parallel_via_master, bool):
+            raise ValidationError("selected_tracks_via_master and parallel_via_master must be booleans")
+        if parallel_via_master and not selected_tracks_via_master:
+            raise ValidationError("parallel_via_master requires selected_tracks_via_master")
+        subset_guids: set[str] | None = None
+        if track_guids is not None:
+            if (not isinstance(track_guids, (list, tuple)) or not track_guids or
+                    any(not isinstance(guid, str) or not guid for guid in track_guids)):
+                raise ValidationError(
+                    "track_guids must be a non-empty list of track GUID strings",
+                    details={"received_type": type(track_guids).__name__})
+            if len(set(track_guids)) != len(track_guids):
+                raise ValidationError("track_guids must not repeat a track GUID")
+            if master_only:
+                raise ValidationError("track_guids cannot be combined with master_only")
+            if len(track_guids) != expected_track_count:
+                raise ValidationError(
+                    "expected_track_count must equal the requested track subset size",
+                    details={"expected_track_count": expected_track_count,
+                             "track_guids": len(track_guids)})
+            subset_guids = set(track_guids)
+        if render_settings is not None and (
+                isinstance(render_settings, bool) or not isinstance(render_settings, int) or
+                render_settings < 0):
+            raise ValidationError("render_settings must be a non-negative integer or None")
+        if not isinstance(channels, str) or channels not in _CAPTURE_CHANNELS:
+            raise ValidationError("channels must be 'stereo' or 'mono'",
+                                  details={"channels": _json_safe(channels),
+                                           "expected": sorted(_CAPTURE_CHANNELS)})
+        if sample_rate is not None and (
+                isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or
+                sample_rate <= 0):
+            raise ValidationError("sample_rate must be a positive integer or None",
+                                  details={"sample_rate": _json_safe(sample_rate)})
+        if isinstance(tail_ms, bool) or not isinstance(tail_ms, int) or tail_ms < 0:
+            raise ValidationError("tail_ms must be a non-negative integer",
+                                  details={"tail_ms": _json_safe(tail_ms)})
+        channel_count = _CAPTURE_CHANNELS[channels]
+        # The bridge renders a time selection only when both section bounds are
+        # usable numbers; mirror that rule so the echoed bounds flag is comparable.
+        has_section = (_is_finite_number(section_start_s) and
+                       _is_finite_number(section_end_s) and
+                       section_end_s > section_start_s)
         directory = Path(output_dir).expanduser()
         if not directory.is_absolute():
             raise ValidationError("output_dir must be an absolute directory path")
@@ -395,9 +620,32 @@ class ReaperBridge:
             "section_start_s": section_start_s,
             "section_end_s": section_end_s,
             "master_only": master_only,
+            "selected_tracks_via_master": selected_tracks_via_master,
+            "parallel_via_master": parallel_via_master,
+            "track_guids": None if track_guids is None else list(track_guids),
+            "render_settings": render_settings,
+            "channels": channels,
+            "sample_rate": 0 if sample_rate is None else sample_rate,
+            "tail_ms": tail_ms,
         }, timeout_s=timeout_s)
-        returned_before = result.get("revision") if isinstance(result, dict) else None
-        returned_after = result.get("revision_after") if isinstance(result, dict) else None
+        if not isinstance(result, dict):
+            raise BridgeUnavailable(
+                "REAPER returned an invalid analysis render response",
+                details={"result_type": type(result).__name__,
+                         "operation": "project.capture_render"})
+        absent = [name for name in _CAPTURE_RESPONSE_FIELDS if name not in result]
+        if absent:
+            # Older bridges answered without the render-settings echo. Refuse
+            # the capture instead of analysing audio whose settings are unknown.
+            raise BridgeUnavailable(
+                "REAPER returned an analysis render response missing the required "
+                "render contract fields; restart the resident bridge",
+                details={"missing_fields": absent,
+                         "operation": "project.capture_render",
+                         "contract": list(_CAPTURE_RESPONSE_FIELDS)})
+
+        returned_before = result["revision"]
+        returned_after = result["revision_after"]
         revision_matches = (
             isinstance(returned_before, dict) and
             all(returned_before.get(key) == value for key, value in revision.items())
@@ -410,23 +658,62 @@ class ReaperBridge:
             not isinstance(returned_after.get("change_count"), bool) and
             returned_after["change_count"] >= revision["change_count"]
         )
-        expected_point = ("native_render_master_only" if master_only
-                          else "native_render_track_stems_plus_master")
-        if (not isinstance(result, dict) or
-                result.get("project_id") != revision["project_id"] or
+        if master_only:
+            expected_point = "native_render_master_only"
+        elif selected_tracks_via_master:
+            expected_point = "native_render_selected_tracks_via_master"
+        else:
+            expected_point = "native_render_track_stems_plus_master"
+        render_action = result["render_action"]
+        if (result.get("project_id") != revision["project_id"] or
                 not revision_matches or not after_matches_project or
                 result.get("capture_point") != expected_point or
+                not isinstance(render_action, str) or not render_action or
                 not isinstance(result.get("files"), list)):
-            raise BridgeUnavailable("REAPER returned an invalid analysis render response")
+            raise BridgeUnavailable(
+                "REAPER returned an invalid analysis render response",
+                details={"project_id": _json_safe(result.get("project_id")),
+                         "capture_point": _json_safe(result.get("capture_point")),
+                         "render_action": _json_safe(render_action),
+                         "revision_matches": revision_matches,
+                         "revision_after_matches": after_matches_project})
 
         files = result["files"]
-        expected_files = 1 if master_only else expected_track_count + 1
+        if subset_guids is not None:
+            echoed = result.get("track_guids")
+            if (not isinstance(echoed, list) or
+                    any(not isinstance(guid, str) for guid in echoed) or
+                    set(echoed) != subset_guids or len(echoed) != len(subset_guids)):
+                # A bridge that ignores the subset would render every track and
+                # silently multiply capture work; refuse instead of trusting it.
+                raise BridgeUnavailable(
+                    "REAPER did not echo the requested capture track subset; "
+                    "restart the resident bridge",
+                    details={"operation": "project.capture_render",
+                             "requested": len(subset_guids),
+                             "echoed": _json_safe(echoed)})
+        includes_master = master_only
+        reported_master_included = result.get("master_included")
+        if isinstance(reported_master_included, bool):
+            includes_master = reported_master_included
+        elif not selected_tracks_via_master:
+            includes_master = True
+        if render_settings is not None and render_settings % 2 == 1:
+            includes_master = True
+        expected_files = (1 if master_only else
+                          expected_track_count + (1 if includes_master else 0))
         if len(files) != expected_files:
+            if master_only:
+                message = "REAPER returned an incomplete master render set"
+            elif includes_master:
+                message = "REAPER returned an incomplete track and master render set"
+            else:
+                message = "REAPER returned an incomplete track render set"
             raise BridgeUnavailable(
-                "REAPER returned an incomplete master render set" if master_only
-                else "REAPER returned an incomplete track and master render set",
+                message,
                 details={"expected_files": expected_files,
-                         "received_files": len(files)})
+                         "received_files": len(files),
+                         "includes_master": includes_master})
         seen_guids: set[str] = set()
         seen_indices: set[int] = set()
         masters = 0
@@ -465,16 +752,151 @@ class ReaperBridge:
                 if index != -1:
                     raise BridgeUnavailable("REAPER returned an invalid master track index")
             else:
-                if index < 0 or index >= expected_track_count or index in seen_indices:
+                if subset_guids is not None:
+                    if guid not in subset_guids or index in seen_indices:
+                        raise BridgeUnavailable(
+                            "REAPER returned a track outside the requested capture subset",
+                            details={"source_guid": guid, "track_index": index})
+                elif index < 0 or index >= expected_track_count or index in seen_indices:
                     raise BridgeUnavailable("REAPER returned an invalid or duplicate track index",
                                             details={"track_index": index})
                 seen_indices.add(index)
         required_tracks = 0 if master_only else expected_track_count
-        if masters != 1 or len(seen_indices) != required_tracks:
-            raise BridgeUnavailable("REAPER did not return each track and one master exactly once",
+        expected_masters = 1 if includes_master else 0
+        if masters != expected_masters or len(seen_indices) != required_tracks:
+            raise BridgeUnavailable("REAPER did not return each track and expected master exactly once",
                                     details={"master_count": masters,
+                                             "expected_masters": expected_masters,
                                              "track_indices": sorted(seen_indices)})
+        self._validate_render_echo(
+            result,
+            channel_count=channel_count,
+            sample_rate=sample_rate,
+            tail_ms=tail_ms,
+            has_section=has_section,
+        )
         return result
+
+    @staticmethod
+    def _validate_render_echo(result: dict, *, channel_count: int,
+                              sample_rate: int | None, tail_ms: int,
+                              has_section: bool) -> None:
+        """Prove REAPER rendered with the requested channel layout and tail.
+
+        The response echoes the render settings the bridge applied plus the
+        measured tail length. A deviation means the returned audio does not
+        represent the request, so the capture is refused before it is analysed.
+        """
+        settings = result["render_settings_used"]
+        if not isinstance(settings, dict):
+            raise BridgeUnavailable(
+                "REAPER did not report the render settings it used",
+                details={"field": "render_settings_used",
+                         "received_type": type(settings).__name__})
+        absent = [name for name in _RENDER_SETTING_FIELDS if name not in settings]
+        if absent:
+            raise BridgeUnavailable(
+                "REAPER reported an incomplete render settings echo",
+                details={"field": "render_settings_used",
+                         "missing_fields": absent})
+        invalid = [name for name in _RENDER_SETTING_FIELDS
+                   if not _is_finite_number(settings[name])]
+        if invalid:
+            raise BridgeUnavailable(
+                "REAPER reported a non-numeric render setting",
+                details={"field": "render_settings_used",
+                         "invalid_fields": invalid,
+                         "received": {name: _json_safe(settings[name])
+                                      for name in invalid}})
+
+        reported_channels = result["channels"]
+        if not _is_int(reported_channels) or reported_channels not in (1, 2):
+            raise BridgeUnavailable(
+                "REAPER reported an invalid render channel count",
+                details={"field": "channels",
+                         "received": _json_safe(reported_channels)})
+        if reported_channels != channel_count:
+            raise BridgeUnavailable(
+                "REAPER rendered a different channel layout than requested",
+                details={"field": "channels",
+                         "requested_channels": channel_count,
+                         "reported_channels": reported_channels})
+
+        reported_rate = result["sample_rate"]
+        if not _is_int(reported_rate) or reported_rate <= 0:
+            raise BridgeUnavailable(
+                "REAPER reported an invalid render sample rate",
+                details={"field": "sample_rate",
+                         "received": _json_safe(reported_rate)})
+        if sample_rate is not None and reported_rate != sample_rate:
+            raise BridgeUnavailable(
+                "REAPER rendered at a different sample rate than requested",
+                details={"field": "sample_rate",
+                         "requested_sample_rate": sample_rate,
+                         "reported_sample_rate": reported_rate})
+
+        reported_tail_s = result["tail_s"]
+        if not _is_finite_number(reported_tail_s) or reported_tail_s < 0:
+            raise BridgeUnavailable(
+                "REAPER reported an invalid render tail length",
+                details={"field": "tail_s",
+                         "received": _json_safe(reported_tail_s)})
+        expected_tail_s = tail_ms / 1000.0
+        if abs(reported_tail_s - expected_tail_s) > 1e-9:
+            raise BridgeUnavailable(
+                "REAPER applied a different render tail than requested",
+                details={"field": "tail_s",
+                         "requested_tail_ms": tail_ms,
+                         "expected_tail_s": expected_tail_s,
+                         "reported_tail_s": reported_tail_s})
+
+        report = result["restore_report"]
+        if not isinstance(report, dict) or report.get("restored") is not True:
+            raise BridgeUnavailable(
+                "REAPER did not confirm that the project render settings were restored",
+                details={"field": "restore_report",
+                         "received": _json_safe(report)})
+        failures = report.get("failures")
+        if not isinstance(failures, (list, tuple, dict)) or failures:
+            raise BridgeUnavailable(
+                "REAPER could not restore the project render settings after the capture",
+                details={"field": "restore_report.failures",
+                         "failures": _json_safe(failures)})
+
+        deviations: dict[str, dict[str, Any]] = {}
+
+        def expect(setting: str, wanted: float) -> None:
+            if abs(float(settings[setting]) - wanted) > 1e-9:
+                deviations[setting] = {"expected": wanted,
+                                       "reported": _json_safe(settings[setting])}
+
+        expect("RENDER_CHANNELS", float(channel_count))
+        expect("RENDER_ADDTOPROJ", 0.0)
+        expect("RENDER_BOUNDSFLAG", 2.0 if has_section else 1.0)
+        if sample_rate is not None:
+            expect("RENDER_SRATE", float(sample_rate))
+        else:
+            # 0 means "project rate"; a resolved echo must match the rate the
+            # bridge reported it actually rendered at.
+            echoed_rate = float(settings["RENDER_SRATE"])
+            if echoed_rate != 0 and int(echoed_rate) != reported_rate:
+                deviations["RENDER_SRATE"] = {"expected": f"0 or {reported_rate}",
+                                              "reported": _json_safe(settings["RENDER_SRATE"])}
+        if tail_ms > 0:
+            expect("RENDER_TAILMS", float(tail_ms))
+        tail_flag = float(settings["RENDER_TAILFLAG"])
+        if (tail_ms == 0) != (tail_flag == 0):
+            deviations["RENDER_TAILFLAG"] = {"expected": "0" if tail_ms == 0 else "non-zero",
+                                             "reported": _json_safe(settings["RENDER_TAILFLAG"])}
+        if deviations:
+            raise BridgeUnavailable(
+                "REAPER applied different render settings than requested",
+                details={"field": "render_settings_used",
+                         "requested": {"channels": channel_count,
+                                       "sample_rate": sample_rate,
+                                       "tail_ms": tail_ms,
+                                       "section": has_section},
+                         "deviations": deviations})
 
     def sample_tracks(self, *, project_id: str,
                       output_dir: str | os.PathLike[str], job_id: str,
