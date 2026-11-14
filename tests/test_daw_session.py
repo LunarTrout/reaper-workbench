@@ -163,6 +163,13 @@ def test_capture_audio_binds_processed_track_and_master_to_metadata_and_cleans(
                 "revision_after": dict(revision_after),
                 "capture_point": "native_render_track_stems_plus_master",
                 "render_action": "File: Render project",
+                "render_settings_used": {"RENDER_CHANNELS": 2.0,
+                                         "RENDER_TAILMS": 0.0},
+                "tail_s": 0.0,
+                # The session refuses a capture without a factual restore
+                # report; this fake reports one instead of having the session
+                # invent ``{"restored": True}``.
+                "restore_report": {"restored": True, "failures": []},
                 "files": [
                     {"source_guid": "{TRACK}", "name": "Guitar", "track_index": 0,
                      "is_master": False, "path": str(track_path),
@@ -237,6 +244,41 @@ def test_selected_render_rejects_wrong_duration(tmp_path: Path) -> None:
         _load_rendered_audio(str(path), Section(37.5, 40.0))
 
 
+def test_full_project_loader_keeps_the_tail_in_the_file_window_only(
+        tmp_path: Path) -> None:
+    path = tmp_path / "full-project-tail.wav"
+    sf.write(path, np.zeros(10_000), 8_000, subtype="FLOAT")  # 1.25 s
+
+    audio = _load_rendered_audio(str(path), None, 0.25, project_end_s=1.0)
+
+    assert audio.start_s == 0.0
+    assert audio.frames == 8_000
+    assert audio.duration_s == pytest.approx(1.0)
+    assert audio.provenance["render_window"] == {"start_s": 0.0, "end_s": 1.0}
+    assert audio.provenance["project_window"] == {"start_s": 0.0, "end_s": 1.0}
+    assert audio.provenance["file_window"] == {"start_s": 0.0, "end_s": 1.25}
+    assert audio.provenance["tail_s"] == pytest.approx(0.25)
+
+
+def test_full_project_loader_fails_closed_without_a_boundary(
+        tmp_path: Path) -> None:
+    path = tmp_path / "full-project-tail.wav"
+    sf.write(path, np.zeros(10_000), 8_000, subtype="FLOAT")
+
+    with pytest.raises(BridgeUnavailable, match="no verified project boundary"):
+        _load_rendered_audio(str(path), None, 0.25)
+
+
+@pytest.mark.parametrize("boundary", [0.9, 1.5, float("nan"), True, None])
+def test_full_project_loader_rejects_a_boundary_the_file_cannot_verify(
+        tmp_path: Path, boundary: object) -> None:
+    path = tmp_path / "full-project-tail.wav"
+    sf.write(path, np.zeros(10_000), 8_000, subtype="FLOAT")
+
+    with pytest.raises(BridgeUnavailable):
+        _load_rendered_audio(str(path), None, 0.25, project_end_s=boundary)
+
+
 def test_project_session_analyze_bundles_capture_context_tempo_and_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -245,8 +287,8 @@ def test_project_session_analyze_bundles_capture_context_tempo_and_cleanup(
     captured = {
         "capture_point": "native_render_track_stems_plus_master",
         "render_action": "File: Render project",
-        "time_window": {"timeline": "project_seconds", "project_start_s": 40.0,
-                        "project_end_s": 48.0, "file_start_s": 0.0,
+        "time_window": {"timeline": "project_seconds", "project_start_s": 0.0,
+                        "project_end_s": 8.0, "file_start_s": 0.0,
                         "file_end_s": 8.0},
         "project": {"capture_revision": {**revision, "change_count": 4},
                     "revision": revision, "path": revision["path"],
@@ -278,7 +320,7 @@ def test_project_session_analyze_bundles_capture_context_tempo_and_cleanup(
 
     def fake_load_audio(path: str, section: object = None) -> AudioBuffer:
         loaded_paths.append(path)
-        return AudioBuffer(np.zeros(8_000), 8_000, source=path)
+        return AudioBuffer(np.zeros(8 * 8_000), 8_000, source=path)
 
     analysis_call: dict = {}
 
@@ -557,3 +599,8 @@ def test_analyze_rejects_raw_accessor_as_processed_mix(
 
     with pytest.raises(ValidationError, match=message):
         session.analyze(str(tmp_path), capture_mode=capture_mode)
+
+
+def test_project_session_analyze_rejects_an_unsafe_worker_override() -> None:
+    with pytest.raises(ValidationError, match="analysis_workers"):
+        ProjectSession(FakeBridge()).analyze("temporary-root", max_workers=9)

@@ -13,13 +13,16 @@ import os
 import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from functools import wraps
+from math import isfinite
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 from urllib.parse import quote
 
 from mcp.server.mcpserver import MCPServer
+from pydantic import StrictInt
 
 from .analysis.artifacts import cleanup_audio_job, cleanup_stale_audio_jobs
 from .analysis.audio import load_audio
@@ -27,7 +30,17 @@ from .analysis.edit_map_report import (build_edit_map_from_report,
                                        tempo_points_from_report)
 from .analysis.mix_evidence import build_mix_evidence
 from .daw.session import EditOperation, EditPlan, ProjectRevision, ProjectSession
-from .errors import (BridgeUnavailable, ReaperAudioError, StaleContext,
+from .daw.full_capture import FullCaptureService
+from .context.full_capture import CaptureArchive, FullCaptureRecord
+from .context.lifecycle import PanoramaLifecycle, document_hash
+from .context.panorama import (DEFAULT_MAX_BYTES, DEFAULT_MAX_TOKENS,
+                               PANORAMA_SCHEMA_VERSION, build_panorama, load_panorama,
+                               panorama_path_for_record)
+from .context.panorama_view import DEFAULT_RESPONSE_BYTES, build_view
+from .context.revision import digest_evidence
+from .context.identity import identity_from_mapping
+from .errors import (BridgeUnavailable, PanoramaBindingError,
+                     PanoramaCapacityError, ReaperAudioError, StaleContext,
                      ValidationError)
 from .models import Section
 from .reaper.api_catalog import get_api_catalog
@@ -54,6 +67,104 @@ _LOCK = threading.RLock()
 _analysis_records: dict[str, dict[str, Any]] = {}
 _analysis_roles: dict[tuple[str, str], str] = {}
 _edit_plans: dict[str, dict[str, Any]] = {}
+_PANORAMA_LIFECYCLES: dict[str, PanoramaLifecycle] = {}
+_LAST_PANORAMA_ROOT: str | None = None
+_API_GATE_BYPASS = threading.local()
+
+
+def _panorama_lifecycle(archive_root: str | None = None,
+                        page_bytes: int | None = None) -> PanoramaLifecycle:
+    """Resolve the lifecycle store for an archive; keep one per absolute root."""
+    global _LAST_PANORAMA_ROOT
+    root = str(Path(archive_root or _LAST_PANORAMA_ROOT or
+                    os.environ.get("REAPER_CAPTURE_ARCHIVE", "capture-archive")).resolve())
+    lifecycle = _PANORAMA_LIFECYCLES.get(root)
+    if lifecycle is None or (page_bytes is not None and lifecycle.page_bytes != page_bytes):
+        lifecycle = PanoramaLifecycle(root, page_bytes=page_bytes or 24_576)
+        _PANORAMA_LIFECYCLES[root] = lifecycle
+    _LAST_PANORAMA_ROOT = root
+    return lifecycle
+
+
+def _require_panorama_receipt(receipt: str | None, project_id: str,
+                              expected_revision: Mapping[str, Any] | None,
+                              archive_root: str | None = None,
+                              expected_fact_root: str | None = None,
+                              *, require_audio_fresh: bool = False) -> dict[str, Any]:
+    """Fail closed unless a complete, revision-matched panorama receipt exists."""
+    if not receipt:
+        raise ValidationError(
+            "A complete panorama is required before any project mutation",
+            details={"next_action": ("call reaper_panorama_open, fetch every page with "
+                                     "reaper_panorama_page, then reaper_panorama_ack with "
+                                     "all page hashes in order; edits use the receipt's "
+                                     "context_token"),
+                     "gate": "panorama_completion"})
+    lifecycle = _panorama_lifecycle(archive_root)
+    return lifecycle.require_receipt(receipt, project_id, expected_revision,
+                                     expected_fact_root=expected_fact_root,
+                                     require_audio_fresh=require_audio_fresh)
+
+
+def _require_interpretation_receipt(receipt: str | None, project_id: str,
+                                    expected_revision: Mapping[str, Any] | None,
+                                    archive_root: str | None = None,
+                                    expected_fact_root: str | None = None) -> dict[str, Any]:
+    """Gate model-facing interpretation, not the bootstrap capture itself.
+
+    The first full capture creates the evidence document and is deliberately
+    allowed without a receipt. Every project-target analysis/interpretation
+    call that follows must present one complete, delivered receipt for that
+    same project, revision and fact root *and* its audio evidence must still be
+    current. A structural delta can authorize edits but never audio
+    interpretation: only a fresh capture does that. The server cannot observe
+    private model reasoning; this gates tool access, not thought.
+    """
+    if not receipt:
+        raise ValidationError(
+            "A complete, delivered panorama is required before interpreting "
+            "project audio or project measurements",
+            details={"next_action": ("call reaper_capture_snapshot once to create "
+                                     "the evidence document, then reaper_panorama_open, "
+                                     "fetch every page with reaper_panorama_page, and "
+                                     "reaper_panorama_ack with all page hashes"),
+                     "gate": "panorama_interpretation"})
+    return _require_panorama_receipt(receipt, project_id, expected_revision,
+                                     archive_root, expected_fact_root,
+                                     require_audio_fresh=True)
+
+
+def _require_capture_read_receipt(receipt: str | None, project_id: str,
+                                  expected_revision: Mapping[str, Any] | None,
+                                  capture_id: str,
+                                  archive_root: str | None = None) -> dict[str, Any]:
+    """Gate a model-facing archive read for one exact capture.
+
+    Unlike a mutation gate, this must validate the receipt against the capture
+    being read, not the latest capture in the project archive.  A receipt for a
+    different capture, document hash, revision, project or fact root must never
+    unlock the panorama payload.
+    """
+    if not receipt:
+        raise ValidationError(
+            "A complete, delivered panorama is required before reading a "
+            "capture through the MCP surface",
+            details={"capture_id": capture_id,
+                     "archive_root": archive_root,
+                     "next_action": ("call reaper_panorama_open for this capture, fetch "
+                                     "every page with reaper_panorama_page, then "
+                                     "reaper_panorama_ack with all page hashes"),
+                     "next_action_args": {
+                         "tool": "reaper_panorama_open",
+                         "capture_id": capture_id,
+                         "archive_root": archive_root,
+                     },
+                     "gate": "panorama_capture_read"})
+    lifecycle = _panorama_lifecycle(archive_root)
+    return lifecycle.require_receipt(
+        receipt, project_id, expected_revision,
+        expected_capture_id=capture_id,
+    )
 
 
 class ReferenceWindow(TypedDict):
@@ -65,20 +176,44 @@ class ReferenceWindow(TypedDict):
 server = MCPServer(
     "reaper-workbench",
     title="REAPER Workbench",
-    version="0.2.0",
+    version="0.3.0",
     description=("Native REAPER control and audio analysis through the documented "
-                 "ReaScript API and resident local bridge."),
+                 "ReaScript API and resident local bridge, with one revision-bound "
+                 "project panorama delivered in measured pages and exact semantic queries."),
     instructions=(
-        "Start with reaper_session(action='health') and reaper_project to establish "
-        "the project and revision. Use reaper_capabilities and reaper_api_search to "
-        "discover operations; do not assume a fixed musical workflow. Analyze all "
-        "processed tracks and the master together with reaper_analyze. Project edits "
-        "are batched as preview, then apply, then read back; every write is tied to "
-        "project_id and expected_revision. The generic API and Actions remain "
-        "available for documented REAPER functions beyond convenience edits. "
-        "Audio analysis uses native REAPER render capture; raw AudioAccessor samples "
-        "are pre-FX and are not processed mix stems. Temporary audio is outside the "
-        "project and has a bounded lease."
+        "REAPER Workbench. Establish the project, its identity and exact revision with "
+        "reaper_session and reaper_project, then reaper_panorama_status. reaper_panorama_open "
+        "returns page 1 of the revision-bound project panorama plus a manifest; fetch every page "
+        "with reaper_panorama_page, then reaper_panorama_ack with all page hashes in order. "
+        "That receipt proves delivery of every page of this bounded projection, not delivery of every raw audio point, "
+        "not that the model understood it, and not that the model heard the audio. The panorama is a project-wide map, "
+        "not full-resolution audio evidence: temporal maps use declared aggregation, and exact series and relation rows "
+        "are fetched separately. Check coverage, point counts, resolution, aggregation, units, stage, and provenance. "
+        "Before a conclusion or edit depends on fine timing, frequency, transient, or relation evidence, fetch the exact "
+        "relevant source(s) and interval with reaper_panorama_query; narrow the interval if the result is over budget. "
+        "Never treat a missing or summarized value as proof that the event or feature is absent. A URI alone does not "
+        "mean an audio-capable client delivered sound to the model. Only that complete receipt unlocks analysis, exact "
+        "queries and edits. A partial set returns the missing page ids; a stale revision needs a new open. "
+        "Create a capture with reaper_capture_snapshot only when no capture matches the "
+        "revision. Do not interpret project audio or edit from a partial panorama. Exact "
+        "high-frequency rows "
+        "(relation edges, series cells, MIDI notes, envelope points) come from "
+        "reaper_panorama_query by semantic selection. "
+        "Every successful mutation (reaper_edit apply/undo, "
+        "reaper_api_call, reaper_action) returns a factual delta bound to the acknowledged "
+        "base, together with its successor context token in the same response; use "
+        "advance.context_token for the next structural edit and continue editing at the new "
+        "revision without another full capture. A "
+        "delta never makes stale audio current: its audio_evidence names every invalidated "
+        "source, and project-target analysis refuses until a fresh capture is acknowledged. "
+        "Raw API calls and Actions have unknown mutation scope and invalidate project audio "
+        "conservatively. Use reaper_capabilities and reaper_api_search to discover "
+        "operations; do not assume a fixed musical workflow. Project edits are batched as "
+        "preview, then apply, then read back; every write is tied to project_id and "
+        "expected_revision. The generic API and Actions remain available for documented "
+        "REAPER functions beyond convenience edits. Audio analysis uses native REAPER render "
+        "capture; raw AudioAccessor samples are pre-FX and are not processed mix stems. "
+        "Temporary audio is outside the project and has a bounded lease."
     ),
 )
 
@@ -90,7 +225,7 @@ def _jsonable(value: Any) -> Any:
         return str(value)
     if is_dataclass(value) and not isinstance(value, type):
         return _jsonable(asdict(value))
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {str(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
@@ -110,7 +245,16 @@ def _next_action(code: str) -> str:
         "api_unavailable": "Check the REAPER version and discover an available alternative in the API catalog.",
         "transaction_failed": "Read the project state and undo status before attempting another edit.",
         "analysis_unavailable": "Inspect capture and analysis details, then retry a smaller time range if appropriate.",
+        "capture_master_invalid": "The capture is archived as invalid evidence; inspect master_attempts and re-render after fixing the master signal path.",
+        "media_unresolved": "Inspect the named take source paths and online/offline state; bring the media online before capturing rather than accepting silence.",
+        "panorama_capacity_exceeded": "Request a smaller capture section or raise the explicit panorama capacity; the canonical record remains archived.",
+        "panorama_binding_invalid": "Do not use this sidecar; rebuild the panorama from the verified canonical record.",
         "artifact_cleanup_failed": "Do not delete the directory manually; inspect the manifest and preserved paths.",
+        "render_budget_exceeded": "Choose a shorter interval or a lower sample rate; the candidate is not delivered over budget.",
+        "render_provenance_incomplete": "Do not use this candidate; fix the missing render settings, FX state or routing provenance first.",
+        "render_candidate_mismatch": "Re-read the applied plan and revision; do not treat a mismatched or content-changing render as the candidate.",
+        "render_unsupported": "Update the resident bridge so it supports the native master-only render contract.",
+        "render_candidate_refused": "Inspect the typed refusal details; no candidate audio was delivered.",
     }.get(code, "Inspect the structured error details and verify current REAPER state before retrying.")
 
 
@@ -237,6 +381,112 @@ def _current_context(session: ProjectSession,
     return context
 
 
+def _mutation_readback(session: ProjectSession, project_id: str) -> dict[str, Any]:
+    """Read the strongest post-mutation structural facts available.
+
+    The revision comes from a full project-context read; the digest proves the
+    render-affecting content.  A digest whose ``change_count`` disagrees with
+    the observed revision, a digest that fails verification, or a missing
+    subgroup is a partial readback and is reported as such — never as "no
+    change".
+    """
+    missing: list[str] = []
+    revision: ProjectRevision | None = None
+    digest: dict[str, Any] | None = None
+    evidence: Mapping[str, Any] | None = None
+    try:
+        context = session.snapshot()
+        revision = ProjectRevision.from_dict(context.get("revision", {}))
+        if not revision.project_id or revision.change_count < 0:
+            missing.append("revision_unreadable")
+            revision = None
+    except Exception as exc:  # noqa: BLE001 - reported as a coverage fact
+        missing.append(f"context_unreadable:{type(exc).__name__}")
+    try:
+        digest = session.digest(project_id)
+    except Exception as exc:  # noqa: BLE001
+        missing.append(f"digest_unavailable:{type(exc).__name__}")
+    if isinstance(digest, Mapping):
+        if str(digest.get("project_id") or "") != project_id:
+            missing.append("digest_project_mismatch")
+        if revision is not None and digest.get("change_count") != revision.change_count:
+            missing.append("digest_revision_mismatch")
+        try:
+            resolved = digest_evidence(project_id, dict(digest))
+            if resolved.scope != "full":
+                missing.extend(f"digest_missing:{name}" for name in resolved.missing)
+            evidence = {"fingerprint": resolved.fingerprint,
+                        "scope": resolved.scope,
+                        "missing": list(resolved.missing)}
+        except Exception:  # noqa: BLE001
+            missing.append("digest_unverifiable")
+    complete = revision is not None and isinstance(digest, Mapping) and not missing
+    identity = identity_from_mapping(revision.to_dict()) if revision is not None else None
+    if identity is not None and identity.gaps():
+        missing.extend(f"identity_missing:{gap}" for gap in identity.gaps())
+        complete = False
+    return {
+        "revision": revision,
+        "digest": digest,
+        "evidence": evidence,
+        "complete": complete,
+        "missing": missing,
+    }
+
+
+def _record_mutation_delta(*, lifecycle: PanoramaLifecycle, kind: str,
+                           receipt: str, project_id: str,
+                           base_revision: ProjectRevision,
+                           session: ProjectSession, scope: str,
+                           operation_facts: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Attach one factual delta to a successful mutation, or say why not.
+
+    A mutation has already happened when this runs.  A delta failure therefore
+    cannot be reported as a mutation failure; it is returned as an explicit
+    non-advanceable record with ``refresh_required``.
+    """
+    readback = _mutation_readback(session, project_id)
+    revision = readback["revision"]
+    if revision is None or not isinstance(readback["digest"], Mapping):
+        return {
+            "status": "unavailable",
+            "acknowledgeable": False,
+            "refresh_required": True,
+            "reason": "post_mutation_readback_incomplete",
+            "readback": {"complete": False, "missing": readback["missing"]},
+            "next_call": {"tool": "reaper_capture_snapshot", "project_id": project_id,
+                          "then": ("No structural delta can be minted from this readback; "
+                                   "capture again and acknowledge the panorama.")},
+        }
+    try:
+        delta = lifecycle.record_change(
+            kind=kind, context_token=receipt, project_id=project_id,
+            base_revision=base_revision.to_dict(),
+            target_revision=revision.to_dict(),
+            after_digest=readback["digest"],
+            scope=scope,
+            operation_facts=operation_facts,
+            readback_complete=bool(readback["complete"]),
+            readback_missing=readback["missing"],
+            target_digest_evidence=readback["evidence"],
+        )
+    except Exception as exc:  # noqa: BLE001 - mutation already applied
+        return {
+            "status": "unavailable",
+            "acknowledgeable": False,
+            "refresh_required": True,
+            "reason": f"delta_build_failed:{type(exc).__name__}",
+            "error": str(exc),
+            "readback": {"complete": bool(readback["complete"]),
+                         "missing": readback["missing"]},
+            "next_call": {"tool": "reaper_capture_snapshot", "project_id": project_id,
+                          "then": ("The mutation applied but its context cannot be "
+                                   "proven; capture again before interpreting or "
+                                   "continuing structural edits.")},
+        }
+    return delta
+
+
 def _classify_api(name: str) -> str:
     lowered = name.casefold()
     if lowered.startswith(("midi_", "midi", "midieditor", "midi_editor")):
@@ -297,6 +547,7 @@ def _capability_summary() -> dict[str, Any]:
             {"id": "audio_analysis", "description": "All project tracks and rendered master, measurements, comparisons, temporal tape, and audio resources."},
             {"id": "transactions", "description": "Batch preview/apply/undo for library-supported project operations.",
              "supported_operations": list(_TRANSACTION_OPERATIONS)},
+            {"id": "candidate_render", "description": "Plan-bound native master render on an exact interval, with verified restoration, explicit post-render revision, stage/FX/routing provenance and a leased audio resource."},
             {"id": "native_bridge_operations", "description": "Library operations such as render capture, save, tempo-map queries, and installed-FX inspection."},
         ],
         "runtime_claim": "Catalog entries are documented; availability and behavior depend on the installed REAPER version and are checked at call time.",
@@ -376,6 +627,48 @@ def _report_without_local_paths(report: dict[str, Any]) -> dict[str, Any]:
     safe = dict(report)
     safe.pop("audio_files", None)
     return safe
+
+
+def _analysis_windows(report: dict[str, Any], section: Section | None,
+                      tail_ms: int) -> dict[str, Any]:
+    """Separate what the capture wrote from what the analysis measured.
+
+    ``session.analyze`` already reports ``capture_time_window`` and top-level
+    ``tail_s``.  The MCP response keeps that evidence, but states the three
+    spans explicitly so a client cannot mistake a rendered tail for measured
+    material.
+    """
+    window = report.get("capture_time_window")
+    window = window if isinstance(window, Mapping) else {}
+    raw_tail = report.get("tail_s")
+    tail_s = (float(raw_tail) if isinstance(raw_tail, (int, float)) and
+              not isinstance(raw_tail, bool) else tail_ms / 1000.0)
+    project_start = window.get("project_start_s")
+    project_end = window.get("project_end_s")
+    file_start = window.get("file_start_s")
+    file_end = window.get("file_end_s")
+    if section is not None:
+        project_start, project_end = section.start_s, section.end_s
+        file_start = 0.0 if file_start is None else file_start
+        file_end = (section.duration_s + tail_s) if file_end is None else file_end
+    measured = ({"start_s": project_start, "end_s": project_end}
+                if isinstance(project_start, (int, float)) and
+                isinstance(project_end, (int, float)) else None)
+    captured = ({"start_s": file_start, "end_s": file_end}
+                if isinstance(file_start, (int, float)) and
+                isinstance(file_end, (int, float)) else None)
+    return {
+        "project_section": (None if section is None else
+                            {"start_s": section.start_s, "end_s": section.end_s}),
+        "measured": measured,
+        "captured_file": captured,
+        "tail_s": tail_s,
+        # A valid capture resolves the project boundary before analysis, so a
+        # rendered tail is never part of the measured span.  Only an unknown
+        # boundary leaves this undecidable, and that capture never reaches here.
+        "tail_included_in_measurement": (False if measured is not None or
+                                         tail_s == 0 else None),
+    }
 
 
 @server.tool()
@@ -535,7 +828,9 @@ def reaper_project(project_id: str | None = None,
                    include_midi_notes: bool = False,
                    track_guids: list[str] | None = None,
                    item_guids: list[str] | None = None,
-                   expected_revision: dict[str, Any] | None = None) -> dict[str, Any]:
+                   expected_revision: dict[str, Any] | None = None,
+                   panorama_receipt: str | None = None,
+                   archive_root: str | None = None) -> dict[str, Any]:
     """Read one project's current context, including master, routing and tempo.
 
     Request items, FX parameters, or MIDI note data only when relevant. GUID
@@ -552,6 +847,35 @@ def reaper_project(project_id: str | None = None,
         raise StaleContext("The project changed since expected_revision was read",
                            details={"expected": expected.to_dict(),
                                     "current": revision.to_dict()})
+    if panorama_receipt:
+        gate = _require_panorama_receipt(panorama_receipt, revision.project_id,
+                                         revision.to_dict(), archive_root)
+        evidence = gate.get("audio_evidence")
+        evidence = evidence if isinstance(evidence, Mapping) else {}
+        fresh = str(evidence.get("state") or "unknown") == "current"
+        context["panorama_gate"] = {
+            "complete": True,
+            "receipt_valid": True,
+            "interpretation_allowed": fresh,
+            "audio_evidence": dict(evidence),
+            "note": ("A structural delta advances edits only; project-audio "
+                     "interpretation needs evidence.state == 'current'."),
+        }
+    else:
+        context["panorama_gate"] = {
+            "complete": False,
+            "receipt_valid": False,
+            "interpretation_allowed": False,
+            "bootstrap_structural_read": True,
+            "next_call": {
+                "tool": "reaper_capture_snapshot",
+                "then": ["reaper_panorama_open"],
+            },
+            "note": ("This structural read is allowed to establish the project "
+                     "and revision for the first capture. Do not treat it as a "
+                     "complete panorama or interpret project audio until "
+                     "reaper_panorama_open has delivered the view and its receipt."),
+        }
     tracks = context.get("tracks", [])
     if track_guids is not None:
         if not isinstance(track_guids, list) or any(not isinstance(g, str) for g in track_guids):
@@ -593,7 +917,12 @@ def reaper_analyze(project_id: str | None = None,
                    reference_windows: list[ReferenceWindow] | None = None,
                    parallel: bool = True,
                    artifact_role: str = "temporary",
-                   detail: str = "summary") -> dict[str, Any]:
+                   detail: str = "summary",
+                   tail_ms: StrictInt = 0,
+                   channels: str = "stereo",
+                   sample_rate: StrictInt | None = None,
+                   panorama_receipt: str | None = None,
+                   archive_root: str | None = None) -> dict[str, Any]:
     """Run the complete available audio suite on all tracks and the rendered master.
 
     This is one batch operation. It returns a concise report plus temporary
@@ -602,10 +931,23 @@ def reaper_analyze(project_id: str | None = None,
     reference_windows selects source-file-local windows independently from the
     project section. artifact_role holds one lease each for temporary, baseline,
     or final; replacing a role releases its previous temporary audio files.
+
+    tail_ms asks REAPER to render extra audio past the project section so
+    reverb decays survive; the extra tail is never measured. channels and
+    sample_rate are the render request. All three options affect only the
+    project capture: reference files and reference windows are read unchanged.
     """
     if (start_s is None) != (end_s is None):
         raise ValidationError("start_s and end_s must be supplied together")
     section = Section(start_s, end_s) if start_s is not None else None
+    if isinstance(tail_ms, bool) or not isinstance(tail_ms, int) or tail_ms < 0:
+        raise ValidationError("tail_ms must be a non-negative integer")
+    if not isinstance(channels, str) or channels not in {"stereo", "mono"}:
+        raise ValidationError("channels must be 'stereo' or 'mono'")
+    if sample_rate is not None and (
+            isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or
+            sample_rate <= 0):
+        raise ValidationError("sample_rate must be a positive integer or None")
     if not isinstance(include_pairwise, bool) or not isinstance(include_partial_loudness, bool):
         raise ValidationError("analysis options must be boolean")
     if not isinstance(parallel, bool):
@@ -629,6 +971,10 @@ def reaper_analyze(project_id: str | None = None,
                 if expected_revision is not None else None)
     project_before = _current_context(session, expected)
     selected_project_id = project_before["revision"]["project_id"]
+    _require_interpretation_receipt(
+        panorama_receipt, selected_project_id, project_before["revision"],
+        archive_root,
+    )
     references: dict[str, Any] = {}
     reference_sections: dict[str, Section] = {}
     reference_inputs: list[dict[str, Any]] = []
@@ -659,6 +1005,7 @@ def reaper_analyze(project_id: str | None = None,
         include_pairwise=include_pairwise, phase_pairs=phase_pairs,
         parallel=parallel, include_partial_loudness=include_partial_loudness,
         capture_mode="render", retain_audio=True, timeout_s=1800.0,
+        tail_ms=tail_ms, channels=channels, sample_rate=sample_rate,
     )
     revision = report.get("project", {}).get("revision", {})
     capture_revision = report.get("project", {}).get("capture_revision", {})
@@ -680,10 +1027,26 @@ def reaper_analyze(project_id: str | None = None,
     audio_files = report.get("audio_files")
     if not isinstance(artifact_job_id, str) or not isinstance(audio_files, dict):
         raise BridgeUnavailable("Audio analysis returned no managed temporary resources")
+    analysis_windows = _analysis_windows(report, section, tail_ms)
+    if analysis_windows["tail_s"] > 0 and analysis_windows["measured"] is None:
+        cleanup_audio_job(_AUDIO_ROOT, artifact_job_id)
+        raise BridgeUnavailable(
+            "Audio analysis did not report a measurable project boundary for "
+            "the rendered tail",
+            details={"boundary": "unknown",
+                     "capture_time_window": report.get("capture_time_window"),
+                     "tail_s": analysis_windows["tail_s"]},
+        )
 
     analysis_id = f"a-{int(time.time())}-{os.urandom(6).hex()}"
+    # The measured audio is bound to the pre-capture revision; the post-capture
+    # revision differs by the capture's own render-settings churn. Gates for
+    # consuming this analysis must use the evidence binding, not that churn.
+    analysis_revision = (capture_revision if isinstance(capture_revision, Mapping)
+                         and capture_revision.get("project_id") else revision)
     record = {"analysis_id": analysis_id, "project_id": selected_project_id,
-              "revision": revision, "role": artifact_role,
+              "revision": analysis_revision, "revision_after": revision,
+              "role": artifact_role,
               "artifact_job_id": artifact_job_id,
               "audio_files": audio_files,
               "report": _report_without_local_paths(report),
@@ -720,7 +1083,10 @@ def reaper_analyze(project_id: str | None = None,
         "lease_expires_in_seconds": _ANALYSIS_TTL_S,
         "project": report.get("project"),
         "initial_context_revision": project_before.get("revision"),
+        "evidence_revision": analysis_revision,
+        "revision_after_capture": revision,
         "section": report.get("section"),
+        "analysis_windows": analysis_windows,
         "reference_inputs": reference_inputs,
         "source_count_including_master": len(source_rows),
         "sources": source_rows,
@@ -742,7 +1108,9 @@ def reaper_edit_map(analysis_id: str,
                     decide: bool = False,
                     source_groups: dict[str, str] | None = None,
                     start_s: float | None = None,
-                    end_s: float | None = None) -> dict[str, Any]:
+                    end_s: float | None = None,
+                    panorama_receipt: str | None = None,
+                    archive_root: str | None = None) -> dict[str, Any]:
     """Build cut/seam evidence from an existing analysis, without applying it.
 
     This is deliberately evidence-only by default: no tight/natural preset,
@@ -771,6 +1139,10 @@ def reaper_edit_map(analysis_id: str,
     report = record.get("report")
     if not isinstance(report, dict):
         raise ValidationError("analysis has no report")
+    _require_interpretation_receipt(
+        panorama_receipt, str(record.get("project_id") or ""),
+        record.get("revision"), archive_root,
+    )
     points = tempo_points_from_report(report)
     edit_map = build_edit_map_from_report(
         report, points, intent=intent, decide=decide,
@@ -786,7 +1158,9 @@ def reaper_edit_map(analysis_id: str,
 
 @server.tool()
 @_guard
-def reaper_mix_evidence(analysis_id: str) -> dict[str, Any]:
+def reaper_mix_evidence(analysis_id: str,
+                        panorama_receipt: str | None = None,
+                        archive_root: str | None = None) -> dict[str, Any]:
     """Return measured mix issues/questions from an existing analysis.
 
     No plugin, EQ frequency, or gain recipe is chosen here. The agent reads the
@@ -802,6 +1176,10 @@ def reaper_mix_evidence(analysis_id: str) -> dict[str, Any]:
     report = record.get("report")
     if not isinstance(report, dict):
         raise ValidationError("analysis has no report")
+    _require_interpretation_receipt(
+        panorama_receipt, str(record.get("project_id") or ""),
+        record.get("revision"), archive_root,
+    )
     evidence = build_mix_evidence(report)
     return {
         "ok": True,
@@ -809,6 +1187,29 @@ def reaper_mix_evidence(analysis_id: str) -> dict[str, Any]:
         "revision": record.get("revision"),
         "mix_evidence": evidence,
     }
+
+
+def _edit_operation_facts(result: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Pair the per-operation before/after readback into one factual list."""
+    before = result.get("before")
+    after = result.get("after")
+    before_rows = before if isinstance(before, list) else []
+    after_rows = after if isinstance(after, list) else []
+    facts: list[dict[str, Any]] = []
+    for index, entry in enumerate(before_rows):
+        if not isinstance(entry, Mapping):
+            continue
+        paired = after_rows[index] if index < len(after_rows) else {}
+        paired = paired if isinstance(paired, Mapping) else {}
+        facts.append({
+            "operation_index": entry.get("operation_index"),
+            "kind": entry.get("kind"),
+            "target_guid": entry.get("target_guid"),
+            "before": entry.get("values"),
+            "after": paired.get("values"),
+            "changes_state": entry.get("changes_state"),
+        })
+    return facts
 
 
 @server.tool()
@@ -819,13 +1220,17 @@ def reaper_edit(mode: str,
                 operations: list[dict[str, Any]] | None = None,
                 reason: str | None = None,
                 plan_id: str | None = None,
-                bridge_session_id: str | None = None) -> dict[str, Any]:
+                bridge_session_id: str | None = None,
+                panorama_receipt: str | None = None,
+                archive_root: str | None = None) -> dict[str, Any]:
     """Preview, apply, or undo one revision-bound batch of project edits.
 
     preview: supply operations and reason; nothing changes. apply: use the
-    returned plan_id and the same expected_revision. undo: use that plan_id
-    and the post-apply revision returned by apply. Each batch may contain up
-    to 256 library-supported operations; generic API calls and Actions remain
+    returned plan_id and the same expected_revision; the response carries a
+    factual delta bound to the acknowledged panorama token. undo: use that
+    plan_id and the post-apply revision returned by apply; undo is a new
+    forward revision with its own delta. Each batch may contain up to 256
+    library-supported operations; generic API calls and Actions remain
     available for operations outside this transaction set.
     """
     if mode not in {"preview", "apply", "undo"}:
@@ -833,6 +1238,9 @@ def reaper_edit(mode: str,
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)
     _current_context(session, expected)
+    if mode != "preview":
+        _require_panorama_receipt(panorama_receipt, project_id, expected.to_dict(),
+                                  archive_root)
     if mode == "preview":
         if not isinstance(operations, list) or not operations:
             raise ValidationError("preview requires a non-empty operations list")
@@ -873,7 +1281,15 @@ def reaper_edit(mode: str,
         raise ValidationError("plan_id is unknown or expired; preview the change again",
                               details={"plan_id": plan_id})
     plan: EditPlan = cached["plan"]
-    if cached["project_id"] != project_id or plan.revision != expected:
+    if cached["project_id"] != project_id:
+        raise StaleContext("The edit plan does not match this project revision",
+                           details={"plan_project_id": cached["project_id"],
+                                    "plan_revision": plan.revision.to_dict(),
+                                    "provided_revision": expected.to_dict()})
+    # Apply starts from the plan's base revision.  Undo starts from the exact
+    # revision that apply produced, which is not the plan's base revision; the
+    # applied-revision check below still requires that exact value.
+    if mode != "undo" and plan.revision != expected:
         raise StaleContext("The edit plan does not match this project revision",
                            details={"plan_project_id": cached["project_id"],
                                     "plan_revision": plan.revision.to_dict(),
@@ -887,12 +1303,30 @@ def reaper_edit(mode: str,
         applied_revision = result.get("revision_after")
         if not isinstance(applied_revision, dict):
             raise BridgeUnavailable("REAPER did not return the applied project revision")
-        cached["applied_revision"] = ProjectRevision.from_dict(applied_revision)
+        applied = ProjectRevision.from_dict(applied_revision)
+        cached["applied_revision"] = applied
+        delta = _record_mutation_delta(
+            lifecycle=_panorama_lifecycle(archive_root), kind="edit",
+            receipt=str(panorama_receipt), project_id=project_id,
+            base_revision=expected, session=session, scope="known",
+            operation_facts=_edit_operation_facts(result))
+        advance = delta.get("advance") if isinstance(delta, Mapping) else None
+        if isinstance(advance, Mapping) and advance.get("context_token"):
+            cached["applied_context_token"] = str(advance["context_token"])
+        cached["applied_archive_root"] = archive_root
+        if not delta.get("delta_id") or not delta.get("acknowledgeable"):
+            return {"mode": "apply", "plan_id": plan_id, "result": result,
+                    "delta": delta, "next_call": delta.get("next_call")}
         return {"mode": "apply", "plan_id": plan_id,
                 "result": result,
-                "next_call": {"tool": "reaper_project", "project_id": project_id,
-                              "expected_revision": applied_revision,
-                              "then": "Read back touched objects; use reaper_edit(mode='undo') only if this plan is still the newest undo record."}}
+                "delta": delta,
+                "next_call": {
+                    "tool": None,
+                    "context_token": (delta.get("advance") or {}).get("context_token"),
+                    "note": ("the successor token is already in delta.advance.context_token; "
+                             "no acknowledgement call is required to continue structural "
+                             "edits. Project-audio interpretation still needs a fresh "
+                             "capture.")}}
     applied_revision = cached.get("applied_revision")
     if not isinstance(applied_revision, ProjectRevision) or applied_revision != expected:
         raise StaleContext("Undo needs the exact revision returned by this plan's apply",
@@ -901,9 +1335,348 @@ def reaper_edit(mode: str,
                                                           else None),
                                     "provided_revision": expected.to_dict()})
     result = session.undo(expected_revision=expected)
+    undone_revision = result.get("revision_after")
+    delta = _record_mutation_delta(
+        lifecycle=_panorama_lifecycle(archive_root), kind="undo",
+        receipt=str(panorama_receipt), project_id=project_id,
+        base_revision=expected, session=session, scope="known",
+        operation_facts=None)
     with _LOCK:
         _edit_plans.pop(plan_id, None)
-    return {"mode": "undo", "plan_id": plan_id, "result": result}
+    response = {"mode": "undo", "plan_id": plan_id, "result": result,
+                "revision_after": undone_revision, "delta": delta}
+    if delta.get("delta_id") and delta.get("acknowledgeable"):
+        response["next_call"] = {
+            "tool": None,
+            "context_token": (delta.get("advance") or {}).get("context_token"),
+            "note": ("the successor token is already in delta.advance.context_token; the "
+                     "earlier edit records remain history and no ack call is required"),
+        }
+    else:
+        response["next_call"] = delta.get("next_call")
+    return response
+
+
+def _advance_candidate_context(*, cached: dict[str, Any], project_id: str,
+                               applied: ProjectRevision,
+                               post_revision: ProjectRevision,
+                               session: ProjectSession) -> dict[str, Any]:
+    """Make the post-render revision the next valid lifecycle revision/token.
+
+    A native REAPER render can advance the monotonic change counter while the
+    content digest and restored settings remain identical.  That is not an edit
+    and must not invalidate audio evidence, but the old context token is bound
+    to the pre-render revision.  Record a content-neutral delta from the
+    applied revision to the post-render revision using the token returned by
+    apply, so the model receives the next valid token instead of a stale one.
+    """
+    token = cached.get("applied_context_token")
+    if not token:
+        return {
+            "status": "unavailable",
+            "reason": "no_applied_context_token",
+            "from_revision": applied.to_dict(),
+            "to_revision": post_revision.to_dict(),
+            "revision_after_render": post_revision.to_dict(),
+            "next_call": {
+                "tool": "reaper_panorama_refresh",
+                "project_id": project_id,
+                "then": ("The render advanced the counter but no apply context "
+                         "token was cached; refresh the panorama before the next edit."),
+            },
+        }
+    lifecycle = _panorama_lifecycle(cached.get("applied_archive_root"))
+    delta = _record_mutation_delta(
+        lifecycle=lifecycle, kind="render_candidate", receipt=str(token),
+        project_id=project_id, base_revision=applied, session=session,
+        scope="known", operation_facts=[])
+    advance = delta.get("advance") if isinstance(delta, Mapping) else None
+    next_token = advance.get("context_token") if isinstance(advance, Mapping) else None
+    if not next_token:
+        return {
+            "status": "unavailable",
+            "reason": str(delta.get("reason") or "delta_not_advanceable"),
+            "from_revision": applied.to_dict(),
+            "to_revision": post_revision.to_dict(),
+            "revision_after_render": post_revision.to_dict(),
+            "delta": delta,
+            "next_call": delta.get("next_call") or {
+                "tool": "reaper_panorama_refresh",
+                "project_id": project_id,
+                "then": "Refresh the panorama before the next structural edit.",
+            },
+        }
+    return {
+        "status": "advanced",
+        "from_revision": applied.to_dict(),
+        "to_revision": post_revision.to_dict(),
+        "revision_after_render": post_revision.to_dict(),
+        "context_token": str(next_token),
+        "delta": delta,
+        "next_call": delta.get("next_call"),
+    }
+
+
+@server.tool()
+@_guard
+def reaper_render_candidate(
+        plan_id: str,
+        project_id: str,
+        revision_after: dict[str, Any],
+        start_s: float,
+        end_s: float,
+        bridge_session_id: str | None = None,
+        channels: str = "stereo",
+        sample_rate: StrictInt | None = None,
+        tail_ms: StrictInt = 0,
+        max_duration_s: float = 120.0) -> dict[str, Any]:
+    """Render the applied edit's processed master output on an exact interval.
+
+    This is the verification primitive for an iterative mix: it binds one
+    already-applied ``reaper_edit`` plan to a short, explicitly selected
+    interval and returns the processed master WAV (track, bus and master FX
+    plus routing) with its SHA-256, exact project/file bounds, render stage,
+    FX/routing provenance, render key and a lease-managed audio resource.
+
+    The native REAPER render temporarily rewrites render settings and the time
+    selection, then restores them. Restoration is verified by comparing the
+    project digest and important render state before/after; the monotonic
+    counter may advance and is returned explicitly as ``revision_after_render``.
+    No project reload, save, reset or hidden counter rollback is performed.
+    The candidate file is outside the .rpp and is replaced on the next
+    candidate for this project; release it with
+    ``reaper_release(analysis_id=candidate_id)`` or let its lease expire.
+    """
+    if not isinstance(plan_id, str) or not plan_id:
+        raise ValidationError("plan_id must be the id returned by reaper_edit preview/apply")
+    if not isinstance(project_id, str) or not project_id:
+        raise ValidationError("project_id must be a non-empty string")
+    if (isinstance(start_s, bool) or not isinstance(start_s, (int, float)) or
+            isinstance(end_s, bool) or not isinstance(end_s, (int, float)) or
+            not isfinite(float(start_s)) or not isfinite(float(end_s))):
+        raise ValidationError("start_s and end_s must be finite numbers")
+    section = Section(float(start_s), float(end_s))
+    if (isinstance(max_duration_s, bool) or
+            not isinstance(max_duration_s, (int, float)) or
+            not isfinite(float(max_duration_s)) or max_duration_s <= 0):
+        raise ValidationError("max_duration_s must be a positive finite number")
+    if isinstance(tail_ms, bool) or not isinstance(tail_ms, int) or tail_ms < 0:
+        raise ValidationError("tail_ms must be a non-negative integer")
+    if channels not in {"stereo", "mono"}:
+        raise ValidationError("channels must be 'stereo' or 'mono'")
+    if sample_rate is not None and (isinstance(sample_rate, bool) or sample_rate <= 0):
+        raise ValidationError("sample_rate must be a positive integer or None")
+    requested = _revision(revision_after, project_id=project_id)
+    with _LOCK:
+        cached = _edit_plans.get(plan_id)
+    if cached is None:
+        raise ValidationError("plan_id is unknown or expired; preview/apply the edit again",
+                              details={"plan_id": plan_id})
+    if cached.get("project_id") != project_id:
+        raise StaleContext("The candidate plan belongs to a different project",
+                           details={"plan_project_id": cached.get("project_id"),
+                                    "project_id": project_id})
+    if cached.get("bridge_session_id") != bridge_session_id:
+        raise StaleContext("The candidate plan belongs to a different REAPER bridge instance")
+    created_at = cached.get("created_at")
+    if (isinstance(created_at, (int, float)) and
+            time.time() - float(created_at) > _PLAN_TTL_S):
+        raise StaleContext("The candidate plan has expired; preview/apply the edit again",
+                           details={"plan_id": plan_id, "ttl_s": _PLAN_TTL_S})
+    applied = cached.get("applied_revision")
+    if not isinstance(applied, ProjectRevision):
+        raise ValidationError("The candidate plan has not been applied",
+                              details={"plan_id": plan_id,
+                                       "next_action": "apply the previewed plan first"})
+    if (applied.project_id != requested.project_id or
+            applied.change_count != requested.change_count or
+            applied.path != requested.path or
+            (applied.instance_id is not None and requested.instance_id is not None and
+             applied.instance_id != requested.instance_id) or
+            (applied.epoch is not None and requested.epoch is not None and
+             applied.epoch != requested.epoch)):
+        raise StaleContext("revision_after is not the revision returned by this plan's apply",
+                           details={"plan_applied_revision": applied.to_dict(),
+                                    "revision_after": requested.to_dict()})
+    plan = cached.get("plan")
+    if plan is None or getattr(plan, "plan_id", None) != plan_id:
+        raise ValidationError("The cached candidate plan is invalid")
+    session = _session(project_id, bridge_session_id)
+    _current_context(session, requested)
+    _prune_analysis_state()
+    result = session.render_candidate(
+        plan, revision_after=applied, section=section,
+        artifact_root=_AUDIO_ROOT, channels=channels,
+        sample_rate=sample_rate, tail_ms=tail_ms,
+        max_duration_s=float(max_duration_s),
+    )
+    result_map: dict[str, Any] = result if isinstance(result, dict) else {}
+    provenance_raw = result_map.get("provenance")
+    provenance: dict[str, Any] = (dict(provenance_raw)
+                                  if isinstance(provenance_raw, Mapping) else {})
+    master_guid = str(provenance.get("master_guid") or "")
+    job_raw = result_map.get("artifact_job")
+    job_map: dict[str, Any] = dict(job_raw) if isinstance(job_raw, Mapping) else {}
+    job_id = str(job_map.get("job_id") or "")
+    audio_raw = result_map.get("audio")
+    audio: dict[str, Any] = dict(audio_raw) if isinstance(audio_raw, Mapping) else {}
+    audio_path = audio.get("path")
+    if not master_guid or not job_id or not isinstance(audio_path, str) or not audio_path:
+        if job_id:
+            cleanup_audio_job(_AUDIO_ROOT, job_id)
+        raise BridgeUnavailable("The candidate render returned incomplete lease provenance")
+    post_raw = result_map.get("revision_after_render")
+    if not isinstance(post_raw, Mapping):
+        cleanup_audio_job(_AUDIO_ROOT, job_id)
+        raise BridgeUnavailable("The candidate render did not return a post-render revision")
+    try:
+        post_revision = ProjectRevision.from_dict(dict(post_raw))
+    except Exception as exc:
+        cleanup_audio_job(_AUDIO_ROOT, job_id)
+        raise BridgeUnavailable(
+            "The candidate render returned an invalid post-render revision",
+            details={"reason": str(exc), "revision_after_render": post_raw},
+        ) from exc
+    if post_revision == applied:
+        context_advance: dict[str, Any] = {
+            "status": "not_required",
+            "from_revision": applied.to_dict(),
+            "to_revision": post_revision.to_dict(),
+            "revision_after_render": post_revision.to_dict(),
+            "context_token": cached.get("applied_context_token"),
+        }
+    else:
+        try:
+            context_advance = _advance_candidate_context(
+                cached=cached, project_id=project_id, applied=applied,
+                post_revision=post_revision, session=session)
+        except Exception as exc:  # noqa: BLE001 - audio is already valid
+            context_advance = {
+                "status": "unavailable",
+                "reason": f"context_advance_failed:{type(exc).__name__}",
+                "from_revision": applied.to_dict(),
+                "to_revision": post_revision.to_dict(),
+                "revision_after_render": post_revision.to_dict(),
+                "next_call": {
+                    "tool": "reaper_panorama_refresh",
+                    "project_id": project_id,
+                    "then": "Refresh the panorama before the next structural edit.",
+                },
+            }
+    with _LOCK:
+        cached["applied_revision"] = post_revision
+        if context_advance.get("context_token"):
+            cached["applied_context_token"] = str(context_advance["context_token"])
+    candidate_id = f"rc-{int(time.time())}-{os.urandom(6).hex()}"
+    role_key = (project_id, "candidate")
+    with _LOCK:
+        previous_id = _analysis_roles.get(role_key)
+    if previous_id:
+        try:
+            _cleanup_analysis_record(previous_id)
+        except Exception:
+            cleanup_audio_job(_AUDIO_ROOT, job_id)
+            raise
+    record = {
+        "analysis_id": candidate_id,
+        "project_id": project_id,
+        "revision": result_map.get("revision_after"),
+        "revision_after": result_map.get("revision_after_render"),
+        "role": "candidate",
+        "artifact_job_id": job_id,
+        "audio_files": {master_guid: audio_path},
+        "report": {
+            "kind": "render_candidate",
+            "plan_id": plan_id,
+            "project_id": project_id,
+            "revision_after": result_map.get("revision_after"),
+            "provenance": provenance,
+            "audio": {key: value for key, value in audio.items() if key != "path"},
+        },
+        "expires_at": time.time() + _ANALYSIS_TTL_S,
+    }
+    with _LOCK:
+        _analysis_records[candidate_id] = record
+        _analysis_roles[role_key] = candidate_id
+    audio_uri = (f"reaper://analyses/{candidate_id}/audio/"
+                 f"{quote(master_guid, safe='')}")
+    project_state_raw = result_map.get("project_state")
+    project_state: dict[str, Any] = (dict(project_state_raw)
+                                     if isinstance(project_state_raw, Mapping) else {})
+    response = {
+        "ok": True,
+        "mode": "render_candidate",
+        "candidate_id": candidate_id,
+        "plan_id": plan_id,
+        "project_id": project_id,
+        "revision_before": result_map.get("revision_before"),
+        "revision_after": result_map.get("revision_after"),
+        "revision_after_render": result_map.get("revision_after_render"),
+        "render_key": result_map.get("render_key"),
+        "section": result_map.get("section"),
+        "duration_s": result_map.get("duration_s"),
+        "render_s": result_map.get("render_s"),
+        "audio": {
+            "resource_uri": audio_uri,
+            "sha256": audio.get("sha256"),
+            "bytes": audio.get("bytes"),
+            "sample_rate": audio.get("sample_rate"),
+            "channels": audio.get("channels"),
+            "frames": audio.get("frames"),
+            "duration_s": audio.get("duration_s"),
+            "format": audio.get("format"),
+            "stage": audio.get("stage"),
+            "node": audio.get("node"),
+            "channel_view": audio.get("channel_view"),
+            "source_kind": audio.get("source_kind"),
+            "audio_accessor_used": audio.get("audio_accessor_used"),
+            "file_window": audio.get("file_window"),
+            "project_window": audio.get("project_window"),
+            "measured_window": audio.get("measured_window"),
+            "tail_s": audio.get("tail_s"),
+        },
+        "provenance": provenance,
+        "project_state": project_state,
+        "context_advance": context_advance,
+        "completeness": {
+            "plan_bound": True,
+            "revision_bound": True,
+            "audio_delivered": bool(audio.get("sha256") and audio.get("bytes")),
+            "stage_known": bool(audio.get("stage") and audio.get("node")),
+            "fx_provenance": bool(provenance.get("fingerprints")),
+            "routing_provenance": bool(provenance.get("routing_summary")),
+            "render_settings_echo": bool(provenance.get("render_settings_used")),
+            "restoration_verified": bool(project_state.get("restoration_verified")),
+            "project_content_unchanged": bool(project_state.get("content_unchanged")),
+            "content_evidence_equal": bool(
+                (project_state.get("content_comparison") or {}).get("equal")),
+            "post_render_revision_current": bool(
+                project_state.get("revision_after_render_is_current")),
+            "counter_advance_reported": bool(
+                project_state.get("counter_changed_by_render")),
+            "lifecycle_token_current": bool(context_advance.get("context_token")),
+        },
+        "lease": {
+            "kind": "render_candidate",
+            "id": candidate_id,
+            "expires_at": record["expires_at"],
+            "ttl_s": _ANALYSIS_TTL_S,
+            "release_tool": "reaper_release",
+            "release_argument": {"analysis_id": candidate_id},
+            "cleanup": "manifest-owned job + TTL; replaced by the next candidate for this project",
+        },
+        "warnings": [],
+    }
+    if project_state.get("counter_changed_by_render"):
+        response["warnings"].append("render_counter_advanced")
+    if context_advance.get("status") == "unavailable":
+        response["warnings"].append("candidate_context_token_unavailable")
+    if ((provenance.get("fingerprints") if isinstance(provenance, Mapping) else {})
+            or {}).get("project_digest_scope") != "full":
+        response["warnings"].append("project_digest_scope_coarse")
+    if result_map.get("revision_after_render") != result_map.get("revision_after"):
+        response["warnings"].append("render_advanced_revision_counter")
+    return response
 
 
 def _handle_argument(value: Any, *, kind: str, revision: ProjectRevision,
@@ -948,13 +1721,19 @@ def reaper_api_call(name: str,
                     project_id: str,
                     expected_revision: dict[str, Any],
                     bridge_session_id: str | None = None,
-                    timeout_s: float = 30.0) -> dict[str, Any]:
+                    timeout_s: float = 30.0,
+                    panorama_receipt: str | None = None,
+                    archive_root: str | None = None) -> dict[str, Any]:
     """Call any function in the official REAPER ReaScript catalog.
 
     values are positional and must match the catalog signature exactly.
     Represent host objects as {"$reaper_ref":{"kind":"MediaTrack","guid":"..."}}
     or pass a live $reaper_handle returned by an earlier call. Null is accepted
     only for optional parameters. Arrays use ordinary numeric JSON lists.
+
+    A mutating call returns a delta whose scope is explicitly ``unknown``: the
+    server does not pretend to know which tracks a raw API call touched, so all
+    project audio evidence is invalidated conservatively.
     """
     if not isinstance(values, list):
         raise ValidationError("values must be a positional JSON array")
@@ -965,6 +1744,9 @@ def reaper_api_call(name: str,
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)
     _current_context(session, expected)
+    if not getattr(_API_GATE_BYPASS, "enabled", False):
+        _require_panorama_receipt(panorama_receipt, project_id, expected.to_dict(),
+                                  archive_root)
     if len(values) != len(signature.parameters):
         raise ValidationError("Wrong number of API arguments",
                               details={"name": name,
@@ -982,13 +1764,38 @@ def reaper_api_call(name: str,
                                   details={"name": name, "parameter": parameter.name})
         prepared.append(value)
     result = session.bridge.call_api(name, *prepared, timeout_s=float(timeout_s))
+    before_value = result.project_before if isinstance(result.project_before, Mapping) else None
+    after_value = result.project_after if isinstance(result.project_after, Mapping) else None
+    delta: dict[str, Any] | None = None
+    if isinstance(after_value, Mapping):
+        after_revision = ProjectRevision.from_dict(dict(after_value))
+        if after_revision != expected:
+            delta = _record_mutation_delta(
+                lifecycle=_panorama_lifecycle(archive_root), kind="api_call",
+                receipt=str(panorama_receipt), project_id=project_id,
+                base_revision=expected, session=session, scope="unknown",
+                operation_facts=[{
+                    "operation_index": 0, "kind": name,
+                    "target_guid": None,
+                    "before": {"change_count": expected.change_count},
+                    "after": {"change_count": after_revision.change_count},
+                    "changes_state": True,
+                }])
+        else:
+            delta = {"status": "not_modified", "acknowledgeable": False,
+                     "project_id": project_id,
+                     "revision": after_revision.to_dict(),
+                     "note": "the API call did not change the observed project revision"}
     return {"name": result.name,
             "returns": list(result.returns),
             "arrays": {str(index): list(items) for index, items in result.arrays.items()},
-            "project_before": result.project_before,
-            "project_after": result.project_after,
+            "project_before": before_value,
+            "project_after": after_value,
             "expected_revision": expected.to_dict(),
-            "note": "Re-read project context after any API call that may mutate state."
+            "delta": delta,
+            "note": ("A raw API call has unknown mutation scope: the delta invalidates "
+                     "project audio conservatively and never claims a precise untouched "
+                     "subset. Re-read the project context before claims."),
             }
 
 
@@ -1001,12 +1808,16 @@ def reaper_action(mode: str,
                   query_object: str | None = None,
                   query_operation: str | None = None,
                   command_id: int | None = None,
-                  bridge_session_id: str | None = None) -> dict[str, Any]:
+                  bridge_session_id: str | None = None,
+                  panorama_receipt: str | None = None,
+                  archive_root: str | None = None) -> dict[str, Any]:
     """Search a REAPER Action or invoke it against an identified revision.
 
     Search requires query_object and query_operation. Main-section invocation
     uses revision-bound Main_OnCommandEx. MIDI-editor section 32060 uses the
-    active MIDI editor and also requires expected_revision.
+    active MIDI editor and also requires expected_revision. An invocation that
+    changes state returns a delta with scope ``unknown`` and conservative audio
+    invalidation.
     """
     if mode not in {"search", "invoke"}:
         raise ValidationError("mode must be search or invoke")
@@ -1026,6 +1837,8 @@ def reaper_action(mode: str,
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)
     _current_context(session, expected)
+    _require_panorama_receipt(panorama_receipt, project_id, expected.to_dict(),
+                              archive_root)
     project_handle = ReaperHandle(kind="ReaProject", project_id=project_id,
                                   change_count=expected.change_count,
                                   stable_id=project_id)
@@ -1043,12 +1856,33 @@ def reaper_action(mode: str,
         raise ValidationError("Action invocation supports section 0 or MIDI Editor section 32060",
                               details={"supported_sections": [0, 32060]})
     after = ProjectRevision.from_dict(session.snapshot().get("revision", {}))
+    delta: dict[str, Any] | None = None
+    if after != expected:
+        delta = _record_mutation_delta(
+            lifecycle=_panorama_lifecycle(archive_root), kind="action",
+            receipt=str(panorama_receipt), project_id=project_id,
+            base_revision=expected, session=session, scope="unknown",
+            operation_facts=[{
+                "operation_index": 0, "kind": f"action:{command_id}",
+                "target_guid": None,
+                "before": {"change_count": expected.change_count},
+                "after": {"change_count": after.change_count},
+                "changes_state": True,
+            }])
+    else:
+        delta = {"status": "not_modified", "acknowledgeable": False,
+                 "project_id": project_id, "revision": after.to_dict(),
+                 "note": "the Action did not change the observed project revision"}
     return {"command_id": command_id, "section_id": section_id,
             "returns": list(result.returns),
             "project_before": expected.to_dict(),
             "project_after": after.to_dict(),
             "state_changed": after != expected,
-            "verification": "Read the affected project objects and audio; Actions are not assumed to be undoable by this server."}
+            "delta": delta,
+            "verification": ("Actions have unknown mutation scope: the delta invalidates "
+                             "project audio conservatively; re-read the affected project "
+                             "objects and capture before interpreting audio. Actions are "
+                             "not assumed to be undoable by this server.")}
 
 
 @server.tool()
@@ -1058,8 +1892,15 @@ def reaper_save(mode: str,
                 expected_revision: dict[str, Any],
                 path: str | None = None,
                 overwrite_existing: bool = False,
-                bridge_session_id: str | None = None) -> dict[str, Any]:
-    """Save through REAPER. save_as is absolute .RPP and refuses overwrite by default."""
+                bridge_session_id: str | None = None,
+                panorama_receipt: str | None = None,
+                archive_root: str | None = None) -> dict[str, Any]:
+    """Save through REAPER. save_as is absolute .RPP and refuses overwrite by default.
+
+    A save that moves the revision or path sets ``context_invalidated`` and
+    returns no delta: the previous token cannot be reused, and no facts about a
+    new document are invented.
+    """
     if mode not in {"save_current", "save_as"}:
         raise ValidationError("mode must be save_current or save_as")
     if not isinstance(overwrite_existing, bool):
@@ -1067,6 +1908,8 @@ def reaper_save(mode: str,
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)
     before = _current_context(session, expected)
+    _require_panorama_receipt(panorama_receipt, project_id, expected.to_dict(),
+                              archive_root)
     if mode == "save_current":
         if path is not None or overwrite_existing:
             raise ValidationError("path and overwrite_existing only apply to save_as")
@@ -1076,16 +1919,31 @@ def reaper_save(mode: str,
             raise ValidationError("save_as requires path")
         result = session.save_as(path, overwrite_existing=overwrite_existing)
     after = session.snapshot()
-    return {"result": result,
-            "revision_before": before.get("revision"),
-            "revision_after": after.get("revision"),
-            "saved": result.get("saved") is True}
+    after_revision = after.get("revision") or {}
+    changed_identity = (ProjectRevision.from_dict(after_revision) != expected)
+    result_value = {
+        "result": result,
+        "revision_before": before.get("revision"),
+        "revision_after": after_revision,
+        "saved": result.get("saved") is True,
+        "context_invalidated": changed_identity,
+    }
+    if changed_identity:
+        result_value["delta"] = None
+        result_value["next_call"] = {
+            "tool": "reaper_capture_snapshot",
+            "project_id": project_id,
+            "then": ("Saving moved the project revision or path; the current context "
+                     "token no longer matches. Capture again or refresh the structural "
+                     "context before editing. No factual delta is invented for a save."),
+        }
+    return result_value
 
 
 @server.tool()
 @_guard
 def reaper_release(analysis_id: str) -> dict[str, Any]:
-    """Release one analysis report and its manifest-owned temporary WAVs now."""
+    """Release one analysis or render-candidate lease and its temporary WAVs now."""
     if not isinstance(analysis_id, str) or not analysis_id:
         raise ValidationError("analysis_id must be a non-empty string")
     return {"analysis_id": analysis_id,
@@ -1191,9 +2049,14 @@ def reaper_flamingo_status() -> dict[str, Any]:
 
 
 def _api_call(ctx, name, values):
-    return reaper_api_call(name=name, values=values,
-                           project_id=ctx["revision"]["project_id"],
-                           expected_revision=ctx["revision"])["returns"]
+    previous = getattr(_API_GATE_BYPASS, "enabled", False)
+    _API_GATE_BYPASS.enabled = True
+    try:
+        return reaper_api_call(name=name, values=values,
+                               project_id=ctx["revision"]["project_id"],
+                               expected_revision=ctx["revision"])["returns"]
+    finally:
+        _API_GATE_BYPASS.enabled = previous
 
 
 def _track_send_destinations(ctx, track_guid):
@@ -1327,7 +2190,9 @@ def reaper_flamingo_describe(target: str = "master",
                              reference_path: str | None = None,
                              prompt: str | None = None,
                              project_id: str | None = None,
-                             bridge_session_id: str | None = None) -> dict[str, Any]:
+                             bridge_session_id: str | None = None,
+                             panorama_receipt: str | None = None,
+                             archive_root: str | None = None) -> dict[str, Any]:
     """Describe audio with Music Flamingo (GPU only).
 
     target: "master" renders the project master through its FX; "file:<path>" uses an
@@ -1350,6 +2215,10 @@ def reaper_flamingo_describe(target: str = "master",
         raise ValidationError("target must be 'master', 'track:<name|guid>' or 'file:<path>'")
     session = _session(project_id, bridge_session_id)
     ctx = session.snapshot(include_fx_params=False)
+    _require_interpretation_receipt(
+        panorama_receipt, str(ctx.get("revision", {}).get("project_id") or ""),
+        ctx.get("revision"), archive_root,
+    )
 
     if target.startswith("track:"):
         wav, tinfo = _render_isolated_track(session, ctx, target[6:], start_s, end_s)
@@ -1397,7 +2266,9 @@ def reaper_flamingo_ask(question: str,
                         representations: list[str] | None = None,
                         reference_path: str | None = None,
                         project_id: str | None = None,
-                        bridge_session_id: str | None = None) -> dict[str, Any]:
+                        bridge_session_id: str | None = None,
+                        panorama_receipt: str | None = None,
+                        archive_root: str | None = None) -> dict[str, Any]:
     """Ask Music Flamingo a free-form question about the master or a file, optionally bounded."""
     if not isinstance(question, str) or not question.strip():
         raise ValidationError("question must be a non-empty string")
@@ -1406,7 +2277,9 @@ def reaper_flamingo_ask(question: str,
                                     reference_path=reference_path,
                                     prompt=question.strip(),
                                     project_id=project_id,
-                                    bridge_session_id=bridge_session_id)
+                                    bridge_session_id=bridge_session_id,
+                                    panorama_receipt=panorama_receipt,
+                                    archive_root=archive_root)
 
 
 @server.tool()
@@ -1432,7 +2305,9 @@ def reaper_spatial_analyze(question: str | None = None,
                            quantize: str = "none",
                            with_timeline: bool = True,
                            project_id: str | None = None,
-                           bridge_session_id: str | None = None) -> dict[str, Any]:
+                           bridge_session_id: str | None = None,
+                           panorama_receipt: str | None = None,
+                           archive_root: str | None = None) -> dict[str, Any]:
     """Ask Ossicle-4B about the real L/R channels of a stereo source (GPU only).
 
     target: "master" renders the master through its FX as stereo; "track:<name>" renders
@@ -1462,6 +2337,10 @@ def reaper_spatial_analyze(question: str | None = None,
         raise ValidationError("target must be 'master', 'track:<name|guid>' or 'file:<path>'")
     session = _session(project_id, bridge_session_id)
     ctx = session.snapshot(include_fx_params=False)
+    _require_interpretation_receipt(
+        panorama_receipt, str(ctx.get("revision", {}).get("project_id") or ""),
+        ctx.get("revision"), archive_root,
+    )
     timeline_text = None
     if with_timeline:
         from .analysis import timeline_context as tc
@@ -1500,7 +2379,9 @@ def reaper_spatial_timeline(target: str = "master",
                             window_s: float = 30.0,
                             hop_s: float | None = None,
                             project_id: str | None = None,
-                            bridge_session_id: str | None = None) -> dict[str, Any]:
+                            bridge_session_id: str | None = None,
+                            panorama_receipt: str | None = None,
+                            archive_root: str | None = None) -> dict[str, Any]:
     """Measured width/balance profile across the timeline (no model, no GPU).
 
     Stereo only: renders the master (or a track, or a file) and reports per-window RMS,
@@ -1517,6 +2398,10 @@ def reaper_spatial_timeline(target: str = "master",
         raise ValidationError("target must be 'master', 'track:<name|guid>' or 'file:<path>'")
     session = _session(project_id, bridge_session_id)
     ctx = session.snapshot(include_fx_params=False)
+    _require_interpretation_receipt(
+        panorama_receipt, str(ctx.get("revision", {}).get("project_id") or ""),
+        ctx.get("revision"), archive_root,
+    )
     if target.startswith("track:"):
         wav, tinfo = _render_isolated_track(session, ctx, target[6:], start_s, end_s)
     else:
@@ -1540,27 +2425,15 @@ def _timeline_items_markers(ctx: dict[str, Any], start_s: float | None,
     items: list[dict[str, Any]] = []
     for t in ctx.get("tracks", []):
         try:
-            handle = reaper_api_call(name="GetTrack", values=[proj, t["index"]],
-                                     project_id=ctx["revision"]["project_id"],
-                                     expected_revision=ctx["revision"])["returns"][0]
-            count = int(reaper_api_call(name="CountTrackMediaItems", values=[handle],
-                                        project_id=ctx["revision"]["project_id"],
-                                        expected_revision=ctx["revision"])["returns"][0])
+            handle = _api_call(ctx, "GetTrack", [proj, t["index"]])[0]
+            count = int(_api_call(ctx, "CountTrackMediaItems", [handle])[0])
         except Exception:                       # noqa: BLE001
             continue
         for i in range(min(count, 20)):
             try:
-                item = reaper_api_call(name="GetTrackMediaItem", values=[handle, i],
-                                       project_id=ctx["revision"]["project_id"],
-                                       expected_revision=ctx["revision"])["returns"][0]
-                pos = float(reaper_api_call(name="GetMediaItemInfo_Value",
-                                            values=[item, "D_POSITION"],
-                                            project_id=ctx["revision"]["project_id"],
-                                            expected_revision=ctx["revision"])["returns"][0])
-                length = float(reaper_api_call(name="GetMediaItemInfo_Value",
-                                               values=[item, "D_LENGTH"],
-                                               project_id=ctx["revision"]["project_id"],
-                                               expected_revision=ctx["revision"])["returns"][0])
+                item = _api_call(ctx, "GetTrackMediaItem", [handle, i])[0]
+                pos = float(_api_call(ctx, "GetMediaItemInfo_Value", [item, "D_POSITION"])[0])
+                length = float(_api_call(ctx, "GetMediaItemInfo_Value", [item, "D_LENGTH"])[0])
             except Exception:                   # noqa: BLE001
                 continue
             if start_s is not None and (pos >= end_s or pos + length <= start_s):
@@ -1569,13 +2442,9 @@ def _timeline_items_markers(ctx: dict[str, Any], start_s: float | None,
                           "end": round(pos + length, 2)})
     markers: list[dict[str, Any]] = []
     try:
-        total = int(reaper_api_call(name="CountProjectMarkers", values=[proj],
-                                    project_id=ctx["revision"]["project_id"],
-                                    expected_revision=ctx["revision"])["returns"][0])
+        total = int(_api_call(ctx, "CountProjectMarkers", [proj])[0])
         for i in range(min(total, 20)):
-            row = reaper_api_call(name="EnumProjectMarkers3", values=[proj, i],
-                                  project_id=ctx["revision"]["project_id"],
-                                  expected_revision=ctx["revision"])["returns"]
+            row = _api_call(ctx, "EnumProjectMarkers3", [proj, i])
             if isinstance(row, list) and len(row) >= 5:
                 markers.append({"time_s": float(row[2]), "name": row[4]})
     except Exception:                           # noqa: BLE001
@@ -1588,7 +2457,9 @@ def _timeline_items_markers(ctx: dict[str, Any], start_s: float | None,
 def reaper_timeline_context(start_s: float | None = None,
                             end_s: float | None = None,
                             project_id: str | None = None,
-                            bridge_session_id: str | None = None) -> dict[str, Any]:
+                            bridge_session_id: str | None = None,
+                            panorama_receipt: str | None = None,
+                            archive_root: str | None = None) -> dict[str, Any]:
     """Arrangement context as text: tempo map, bar numbers, items, markers, pan/level.
 
     This is the "timeline" that can be handed to an audio model together with the request.
@@ -1597,11 +2468,429 @@ def reaper_timeline_context(start_s: float | None = None,
     from .analysis import timeline_context as tc
     session = _session(project_id, bridge_session_id)
     ctx = session.snapshot(include_fx_params=False)
+    _require_interpretation_receipt(
+        panorama_receipt, str(ctx.get("revision", {}).get("project_id") or ""),
+        ctx.get("revision"), archive_root,
+    )
     items, markers = _timeline_items_markers(ctx, start_s, end_s)
     text = tc.build(ctx, start_s, end_s, items=items, markers=markers)
     return {"ok": True, "context": text,
             "project": {"name": ctx.get("name"), "revision": ctx.get("revision")},
             "counts": {"items": len(items), "markers": len(markers)}}
+
+
+@server.tool()
+@_guard
+def reaper_capture_snapshot(project_id: str,
+                            expected_revision: dict[str, Any],
+                            archive_root: str,
+                            start_s: float | None = None,
+                            end_s: float | None = None,
+                            channels: str = "stereo",
+                            sample_rate: int | None = None,
+                            tail_ms: int = 0,
+                            analysis_workers: int | None = None,
+                            bridge_session_id: str | None = None) -> dict[str, Any]:
+    """Capture a complete project snapshot and append it to a durable archive.
+
+    The capture contains the full project map (tracks/buses/master, items/takes,
+    MIDI, FX and parameters, routing, automation/envelopes, tempo/time signatures,
+    markers/regions, selection/transport), one post-FX audio asset per project
+    track and one master, and an analysis record for every asset. Temporary
+    WAVs are copied into a content-addressed SHA-256 archive store and verified
+    before the capture is committed; identical assets share one stored blob.
+
+    Master renders are fail-closed: the master signal is checked byte-level
+    from peak/RMS; one bounded retry is allowed, every failed attempt is
+    preserved as archive evidence, and persistent silence returns
+    ``capture_master_invalid`` instead of an ``ok=true`` result.
+
+    The bootstrap call returns capture/archive metadata only.  It deliberately
+    does not return the panorama payload: call ``reaper_panorama_open`` for the
+    new capture and read the one-response project view (receipt and context
+    token included) before interpreting.
+    """
+    expected = _revision(expected_revision, project_id=project_id)
+    session = _session(project_id, bridge_session_id)
+    _current_context(session, expected)
+    if (start_s is None) != (end_s is None):
+        raise ValidationError("start_s and end_s must both be provided or both be null")
+    section = None if start_s is None else (float(start_s), float(end_s))
+    service = FullCaptureService(session, archive_root)
+    result = service.capture(section=section, channels=channels,
+                             sample_rate=sample_rate, tail_ms=tail_ms,
+                             analysis_workers=analysis_workers)
+    serialization_start = time.perf_counter()
+    safe = _jsonable(result)
+    # The bootstrap capture creates the document, but it must not become a
+    # second raw reading path.  The model opens the exact document and receives
+    # the whole view with its receipt; only capture/archive metadata is returned.
+    safe.pop("panorama", None)
+    safe["panorama_delivery"] = {
+        "view_delivered": False,
+        "interpretation_allowed": False,
+        "complete_view_required": True,
+        "reason": ("bootstrap capture returns metadata only; open the panorama to receive "
+                   "the whole project view and its receipt in one response"),
+        "next_action": {
+            "tool": "reaper_panorama_open",
+            "project_id": project_id,
+            "archive_root": archive_root,
+            "capture_id": safe.get("capture_id"),
+            "returns": ["view", "receipt", "context_token"],
+        },
+    }
+    serialization_end = time.perf_counter()
+    timings = safe.setdefault("timings", {})
+    timings["mcp_serialization_s"] = round(serialization_end - serialization_start, 3)
+    return safe
+
+
+def _read_capture_panorama(capture_id: str, archive_root: str,
+                           record: FullCaptureRecord | None = None,
+                           *, delivered_receipt: str | None = None) -> dict[str, Any]:
+    """Internal archive reader used by tests/archive tooling.
+
+    This is deliberately not an MCP tool.  The model-facing
+    ``reaper_capture_read`` wrapper requires an exact-capture receipt before it
+    calls this helper.
+    """
+    archive = CaptureArchive(archive_root)
+    if record is None:
+        record = archive.read(capture_id)
+    status = archive.status(capture_id)
+    path = panorama_path_for_record(
+        archive.captures / capture_id / "record.json")
+    if path.is_file():
+        try:
+            panorama = load_panorama(path, record, max_bytes=DEFAULT_MAX_BYTES,
+                                     max_tokens=DEFAULT_MAX_TOKENS)
+            audio_rows = panorama.get("audio")
+            has_render_provenance = (
+                isinstance(audio_rows, list) and bool(audio_rows) and
+                all(isinstance(row, Mapping) and
+                    isinstance(row.get("render_provenance"), Mapping) and
+                    row["render_provenance"].get("complete") is True
+                    for row in audio_rows)
+            )
+            if panorama.get("schema_version") != PANORAMA_SCHEMA_VERSION:
+                # A sealed older sidecar is never rewritten; project the same
+                # canonical record into the current schema for this read.
+                panorama = build_panorama(
+                    record,
+                    record_path=str((archive.captures / capture_id / "record.json").relative_to(
+                        archive.root)),
+                    max_bytes=DEFAULT_MAX_BYTES,
+                    max_tokens=DEFAULT_MAX_TOKENS,
+                )
+                source = "read_time_schema_upgrade"
+            elif has_render_provenance:
+                source = "sidecar"
+            else:
+                # A valid pre-contract sidecar may still bind to the right
+                # capture while lacking the per-asset render stage/revision.
+                # Rebuild it from the sealed record in memory; do not mutate
+                # an existing archive during a read.
+                panorama = build_panorama(
+                    record,
+                    record_path=str((archive.captures / capture_id / "record.json").relative_to(
+                        archive.root)),
+                    max_bytes=DEFAULT_MAX_BYTES,
+                    max_tokens=DEFAULT_MAX_TOKENS,
+                )
+                source = "read_time_stale_sidecar_contract"
+        except PanoramaCapacityError:
+            # A legacy sidecar may have been written before the one-shot token
+            # budget existed.  Project it compactly in memory; never rewrite or
+            # truncate the canonical archive on read.
+            panorama = build_panorama(
+                record,
+                record_path=str((archive.captures / capture_id / "record.json").relative_to(
+                    archive.root)),
+                max_bytes=DEFAULT_MAX_BYTES,
+                max_tokens=DEFAULT_MAX_TOKENS,
+            )
+            source = "read_time_legacy_sidecar_budget"
+    else:
+        panorama = build_panorama(
+            record,
+            record_path=str((archive.captures / capture_id / "record.json").relative_to(
+                archive.root)),
+            max_bytes=DEFAULT_MAX_BYTES,
+            max_tokens=DEFAULT_MAX_TOKENS,
+        )
+        source = "read_time"
+    master_validation = (record.timings.get("master_validation")
+                         if isinstance(record.timings, Mapping) else None)
+    if not isinstance(master_validation, Mapping):
+        master_validation = {}
+    invalid_reasons: list[str] = []
+    if master_validation.get("valid") is False:
+        invalid_reasons.append("master_signal_invalid")
+    if record.missing:
+        invalid_reasons.append("capture_missing_fields")
+    if not all(bool(value) for value in record.coverage.values()):
+        invalid_reasons.append("coverage_incomplete")
+    delivery = {
+        "view_delivered": bool(delivered_receipt),
+        "interpretation_allowed": bool(delivered_receipt),
+        "complete_view_required": True,
+        "receipt": delivered_receipt,
+        "capture_id": record.capture_id,
+        "document_hash": document_hash(panorama),
+    }
+    return {
+        "ok": True,
+        "panorama": panorama,
+        "panorama_source": source,
+        "delivery": delivery,
+        "capture": {
+            "capture_id": record.capture_id,
+            "project_id": record.project_id,
+            "project_path": record.project_path,
+            "schema_version": record.schema_version,
+            "integrity_sha256": record.integrity_sha256,
+            "revision_before": record.revision_before,
+            "revision_after": record.revision_after,
+            "time_window": record.time_window,
+            "capture_status": "invalid" if invalid_reasons else "complete",
+            "invalid_reasons": invalid_reasons,
+            "master_validation": dict(master_validation),
+            "coverage": dict(record.coverage),
+            "missing": list(record.missing),
+            "record_path": str(archive.captures / capture_id / "record.json"),
+        },
+        "retention_status": status["retention_status"],
+        "archive": {"capture_id": capture_id, "root": str(archive.root)},
+    }
+
+
+
+@server.tool()
+@_guard
+def reaper_capture_read(capture_id: str, archive_root: str,
+                        panorama_receipt: str | None = None) -> dict[str, Any]:
+    """Read one capture only after an exact-capture complete-view receipt.
+
+    A receipt for the latest capture is not sufficient for a historical capture.
+    Without a matching project, capture, revision, fact root and document hash
+    this tool fails closed and returns a ``next_action`` pointing to
+    ``reaper_panorama_open``. The bootstrap ``reaper_capture_snapshot`` remains
+    the only no-receipt capture operation and returns metadata only.
+    """
+    if not panorama_receipt:
+        _require_capture_read_receipt(panorama_receipt, "", None, capture_id,
+                                      archive_root)
+    archive = CaptureArchive(archive_root)
+    record = archive.read(capture_id)
+    _require_capture_read_receipt(
+        panorama_receipt, record.project_id,
+        record.revision_after or record.revision_before,
+        record.capture_id, archive_root,
+    )
+    return _read_capture_panorama(capture_id, archive_root, record=record,
+                                  delivered_receipt=panorama_receipt)
+
+
+@server.tool()
+@_guard
+def reaper_panorama_open(project_id: str,
+                         archive_root: str,
+                         expected_revision: dict[str, Any] | None = None,
+                         capture_id: str | None = None,
+                         page_target_bytes: int | None = None,
+                         max_page_bytes: int | None = None) -> dict[str, Any]:
+    """Open the whole-project view as pages and return page 1 with the manifest.
+
+    The panorama is fixed to one capture, revision and ``view_sha256``.  The
+    manifest lists every ``page_id``, its payload hash and the measured response
+    size of each page.  Fetch every page with ``reaper_panorama_page``, then call
+    ``reaper_panorama_ack`` with all page hashes in order; only the resulting
+    receipt (and its ``context_token``) unlocks analysis and mutations.
+
+    The page count is adaptive: each page contains whole view sections or an
+    exact list-boundary split, and the pages reconstruct this bounded panorama
+    without further truncation. The panorama itself is a derived projection:
+    dense time series may be summarized and linked to exact archived detail.
+    Page sizing measures this server's indented-JSON character count, not the
+    host's complete MCP transport envelope. A page that cannot fit raises
+    instead of being silently truncated.
+
+    ``page_target_bytes`` is the preferred page size (default 30,000) and
+    ``max_page_bytes`` is the configured per-page limit (default 46,000).  The
+    current measurement is the character count of an indented JSON rendering,
+    not UTF-8 wire bytes or the complete MCP transport envelope.  Validate the
+    host's actual result limit before raising this setting.
+    """
+    lifecycle = _panorama_lifecycle(archive_root)
+    return lifecycle.open_view(project_id, expected_revision=expected_revision,
+                               capture_id=capture_id,
+                               page_target_bytes=page_target_bytes,
+                               max_page_bytes=max_page_bytes)
+
+
+@server.tool()
+@_guard
+def reaper_panorama_page(handle: str, revision: dict[str, Any], archive_root: str,
+                         page_id: str) -> dict[str, Any]:
+    """Fetch one page of the opened panorama by its stable ``page_id``.
+
+    Pages may be fetched in any order but every page_id in the manifest must be
+    fetched before ``reaper_panorama_ack``.  Repeated requests are idempotent and
+    return the same page hash.  A page request for another revision fails with
+    ``stale_context``; an unknown page_id fails and lists the valid ids.
+    """
+    lifecycle = _panorama_lifecycle(archive_root)
+    return lifecycle.view_page(handle, revision, page_id)
+
+
+@server.tool()
+@_guard
+def reaper_panorama_ack(handle: str, revision: dict[str, Any], archive_root: str,
+                        page_hashes: list[str]) -> dict[str, Any]:
+    """Verify every delivered page and mint the complete-view receipt.
+
+    The server checks that every page was actually fetched on this handle, that
+    the supplied hashes match the served pages in order, and that the pages
+    reconstruct the exact ``view_sha256``.  A partial page set returns
+    ``incomplete`` with the missing page ids and mints no receipt.  The receipt
+    proves delivery of these exact pages, not that the model read or understood
+    them.
+    """
+    lifecycle = _panorama_lifecycle(archive_root)
+    return lifecycle.ack_pages(handle, revision, page_hashes)
+
+
+@server.tool()
+@_guard
+def reaper_panorama_query(revision: dict[str, Any],
+                          archive_root: str,
+                          handle: str | None = None,
+                          data: list[str] | None = None,
+                          objects: list[str] | str | None = None,
+                          interval: dict[str, float] | None = None,
+                          series: list[str] | None = None,
+                          metrics: list[str] | None = None,
+                          kinds: list[str] | None = None,
+                          bands_hz: list[float] | None = None,
+                          resolution_s: float | None = None,
+                          include_pairs: bool = True,
+                          max_response_bytes: int | None = None,
+                          panorama_receipt: str | None = None,
+                          read_scope: str | None = None) -> dict[str, Any]:
+    """Return exact high-frequency rows for a semantic selection, in one result.
+
+    This tool never pages: a selection either arrives whole or returns
+    ``query_too_large`` with its measured size.  Paging applies only to the
+    project panorama (``reaper_panorama_open`` → ``reaper_panorama_page`` →
+    ``reaper_panorama_ack``); acknowledge the panorama first, then name what you
+    want here by meaning and the whole coherent fragment arrives at once:
+
+    * ``data``: ``relations`` | ``series`` | ``midi_notes`` | ``envelope_points`` |
+      ``items`` | ``takes`` | ``audio`` | ``fx`` | ``analysis`` | ``project_summary``
+      (default all);
+    * ``objects``: ``"all"``, stable ids (``track:<guid>``, ``analysis:<guid>``, ...),
+      raw REAPER GUIDs, or unique track names;
+    * ``interval``: ``{start_s, end_s}`` for measured rows inside a section;
+    * ``series`` / ``resolution_s``: which exact measurement cells, at what resolution;
+    * ``metrics``: analysis column filter; metadata rows/source stay intact;
+    * ``kinds`` / ``bands_hz``: relation kinds and band centres; ``include_pairs``
+      controls aggregate relation-pair cost.
+
+    Series, MIDI and envelope rows are re-hashed against the sealed detail
+    manifest, so a stale or mismatched reference fails closed.  If the selection
+    is larger than one response, the call returns ``query_too_large`` with the
+    exact size per family and the scope to narrow — never a truncated or paged
+    answer.
+
+    Authorization: ``revision`` + ``archive_root`` + ``handle`` +
+    ``panorama_receipt`` from the acknowledged panorama. A query without that
+    receipt fails closed. The legacy ``read_scope`` argument is accepted only for
+    older single-response flows; it is not a receipt, cannot complete a panorama
+    and never authorizes an edit/API/action/save call. If a selected fragment is
+    still too large, ``query_too_large`` is returned.
+    """
+    lifecycle = _panorama_lifecycle(archive_root)
+    if read_scope:
+        if handle or panorama_receipt:
+            raise ValidationError(
+                "read_scope is a read-only route and cannot be combined with a handle or receipt",
+                details={"next_action": ("use either revision+archive_root+read_scope, or "
+                                         "revision+archive_root+handle+panorama_receipt")})
+        # A budget refusal issues this read-only binding; it is never a
+        # full-view receipt and never unlocks an edit/API/action/save call.
+        return lifecycle.query(
+            "", revision, data=data, objects=objects, interval=interval,
+            series=series, metrics=metrics, kinds=kinds, bands_hz=bands_hz,
+            resolution_s=resolution_s, include_pairs=include_pairs,
+            max_response_bytes=max_response_bytes, read_scope=read_scope)
+    if not handle or not panorama_receipt:
+        raise ValidationError(
+            "A panorama query requires handle and panorama_receipt from an "
+            "acknowledged panorama",
+            details={"next_action": ("open the panorama, fetch every page and call "
+                                     "reaper_panorama_ack, then pass its handle and receipt; "
+                                     "the legacy read_scope is accepted only for older flows")})
+    project_id = str(revision.get("project_id") or "")
+    capture_id = str(revision.get("capture_id") or "")
+    _require_capture_read_receipt(
+        panorama_receipt, project_id, revision, capture_id, archive_root)
+    result = lifecycle.query(
+        handle, revision, data=data, objects=objects, interval=interval,
+        series=series, metrics=metrics, kinds=kinds, bands_hz=bands_hz,
+        resolution_s=resolution_s, include_pairs=include_pairs,
+        max_response_bytes=max_response_bytes)
+    return result
+
+
+@server.tool()
+@_guard
+def reaper_panorama_status(project_id: str,
+                           archive_root: str,
+                           handle: str | None = None) -> dict[str, Any]:
+    """Report the latest captured revision/root and one handle's delivery state."""
+    return _panorama_lifecycle(archive_root).status(project_id, handle)
+
+
+@server.tool()
+@_guard
+def reaper_panorama_changes_since(project_id: str,
+                                  archive_root: str,
+                                  base_capture_id: str | None = None,
+                                  base_revision: dict[str, Any] | None = None,
+                                  base_fact_root: str | None = None,
+                                  context_token: str | None = None) -> dict[str, Any]:
+    """Return a revision-bound delta from an exact base capture/root.
+
+    Pass the latest ``context_token`` to make the delta advanceable. A delta
+    without a token is informational only and cannot unlock mutation. A wrong
+    or missing base returns ``stale_base``; a chain longer than the bounded delta
+    horizon returns ``refresh_required``. The successor token is returned in the
+    same response (``advance.context_token``); no acknowledgement round trip is
+    required to continue.
+    """
+    return _panorama_lifecycle(archive_root).changes_since(
+        project_id, base_capture_id=base_capture_id, base_revision=base_revision,
+        base_fact_root=base_fact_root, context_token=context_token)
+
+
+@server.tool()
+@_guard
+def reaper_panorama_refresh(project_id: str,
+                            archive_root: str,
+                            expected_revision: dict[str, Any] | None = None,
+                            page_target_bytes: int | None = None,
+                            max_page_bytes: int | None = None) -> dict[str, Any]:
+    """Re-open the current panorama from page 1 after loss or staleness.
+
+    Refresh is a normal operation, not an error path: it returns a new handle,
+    page 1 and a fresh manifest.  The old handle, pages and context token must
+    not be used to mutate.
+    """
+    lifecycle = _panorama_lifecycle(archive_root)
+    return lifecycle.open_view(project_id, expected_revision=expected_revision,
+                               page_target_bytes=page_target_bytes,
+                               max_page_bytes=max_page_bytes)
 
 
 if __name__ == "__main__":

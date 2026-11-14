@@ -56,6 +56,19 @@ local function finite_number(value)
          value ~= math.huge and value ~= -math.huge
 end
 
+-- Canonical read-model numbers must stay JSON-encodable. REAPER returns nil or
+-- a non-finite value for absent hardware/source fields; report 0 instead of
+-- letting the encoder suppress the whole response.
+local function finite_or_zero(value)
+  if finite_number(value) then return value end
+  return 0
+end
+
+-- REAPER mixes booleans and 0/1 integers depending on the attribute.
+local function flag_true(value)
+  return value == true or value == 1
+end
+
 local function fail(code, message, details)
   error({ bridge_error = true, code = code, message = message,
           details = details or {} }, 0)
@@ -74,6 +87,59 @@ local function project_identity(project, path)
            identity_basis = "master_track_guid_and_project_path",
            path = path,
            change_count = reaper.GetProjectStateChangeCount(project) }
+end
+
+-- Continuity identity. The path and change counter cannot prove that the
+-- project state is continuous: REAPER restarts reuse both, and a project
+-- reloaded from disk starts a new counter generation. The bridge therefore
+-- keeps one generation counter per project object for the life of this
+-- instance and bumps it whenever continuity is contradicted: a project object
+-- never seen before, a different project identity (save-as, replaced master)
+-- or a change counter that moved backwards (reload / restore).
+--
+-- The epoch starts at 1; 0 means "unknown" and can never prove continuity.
+-- It is scoped to bridge_session_id, so a REAPER restart changes instance_id
+-- and the pair fails closed even though the file path is unchanged.
+local project_generations = {}
+local project_generation_sequence = 0
+
+local function project_identity_state(project, path)
+  local identity = project_identity(project, path)
+  local state = project_generations[project]
+  if state == nil or state.project_id ~= identity.project_id or
+     identity.change_count < state.change_count then
+    project_generation_sequence = project_generation_sequence + 1
+    state = { epoch = project_generation_sequence,
+              project_id = identity.project_id,
+              change_count = identity.change_count }
+    project_generations[project] = state
+  else
+    state.change_count = identity.change_count
+  end
+  identity.instance_id = bridge_session_id
+  identity.epoch = state.epoch
+  identity.epoch_basis = "bridge_session_project_generation"
+  return identity
+end
+
+local function same_revision_fields(left, right)
+  if type(left) ~= "table" or type(right) ~= "table" then return false end
+  if left.project_id ~= right.project_id or left.path ~= right.path or
+     left.change_count ~= right.change_count then
+    return false
+  end
+  -- Identity components are compared only when both sides carry them: a
+  -- legacy client revision cannot prove them, and the Python gate refuses to
+  -- mint a token for such a request. Inside the bridge a missing component
+  -- must not silently widen the match either, so a supplied component is
+  -- always compared strictly.
+  if left.instance_id ~= nil and left.instance_id ~= right.instance_id then
+    return false
+  end
+  if left.epoch ~= nil and left.epoch ~= right.epoch then
+    return false
+  end
+  return true
 end
 
 local function resolve_track(project, guid)
@@ -341,11 +407,23 @@ local function item_context(project, track, item_index, options)
     guid = item_guid_ok and item_guid or "",
     position_s = item and reaper.GetMediaItemInfo_Value(item, "D_POSITION") or 0,
     length_s = item and reaper.GetMediaItemInfo_Value(item, "D_LENGTH") or 0,
+    start_offset_s = 0,
+    playrate = 0,
     fade_in_s = item and reaper.GetMediaItemInfo_Value(item, "D_FADEINLEN") or 0,
     fade_out_s = item and reaper.GetMediaItemInfo_Value(item, "D_FADEOUTLEN") or 0,
     mute = item and reaper.GetMediaItemInfo_Value(item, "B_MUTE") ~= 0 or false,
     selected = item and reaper.IsMediaItemSelected(item) or false,
     take_count = item and reaper.CountTakes(item) or 0,
+    loop_source = false,
+    channel_mode = 0,
+    group_id = 0,
+    beat_attach_mode = 0,
+    source_length_s = 0,
+    source_length_is_qn = false,
+    source_sample_rate = 0,
+    source_channels = 0,
+    source_online = false,
+    stretch_marker_positions = json.array(),
     active_take = json.null,
   }
   if take then
@@ -353,6 +431,43 @@ local function item_context(project, track, item_index, options)
       take, "GUID", "", false)
     local source = reaper.GetMediaItemTake_Source(take)
     local source_file = source and reaper.GetMediaSourceFileName(source, "") or ""
+    entry.start_offset_s = finite_or_zero(
+      reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS"))
+    entry.playrate = finite_or_zero(
+      reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE"))
+    entry.loop_source = flag_true(
+      reaper.GetMediaItemTakeInfo_Value(take, "B_LOOPSRC"))
+    entry.channel_mode = finite_or_zero(
+      reaper.GetMediaItemTakeInfo_Value(take, "I_CHANMODE"))
+    entry.group_id = item and finite_or_zero(
+      reaper.GetMediaItemInfo_Value(item, "I_GROUPID")) or 0
+    entry.beat_attach_mode = finite_or_zero(
+      reaper.GetMediaItemTakeInfo_Value(take, "C_BEATATTACHMODE"))
+    if source then
+      -- MediaSourceLength is quarter notes for beat-based sources; the flag
+      -- travels with the number so the unit is never guessed downstream.
+      local source_length, length_is_qn = reaper.GetMediaSourceLength(source)
+      entry.source_length_s = finite_or_zero(source_length)
+      entry.source_length_is_qn = flag_true(length_is_qn)
+      entry.source_sample_rate = finite_or_zero(
+        reaper.GetMediaSourceSampleRate(source))
+      entry.source_channels = finite_or_zero(
+        reaper.GetMediaSourceNumChannels(source))
+      entry.source_online = flag_true(
+        finite_number(source_length) and source_length > 0 and
+        entry.source_sample_rate > 0 and entry.source_channels > 0)
+    end
+    local marker_count = reaper.GetTakeNumStretchMarkers(take)
+    for marker_index = 0, (finite_number(marker_count) and marker_count or 0) - 1 do
+      local marker_ok, marker_pos, marker_srcpos =
+        reaper.GetTakeStretchMarker(take, marker_index)
+      if marker_ok and marker_ok >= 0 then
+        entry.stretch_marker_positions[#entry.stretch_marker_positions + 1] = {
+          pos = finite_or_zero(marker_pos),
+          srcpos = finite_or_zero(marker_srcpos),
+        }
+      end
+    end
     entry.active_take = {
       guid = take_guid_ok and take_guid or "",
       name = reaper.GetTakeName(take) or "",
@@ -362,6 +477,9 @@ local function item_context(project, track, item_index, options)
       preserve_pitch = reaper.GetMediaItemTakeInfo_Value(take, "B_PPITCH") ~= 0,
       stretch_markers = reaper.GetTakeNumStretchMarkers(take),
       fx_count = reaper.TakeFX_GetCount(take),
+      volume = finite_or_zero(reaper.GetMediaItemTakeInfo_Value(take, "D_VOL")),
+      pan = finite_or_zero(reaper.GetMediaItemTakeInfo_Value(take, "D_PAN")),
+      pitch = finite_or_zero(reaper.GetMediaItemTakeInfo_Value(take, "D_PITCH")),
     }
     if options.include_midi_notes == true and entry.active_take.is_midi then
       local ok, note_count, cc_count, text_count = reaper.MIDI_CountEvts(take)
@@ -418,6 +536,25 @@ local function track_context(project, track, index, options)
     record_mode = reaper.GetMediaTrackInfo_Value(track, "I_RECMODE"),
     record_mode_flags = reaper.GetMediaTrackInfo_Value(track, "I_RECMODE_FLAGS"),
     channel_count = reaper.GetMediaTrackInfo_Value(track, "I_NCHAN"),
+    pan_mode = reaper.GetMediaTrackInfo_Value(track, "I_PANMODE"),
+    pan_law = finite_or_zero(reaper.GetMediaTrackInfo_Value(track, "D_PANLAW")),
+    pan_law_flags = finite_or_zero(
+      reaper.GetMediaTrackInfo_Value(track, "I_PANLAW_FLAGS")),
+    width = finite_or_zero(reaper.GetMediaTrackInfo_Value(track, "D_WIDTH")),
+    dualpan_left = finite_or_zero(
+      reaper.GetMediaTrackInfo_Value(track, "D_DUALPANL")),
+    dualpan_right = finite_or_zero(
+      reaper.GetMediaTrackInfo_Value(track, "D_DUALPANR")),
+    phase_inverted = flag_true(
+      reaper.GetMediaTrackInfo_Value(track, "B_PHASE")),
+    main_send = flag_true(
+      reaper.GetMediaTrackInfo_Value(track, "B_MAINSEND")),
+    play_offset = finite_or_zero(
+      reaper.GetMediaTrackInfo_Value(track, "D_PLAY_OFFSET")),
+    play_offset_flags = finite_or_zero(
+      reaper.GetMediaTrackInfo_Value(track, "I_PLAY_OFFSET_FLAG")),
+    freeze_count = finite_or_zero(
+      reaper.GetMediaTrackInfo_Value(track, "I_FREEZECOUNT")),
     folder_depth = reaper.GetMediaTrackInfo_Value(track, "I_FOLDERDEPTH"),
     fx = fx_context(track, options.include_fx_params == true),
     sends = reaper.GetTrackNumSends(track, 0),
@@ -435,7 +572,7 @@ end
 
 local function project_context(arguments)
   local project, path = target_project(arguments)
-  local revision = project_identity(project, path)
+  local revision = project_identity_state(project, path)
   local tracks = json.array()
   local count = reaper.CountTracks(project)
   for index = 0, count - 1 do
@@ -463,6 +600,23 @@ local function project_context(arguments)
   end
   local selection_start, selection_end = reaper.GetSet_LoopTimeRange2(
     project, false, false, 0, 0, false)
+  local markers, regions = json.array(), json.array()
+  local marker_total, marker_count, region_count =
+    reaper.CountProjectMarkers(project)
+  if finite_number(marker_total) and marker_total >= 0 then
+    for marker_index = 0, marker_total - 1 do
+      local ok, is_region, position_s, end_s, name, number, color =
+        reaper.EnumProjectMarkers3(project, marker_index)
+      if ok then
+        local row = { index = marker_index, is_region = flag_true(is_region),
+                      position_s = finite_or_zero(position_s),
+                      end_s = finite_or_zero(end_s), name = name or "",
+                      number = finite_or_zero(number),
+                      color = finite_or_zero(color) }
+        if is_region then regions[#regions + 1] = row else markers[#markers + 1] = row end
+      end
+    end
+  end
   return {
     revision = revision,
     path = path,
@@ -473,11 +627,909 @@ local function project_context(arguments)
     master = track_context(project, master, -1, arguments),
     selection = { track_guids = selected_tracks,
                  time_start_s = selection_start, time_end_s = selection_end },
-    transport = { play_state = reaper.GetPlayStateEx(project),
-                  cursor_s = reaper.GetCursorPositionEx(project),
-                  play_position_s = reaper.GetPlayPositionEx(project) },
+    transport = (function()
+      local play_state = reaper.GetPlayStateEx(project)
+      local edit_cursor_s = reaper.GetCursorPositionEx(project)
+      local play_position_s = reaper.GetPlayPositionEx(project)
+      return { play_state = play_state,
+               cursor_s = edit_cursor_s,
+               edit_cursor_s = edit_cursor_s,
+               play_position_s = play_position_s,
+               play_position_kind = "observed_playback_not_project_cursor" }
+    end)(),
     tempo = { bpm = bpm, numerator = numerator, denominator = denominator,
               markers = tempo_map },
+    markers = markers, regions = regions,
+    marker_count = marker_count, region_count = region_count,
+  }
+end
+
+-- Canonical content digest (digest_version 1, additive schema).
+--
+-- Fingerprint invalidation: this schema is a strict superset of the Wave B
+-- digest. Master, automation, render/playback settings and FX-chain state are
+-- new fields, so every fingerprint recorded before this change is stale by
+-- construction -- the earlier digest never measured them.
+--
+-- Every value below comes from a documented ReaScript API. A subgroup that
+-- cannot be read is reported through ``coverage``/``missing``; it is never
+-- replaced by an empty value, so a consumer cannot mistake an unmeasured
+-- corner of the project for a measured one.
+local digest_version = 1
+
+-- Bounds. Exceeding one degrades coverage instead of silently truncating.
+local digest_max_envelope_points = 50000
+local digest_max_automation_items = 5000
+local digest_max_fx_envelope_probes = 20000
+local digest_max_fx_chain_chars = 262144
+
+-- Envelope chunks repeat two UI-only fields (lane visibility and lane height)
+-- that move when the arrange view is resized. Dropping them keeps a window
+-- resize from looking like a content edit; ACT/ARM and every point stay in.
+local digest_envelope_ui_lines = { VIS = true, LANEHEIGHT = true }
+
+-- FX chain chunks carry window geometry and the last selected slot. Same
+-- reasoning: they are UI, not sound. Plugin state blobs, BYPASS flags, FXID,
+-- ordering and containers are kept verbatim. UI lines inside nested container
+-- nodes are kept as well, which is conservative -- extra churn, never a missed
+-- change.
+local digest_fx_chain_ui_lines = { WNDRECT = true, SHOW = true, LASTSEL = true,
+                                   DOCKED = true, FLOATPOS = true, WAK = true,
+                                   MULTIFXLINK = true }
+
+-- Item chunks carry selection, colour and lane-view geometry that move without
+-- changing the signal. Everything else (POSITION, LENGTH, fades, take state,
+-- TAKEFX, source) stays byte-identical so a selection change cannot invalidate
+-- a render key.
+local digest_item_ui_lines = { B_UISEL = true, I_CUSTOMCOLOR = true,
+                               I_LASTY = true, I_LASTH = true }
+
+-- Render and playback settings that change what the project produces. Output
+-- file names, patterns and formats are deliberately excluded: they select a
+-- destination rather than project content, and the capture path rewrites them
+-- temporarily. Keys are lower-cased in the payload.
+local digest_project_settings = {
+  "RENDER_SETTINGS", "RENDER_CHANNELS", "RENDER_SRATE", "RENDER_BOUNDSFLAG",
+  "RENDER_STARTPOS", "RENDER_ENDPOS", "RENDER_TAILFLAG", "RENDER_TAILMS",
+  "RENDER_ADDTOPROJ", "RENDER_DITHER", "RENDER_NORMALIZE",
+  "RENDER_NORMALIZE_TARGET", "RENDER_BRICKWALL", "RENDER_FADEIN",
+  "RENDER_FADEOUT", "RENDER_FADEINSHAPE", "RENDER_FADEOUTSHAPE",
+  "RENDER_FADELPF", "RENDER_PADSTART", "RENDER_PADEND", "RENDER_TRIMSTART",
+  "RENDER_TRIMEND", "RENDER_DELAY", "PROJECT_SRATE", "PROJECT_SRATE_USE",
+  "PROJECT_TIMEBASE", "PROJECT_TIMEBASE_FLAGS",
+}
+
+-- Copy one RPPXML block (for example <FXCHAIN ...> ... >) out of a state
+-- chunk. The scan is byte-wise and keeps nothing but the requested block:
+-- a track state chunk can carry every item of the track, and only the FX chain
+-- is evidence here. Returns nil plus a reason when the block is absent or
+-- unbalanced -- a truncated copy would be worse evidence than an admitted gap.
+local function chunk_block(chunk, name)
+  if type(chunk) ~= "string" or chunk == "" then return nil, "empty_chunk" end
+  local opening
+  local position = 1
+  while position <= #chunk do
+    local newline = chunk:find("\n", position, true)
+    local line_end = newline and (newline - 1) or #chunk
+    local text = chunk:sub(position, line_end)
+    local candidate = text:match("^%s*(<.*)$")
+    if candidate and candidate:sub(1, #name + 1) == "<" .. name then
+      local following = candidate:sub(#name + 2, #name + 2)
+      if following == "" or following == ">" or following:match("%s") then
+        opening = position
+        break
+      end
+    end
+    if not newline then break end
+    position = newline + 1
+  end
+  if not opening then return nil, "absent" end
+  local depth = 0
+  position = opening
+  while position <= #chunk do
+    local newline = chunk:find("\n", position, true)
+    local line_end = newline and (newline - 1) or #chunk
+    local text = chunk:sub(position, line_end)
+    if text:match("^%s*<") then
+      depth = depth + 1
+    elseif text:match("^%s*>%s*$") then
+      depth = depth - 1
+      if depth == 0 then
+        return chunk:sub(opening, line_end)
+      end
+      if depth < 0 then return nil, "unbalanced" end
+    end
+    if not newline then break end
+    position = newline + 1
+  end
+  return nil, "unbalanced"
+end
+
+-- Drop direct children of the block root whose keyword is UI-only state.
+-- Depth 1 is the root's own content; plugin state blobs live deeper and are
+-- never touched.
+local function normalize_chunk(block, ui_lines)
+  local out = {}
+  local depth = 0
+  for line in (block .. "\n"):gmatch("([^\n]*)\n") do
+    local trimmed = line:match("^%s*(.-)%s*$")
+    local keyword = trimmed:match("^([A-Z_]+)%s")
+    if not (depth == 1 and keyword ~= nil and ui_lines[keyword] == true) then
+      out[#out + 1] = line
+    end
+    if trimmed:sub(1, 1) == "<" then
+      depth = depth + 1
+    elseif trimmed == ">" then
+      depth = depth - 1
+    end
+  end
+  return table.concat(out, "\n")
+end
+
+local function envelope_text(env, name)
+  if type(reaper.GetSetEnvelopeInfo_String) ~= "function" then return nil end
+  local ok, value = reaper.GetSetEnvelopeInfo_String(env, name, "", false)
+  if not ok or type(value) ~= "string" then return nil end
+  return value
+end
+
+local function envelope_flag(env, name)
+  local value = envelope_text(env, name)
+  if value == "1" then return true end
+  if value == "0" then return false end
+  return nil
+end
+
+-- Read one envelope completely. Returns nil plus a reason when any documented
+-- attribute, point or automation item cannot be read, so the caller reports a
+-- gap instead of a half-empty envelope.
+local function envelope_context(env)
+  if not env then return nil, "missing_envelope" end
+  if type(reaper.GetEnvelopeStateChunk) ~= "function" or
+     type(reaper.GetEnvelopeName) ~= "function" or
+     type(reaper.CountEnvelopePoints) ~= "function" or
+     type(reaper.GetEnvelopePoint) ~= "function" then
+    return nil, "envelope_api_unavailable"
+  end
+  local chunk_ok, chunk = reaper.GetEnvelopeStateChunk(env, "", false)
+  if not chunk_ok or type(chunk) ~= "string" then return nil, "chunk_unreadable" end
+  local name_ok, name = reaper.GetEnvelopeName(env, "")
+  if not name_ok or type(name) ~= "string" then return nil, "name_unreadable" end
+  local guid = envelope_text(env, "GUID")
+  local active = envelope_flag(env, "ACTIVE")
+  local visible = envelope_flag(env, "VISIBLE")
+  local armed = envelope_flag(env, "ARM")
+  if guid == nil or guid == "" or active == nil or visible == nil or armed == nil then
+    return nil, "attribute_unreadable"
+  end
+  local point_count = reaper.CountEnvelopePoints(env)
+  if not finite_number(point_count) or point_count < 0 then
+    return nil, "point_count_unreadable"
+  end
+  if point_count > digest_max_envelope_points then return nil, "point_limit" end
+  local points = json.array()
+  for index = 0, point_count - 1 do
+    local ok, time, value, shape, tension = reaper.GetEnvelopePoint(env, index)
+    if not ok then return nil, "point_unreadable" end
+    points[#points + 1] = { index = index, time_s = finite_or_zero(time),
+                            value = finite_or_zero(value),
+                            shape = finite_or_zero(shape),
+                            tension = finite_or_zero(tension) }
+  end
+  if type(reaper.CountAutomationItems) ~= "function" or
+     type(reaper.GetSetAutomationItemInfo) ~= "function" then
+    return nil, "automation_item_api_unavailable"
+  end
+  local item_count = reaper.CountAutomationItems(env)
+  if not finite_number(item_count) or item_count < 0 then
+    return nil, "automation_item_count_unreadable"
+  end
+  if item_count > digest_max_automation_items then
+    return nil, "automation_item_limit"
+  end
+  local items = json.array()
+  for index = 0, item_count - 1 do
+    local function field(desc)
+      return finite_or_zero(reaper.GetSetAutomationItemInfo(
+        env, index, desc, 0, false))
+    end
+    items[#items + 1] = {
+      index = index,
+      position_s = field("D_POSITION"),
+      length_s = field("D_LENGTH"),
+      start_offset_s = field("D_STARTOFFS"),
+      playrate = field("D_PLAYRATE"),
+      baseline = field("D_BASELINE"),
+      amplitude = field("D_AMPLITUDE"),
+      loop_source = flag_true(field("D_LOOPSRC")),
+      mute = flag_true(field("D_MUTE")),
+      pool_id = field("D_POOL_ID"),
+    }
+  end
+  return {
+    guid = guid,
+    name = name,
+    chunk = normalize_chunk(chunk, digest_envelope_ui_lines),
+    active = active,
+    visible = visible,
+    armed = armed,
+    point_count = point_count,
+    automation_item_count = item_count,
+    points = points,
+    automation_items = items,
+  }
+end
+
+-- Append an envelope once, keyed by its GUID, so an envelope that both the
+-- track enumeration and the FX probe report is not hashed twice.
+local function append_envelope(target, row, seen)
+  if seen[row.guid] == true then return end
+  seen[row.guid] = true
+  target[#target + 1] = row
+end
+
+-- Collect the non-FX and FX envelopes that belong to one track. REAPER 7.84
+-- reports the project tempo map -- which is owned by the master track -- as
+-- envelope 0 of ordinary tracks as well, so ownership is verified through
+-- Envelope_GetParentTrack instead of trusting the enumeration index.
+local function track_envelopes(track)
+  if type(reaper.Envelope_GetParentTrack) ~= "function" then
+    return nil, "parent_api_unavailable"
+  end
+  local count = reaper.CountTrackEnvelopes(track)
+  if not finite_number(count) or count < 0 then
+    return nil, "envelope_count_unreadable"
+  end
+  local plain = json.array()
+  local fx = json.array()
+  local seen = {}
+  for index = 0, count - 1 do
+    local env = reaper.GetTrackEnvelope(track, index)
+    if not env then return nil, "envelope_unreadable" end
+    local parent, fx_index, parameter_index = reaper.Envelope_GetParentTrack(env)
+    if parent == nil then return nil, "envelope_parent_unreadable" end
+    if parent == track then
+      local row, reason = envelope_context(env)
+      if not row then return nil, reason end
+      if seen[row.guid] ~= true then
+        seen[row.guid] = true
+        if fx_index ~= nil and fx_index >= 0 then
+          row.fx_index = fx_index
+          row.parameter_index = finite_or_zero(parameter_index)
+          fx[#fx + 1] = row
+        else
+          plain[#plain + 1] = row
+        end
+      end
+    end
+  end
+  return { plain = plain, fx = fx }
+end
+
+-- Take envelopes for one take. A take without envelopes returns an empty list;
+-- an unreadable take envelope degrades the whole automation subgroup.
+local function take_envelopes(take)
+  if type(reaper.CountTakeEnvelopes) ~= "function" or
+     type(reaper.GetTakeEnvelope) ~= "function" or
+     type(reaper.Envelope_GetParentTake) ~= "function" then
+    return nil, "take_envelope_api_unavailable"
+  end
+  local count = reaper.CountTakeEnvelopes(take)
+  if not finite_number(count) or count < 0 then
+    return nil, "take_envelope_count_unreadable"
+  end
+  local rows = json.array()
+  local seen = {}
+  for index = 0, count - 1 do
+    local env = reaper.GetTakeEnvelope(take, index)
+    if not env then return nil, "take_envelope_unreadable" end
+    local parent = reaper.Envelope_GetParentTake(env)
+    if parent == nil then return nil, "take_envelope_parent_unreadable" end
+    if parent == take then
+      local row, reason = envelope_context(env)
+      if not row then return nil, reason end
+      append_envelope(rows, row, seen)
+    end
+  end
+  return rows
+end
+
+-- Probe every FX parameter for an existing envelope. GetFXEnvelope(..., false)
+-- never creates one (verified: the project change count does not move), so this
+-- is a pure read. The probe budget bounds the cost on very large chains.
+local function fx_envelopes(track, track_guid, is_master, budget)
+  if type(reaper.GetFXEnvelope) ~= "function" then
+    return nil, "fx_envelope_api_unavailable"
+  end
+  local count = reaper.TrackFX_GetCount(track)
+  if not finite_number(count) or count < 0 then return nil, "fx_count_unreadable" end
+  local rows = json.array()
+  for fx_index = 0, count - 1 do
+    local parameter_count = reaper.TrackFX_GetNumParams(track, fx_index)
+    if not finite_number(parameter_count) or parameter_count < 0 then
+      return nil, "fx_parameter_count_unreadable"
+    end
+    for parameter_index = 0, parameter_count - 1 do
+      budget.used = budget.used + 1
+      if budget.used > budget.maximum then
+        return nil, "fx_envelope_probe_limit"
+      end
+      local env = reaper.GetFXEnvelope(track, fx_index, parameter_index, false)
+      if env then
+        local row, reason = envelope_context(env)
+        if not row then return nil, reason end
+        row.track_guid = track_guid
+        row.is_master = is_master
+        row.fx_index = fx_index
+        row.parameter_index = parameter_index
+        rows[#rows + 1] = row
+      end
+    end
+  end
+  return rows
+end
+
+-- FX identity, order, bypass/offline state and every parameter value.
+local function fx_digest(track)
+  local count = reaper.TrackFX_GetCount(track)
+  if not finite_number(count) or count < 0 then return nil, "fx_count_unreadable" end
+  local rows = json.array()
+  for fx_index = 0, count - 1 do
+    local _, name = reaper.TrackFX_GetFXName(track, fx_index, "")
+    local parameter_count = reaper.TrackFX_GetNumParams(track, fx_index)
+    if not finite_number(parameter_count) or parameter_count < 0 then
+      return nil, "fx_parameter_count_unreadable"
+    end
+    local params = json.array()
+    for parameter_index = 0, parameter_count - 1 do
+      params[#params + 1] = {
+        index = parameter_index,
+        normalized = finite_or_zero(reaper.TrackFX_GetParamNormalized(
+          track, fx_index, parameter_index)),
+      }
+    end
+    rows[#rows + 1] = {
+      index = fx_index,
+      guid = reaper.TrackFX_GetFXGUID(track, fx_index) or "",
+      name = name or "",
+      enabled = flag_true(reaper.TrackFX_GetEnabled(track, fx_index)),
+      offline = flag_true(reaper.TrackFX_GetOffline(track, fx_index)),
+      params = params,
+    }
+  end
+  return rows
+end
+
+local function send_digest(track)
+  local count = reaper.GetTrackNumSends(track, 0)
+  if not finite_number(count) or count < 0 then return nil, "send_count_unreadable" end
+  local rows = json.array()
+  for index = 0, count - 1 do
+    local destination = reaper.GetTrackSendInfo_Value(track, 0, index, "P_DESTTRACK")
+    rows[#rows + 1] = {
+      index = index,
+      dest_guid = destination and reaper.GetTrackGUID(destination) or "",
+      volume = finite_or_zero(reaper.GetTrackSendInfo_Value(track, 0, index, "D_VOL")),
+      pan = finite_or_zero(reaper.GetTrackSendInfo_Value(track, 0, index, "D_PAN")),
+      pan_law = finite_or_zero(reaper.GetTrackSendInfo_Value(track, 0, index, "D_PANLAW")),
+      mode = finite_or_zero(reaper.GetTrackSendInfo_Value(track, 0, index, "I_SENDMODE")),
+      mute = flag_true(reaper.GetTrackSendInfo_Value(track, 0, index, "B_MUTE")),
+      phase = flag_true(reaper.GetTrackSendInfo_Value(track, 0, index, "B_PHASE")),
+      mono = flag_true(reaper.GetTrackSendInfo_Value(track, 0, index, "B_MONO")),
+      source_channels = finite_or_zero(
+        reaper.GetTrackSendInfo_Value(track, 0, index, "I_SRCCHAN")),
+      destination_channels = finite_or_zero(
+        reaper.GetTrackSendInfo_Value(track, 0, index, "I_DSTCHAN")),
+      midi_flags = finite_or_zero(
+        reaper.GetTrackSendInfo_Value(track, 0, index, "I_MIDIFLAGS")),
+    }
+  end
+  return rows
+end
+
+-- Hardware outputs (category 1) are routing that changes the delivered mix, so
+-- they belong in the digest next to ordinary sends.
+local function hardware_output_digest(track)
+  local count = reaper.GetTrackNumSends(track, 1)
+  if not finite_number(count) or count < 0 then
+    return nil, "hardware_output_count_unreadable"
+  end
+  local rows = json.array()
+  for index = 0, count - 1 do
+    local function value(name)
+      return finite_or_zero(reaper.GetTrackSendInfo_Value(track, 1, index, name))
+    end
+    rows[#rows + 1] = {
+      index = index,
+      volume = value("D_VOL"),
+      pan = value("D_PAN"),
+      pan_law = value("D_PANLAW"),
+      mute = flag_true(value("B_MUTE")),
+      phase = flag_true(value("B_PHASE")),
+      mono = flag_true(value("B_MONO")),
+      source_channels = value("I_SRCCHAN"),
+      destination_channels = value("I_DSTCHAN"),
+      send_mode = value("I_SENDMODE"),
+    }
+  end
+  return rows
+end
+
+-- Serialized FX state. GetTrackStateChunk is the only documented way to read a
+-- plug-in's opaque state (TrackFX_GetFXChunk does not exist in the 7.85
+-- catalog), so the <FXCHAIN> block is copied out of the track state chunk and
+-- hashed through the digest fingerprint. If a chain cannot be read the whole
+-- fx_state subgroup is reported missing rather than silently downgraded to
+-- parameter values only.
+local function fx_chain_state(track)
+  if type(reaper.GetTrackStateChunk) ~= "function" then
+    return nil, "track_chunk_api_unavailable"
+  end
+  local fx_count = reaper.TrackFX_GetCount(track)
+  if not finite_number(fx_count) or fx_count < 0 then
+    return nil, "fx_count_unreadable"
+  end
+  local ok, chunk = reaper.GetTrackStateChunk(track, "", false)
+  if not ok or type(chunk) ~= "string" then return nil, "track_chunk_unreadable" end
+  -- The same project state is spelled <FXCHAIN for tracks and master alike in
+  -- REAPER 7.84, while the saved .rpp writes the master chain as
+  -- <MASTERFXLIST. Accept either so a representation change degrades nothing.
+  local block = chunk_block(chunk, "FXCHAIN")
+  if not block then block = chunk_block(chunk, "MASTERFXLIST") end
+  if not block then
+    if fx_count == 0 then return { fx_count = 0, chunk = "" } end
+    return nil, "fx_chain_absent"
+  end
+  local normalized = normalize_chunk(block, digest_fx_chain_ui_lines)
+  if #normalized > digest_max_fx_chain_chars then
+    return nil, "fx_chain_too_large"
+  end
+  return { fx_count = fx_count, chunk = normalized }
+end
+
+local function master_digest(track)
+  local fx, fx_reason = fx_digest(track)
+  if not fx then return nil, fx_reason end
+  local sends, send_reason = send_digest(track)
+  if not sends then return nil, send_reason end
+  local hardware, hardware_reason = hardware_output_digest(track)
+  if not hardware then return nil, hardware_reason end
+  local mute = reaper.GetMediaTrackInfo_Value(track, "B_MUTE")
+  return {
+    guid = reaper.GetTrackGUID(track) or "",
+    is_master = true,
+    name = get_track_name(track),
+    volume = finite_or_zero(reaper.GetMediaTrackInfo_Value(track, "D_VOL")),
+    pan = finite_or_zero(reaper.GetMediaTrackInfo_Value(track, "D_PAN")),
+    mute = mute ~= nil and mute ~= 0,
+    solo = finite_or_zero(reaper.GetMediaTrackInfo_Value(track, "I_SOLO")),
+    channel_count = finite_or_zero(reaper.GetMediaTrackInfo_Value(track, "I_NCHAN")),
+    pan_mode = finite_or_zero(reaper.GetMediaTrackInfo_Value(track, "I_PANMODE")),
+    pan_law = finite_or_zero(reaper.GetMediaTrackInfo_Value(track, "D_PANLAW")),
+    pan_law_flags = finite_or_zero(
+      reaper.GetMediaTrackInfo_Value(track, "I_PANLAW_FLAGS")),
+    width = finite_or_zero(reaper.GetMediaTrackInfo_Value(track, "D_WIDTH")),
+    dualpan_left = finite_or_zero(
+      reaper.GetMediaTrackInfo_Value(track, "D_DUALPANL")),
+    dualpan_right = finite_or_zero(
+      reaper.GetMediaTrackInfo_Value(track, "D_DUALPANR")),
+    phase_inverted = flag_true(
+      reaper.GetMediaTrackInfo_Value(track, "B_PHASE")),
+    main_send = flag_true(reaper.GetMediaTrackInfo_Value(track, "B_MAINSEND")),
+    play_offset = finite_or_zero(
+      reaper.GetMediaTrackInfo_Value(track, "D_PLAY_OFFSET")),
+    play_offset_flags = finite_or_zero(
+      reaper.GetMediaTrackInfo_Value(track, "I_PLAY_OFFSET_FLAG")),
+    freeze_count = finite_or_zero(
+      reaper.GetMediaTrackInfo_Value(track, "I_FREEZECOUNT")),
+    fx = fx,
+    sends = sends,
+    hardware_outputs = hardware,
+  }
+end
+
+local function project_settings_digest(project)
+  local settings = {}
+  local unread = json.array()
+  for _, name in ipairs(digest_project_settings) do
+    local value = reaper.GetSetProjectInfo(project, name, 0, false)
+    if finite_number(value) then
+      settings[name:lower()] = value
+    else
+      unread[#unread + 1] = name
+    end
+  end
+  return { settings = settings, unread = unread, complete = #unread == 0 }
+end
+
+local function project_digest(arguments)
+  local project, path = target_project(arguments)
+  local revision = project_identity_state(project, path)
+  local tracks = json.array()
+  local item_rows = {}
+  local item_state_chunks = {}
+  local item_state_reasons = json.array()
+  local automation_tracks = json.array()
+  local automation_items = json.array()
+  local automation_fx = json.array()
+  local fx_state_tracks = json.array()
+  local automation_gaps = json.array()
+  local fx_state_gaps = json.array()
+  local seen_envelope = {}
+  local fx_ok = true
+  local sends_ok = true
+  local automation_ok = true
+  local fx_state_ok = true
+  local items_scanned = 0
+  local budget = { used = 0, maximum = digest_max_fx_envelope_probes }
+  local track_count = reaper.CountTracks(project)
+  for index = 0, track_count - 1 do
+    local track = reaper.GetTrack(project, index)
+    local track_guid = reaper.GetTrackGUID(track) or ""
+    local context = track_context(project, track, index,
+                                  { include_items = true,
+                                    include_fx_params = true })
+    local fx, fx_reason = fx_digest(track)
+    if not fx then
+      fx_ok = false
+      fx = json.array()
+      automation_gaps[#automation_gaps + 1] = { track_guid = track_guid,
+                                                reason = fx_reason }
+    end
+    local sends, send_reason = send_digest(track)
+    if not sends then
+      sends_ok = false
+      sends = json.array()
+      automation_gaps[#automation_gaps + 1] = { track_guid = track_guid,
+                                                reason = send_reason }
+    end
+    local hardware, hardware_reason = hardware_output_digest(track)
+    if not hardware then
+      sends_ok = false
+      hardware = json.array()
+      automation_gaps[#automation_gaps + 1] = { track_guid = track_guid,
+                                                reason = hardware_reason }
+    end
+    local envelopes, envelope_reason = track_envelopes(track)
+    local track_envelope_rows = json.array()
+    if envelopes then
+      for row_index = 1, #envelopes.plain do
+        local row = envelopes.plain[row_index]
+        append_envelope(track_envelope_rows, row, seen_envelope)
+      end
+      for row_index = 1, #envelopes.fx do
+        local row = envelopes.fx[row_index]
+        row.track_guid = track_guid
+        row.is_master = false
+        append_envelope(automation_fx, row, seen_envelope)
+      end
+    else
+      automation_ok = false
+      automation_gaps[#automation_gaps + 1] = { track_guid = track_guid,
+                                                reason = envelope_reason }
+    end
+    local fx_envelope_rows, fx_envelope_reason =
+      fx_envelopes(track, track_guid, false, budget)
+    if fx_envelope_rows then
+      for row_index = 1, #fx_envelope_rows do
+        append_envelope(automation_fx, fx_envelope_rows[row_index], seen_envelope)
+      end
+    else
+      automation_ok = false
+      automation_gaps[#automation_gaps + 1] = { track_guid = track_guid,
+                                                reason = fx_envelope_reason }
+    end
+    automation_tracks[#automation_tracks + 1] = {
+      track_guid = track_guid,
+      envelopes = track_envelope_rows,
+    }
+    local chain, chain_reason = fx_chain_state(track)
+    if chain then
+      fx_state_tracks[#fx_state_tracks + 1] = {
+        track_guid = track_guid, is_master = false, fx_count = chain.fx_count,
+        chunk = chain.chunk, complete = true,
+      }
+    else
+      fx_state_ok = false
+      fx_state_tracks[#fx_state_tracks + 1] = {
+        track_guid = track_guid, is_master = false, fx_count = -1,
+        chunk = "", complete = false,
+      }
+      fx_state_gaps[#fx_state_gaps + 1] = { track_guid = track_guid,
+                                            reason = chain_reason }
+    end
+    tracks[#tracks + 1] = {
+      guid = track_guid,
+      volume = finite_or_zero(context.volume),
+      pan = finite_or_zero(context.pan),
+      mute = context.mute == true,
+      solo = finite_or_zero(context.solo),
+      channel_count = finite_or_zero(context.channel_count),
+      pan_mode = finite_or_zero(context.pan_mode),
+      pan_law = finite_or_zero(context.pan_law),
+      pan_law_flags = finite_or_zero(context.pan_law_flags),
+      width = finite_or_zero(context.width),
+      dualpan_left = finite_or_zero(context.dualpan_left),
+      dualpan_right = finite_or_zero(context.dualpan_right),
+      phase_inverted = context.phase_inverted == true,
+      main_send = context.main_send == true,
+      play_offset = finite_or_zero(context.play_offset),
+      play_offset_flags = finite_or_zero(context.play_offset_flags),
+      freeze_count = finite_or_zero(context.freeze_count),
+      folder_depth = finite_or_zero(context.folder_depth),
+      fx = fx,
+      sends = sends,
+      hardware_outputs = hardware,
+    }
+    for item_index = 1, #(context.items or {}) do
+      local source_item = context.items[item_index]
+      local record = {
+        guid = source_item.guid or "",
+        track_guid = context.guid or "",
+        position_s = finite_or_zero(source_item.position_s),
+        length_s = finite_or_zero(source_item.length_s),
+        start_offset_s = finite_or_zero(source_item.start_offset_s),
+        playrate = finite_or_zero(source_item.playrate),
+        mute = source_item.mute == true,
+        fade_in_s = finite_or_zero(source_item.fade_in_s),
+        fade_out_s = finite_or_zero(source_item.fade_out_s),
+        channel_mode = finite_or_zero(source_item.channel_mode),
+        group_id = finite_or_zero(source_item.group_id),
+        take_guid = "",
+        source_path = "",
+        take_volume = 1,
+        take_pan = 0,
+        take_pitch = 0,
+        preserve_pitch = false,
+        loop_source = source_item.loop_source == true,
+        beat_attach_mode = finite_or_zero(source_item.beat_attach_mode),
+        stretch_marker_positions = json.array(),
+        state_chunk = "",
+        state_chunk_complete = false,
+      }
+      if type(source_item.active_take) == "table" and
+         source_item.active_take ~= json.null then
+        record.take_guid = source_item.active_take.guid or ""
+        record.source_path = source_item.active_take.source or ""
+        record.take_volume = finite_or_zero(source_item.active_take.volume)
+        record.take_pan = finite_or_zero(source_item.active_take.pan)
+        record.take_pitch = finite_or_zero(source_item.active_take.pitch)
+        record.preserve_pitch = source_item.active_take.preserve_pitch == true
+      end
+      for marker_index = 1, #source_item.stretch_marker_positions do
+        local marker = source_item.stretch_marker_positions[marker_index]
+        record.stretch_marker_positions[#record.stretch_marker_positions + 1] = {
+          pos = finite_or_zero(marker.pos),
+          srcpos = finite_or_zero(marker.srcpos),
+        }
+      end
+      item_rows[#item_rows + 1] = { record = record, track_index = index,
+                                    item_index = item_index - 1 }
+    end
+    for item_index = 0, reaper.CountTrackMediaItems(track) - 1 do
+      local item = reaper.GetTrackMediaItem(track, item_index)
+      if item then
+        local item_guid_ok, item_guid = reaper.GetSetMediaItemInfo_String(
+          item, "GUID", "", false)
+        -- The full item state chunk is the only documented read that covers
+        -- take FX, take pitch/volume/pan, fades and source flags together. It
+        -- is normalized so arrange-view selection cannot look like a signal
+        -- change, and hashed by the Python reader so the digest stays small.
+        -- Read it for every item, including items without an active take: an
+        -- item with no take still has geometry, fades and item FX, and a
+        -- missing chunk must not make every later capture look incomplete.
+        if type(reaper.GetItemStateChunk) == "function" then
+          local chunk_ok, chunk = reaper.GetItemStateChunk(item, "", false)
+          if chunk_ok and type(chunk) == "string" then
+            local normalized = normalize_chunk(chunk, digest_item_ui_lines)
+            if #normalized > digest_max_fx_chain_chars then
+              item_state_reasons[#item_state_reasons + 1] = {
+                item_guid = item_guid_ok and item_guid or "",
+                reason = "item_state_chunk_too_large",
+              }
+            else
+              item_state_chunks[item_guid_ok and item_guid or ""] = normalized
+            end
+          else
+            item_state_reasons[#item_state_reasons + 1] = {
+              item_guid = item_guid_ok and item_guid or "",
+              reason = "item_state_chunk_unreadable",
+            }
+          end
+        else
+          item_state_reasons[#item_state_reasons + 1] = {
+            item_guid = item_guid_ok and item_guid or "",
+            reason = "item_state_chunk_api_unavailable",
+          }
+        end
+        local take = reaper.GetActiveTake(item)
+        if take then
+          items_scanned = items_scanned + 1
+          local take_guid_ok, take_guid = reaper.GetSetMediaItemTakeInfo_String(
+            take, "GUID", "", false)
+          local take_rows, take_reason = take_envelopes(take)
+          if take_rows then
+            for row_index = 1, #take_rows do
+              local row = take_rows[row_index]
+              row.track_guid = track_guid
+              row.item_guid = item_guid_ok and item_guid or ""
+              row.take_guid = take_guid_ok and take_guid or ""
+              append_envelope(automation_items, row, seen_envelope)
+            end
+          else
+            automation_ok = false
+            automation_gaps[#automation_gaps + 1] = {
+              track_guid = track_guid,
+              item_guid = item_guid_ok and item_guid or "",
+              reason = take_reason,
+            }
+          end
+        end
+      end
+    end
+  end
+  -- Stable order: items by project position, ties by track then item index;
+  -- tempo markers by time, ties by marker index.
+  table.sort(item_rows, function(left, right)
+    if left.record.position_s ~= right.record.position_s then
+      return left.record.position_s < right.record.position_s
+    end
+    if left.track_index ~= right.track_index then
+      return left.track_index < right.track_index
+    end
+    return left.item_index < right.item_index
+  end)
+  local items = json.array()
+  for index = 1, #item_rows do
+    local record = item_rows[index].record
+    local chunk = item_state_chunks[record.guid or ""]
+    if type(chunk) == "string" then
+      record.state_chunk = chunk
+      record.state_chunk_complete = true
+    end
+    items[#items + 1] = record
+  end
+
+  local tempo_rows = {}
+  local tempo_count = reaper.CountTempoTimeSigMarkers(project)
+  for index = 0, (finite_number(tempo_count) and tempo_count or 0) - 1 do
+    local ok, time_s, _, _, marker_bpm, numerator, denominator, linear =
+      reaper.GetTempoTimeSigMarker(project, index)
+    if ok then
+      tempo_rows[#tempo_rows + 1] = {
+        time_s = finite_or_zero(time_s), bpm = finite_or_zero(marker_bpm),
+        numerator = finite_or_zero(numerator),
+        denominator = finite_or_zero(denominator),
+        linear = flag_true(linear), marker_index = index,
+      }
+    end
+  end
+  table.sort(tempo_rows, function(left, right)
+    if left.time_s ~= right.time_s then return left.time_s < right.time_s end
+    return left.marker_index < right.marker_index
+  end)
+  local tempo = json.array()
+  for index = 1, #tempo_rows do
+    local row = tempo_rows[index]
+    tempo[#tempo + 1] = { time_s = row.time_s, bpm = row.bpm,
+                          numerator = row.numerator,
+                          denominator = row.denominator,
+                          linear = row.linear }
+  end
+
+  local master = reaper.GetMasterTrack(project)
+  local master_guid = reaper.GetTrackGUID(master) or ""
+  local master_row, master_reason = master_digest(master)
+  local master_ok = master_row ~= nil
+  if not master_ok then
+    -- The master's FX, routing and level could not be read as one block, so the
+    -- per-track fx coverage flag cannot claim the whole project either.
+    fx_ok = false
+    automation_gaps[#automation_gaps + 1] = { track_guid = master_guid,
+                                              is_master = true,
+                                              reason = master_reason }
+  end
+  local master_envelope_rows = json.array()
+  local master_envelopes, master_envelope_reason = track_envelopes(master)
+  if master_envelopes then
+    for row_index = 1, #master_envelopes.plain do
+      append_envelope(master_envelope_rows, master_envelopes.plain[row_index],
+                      seen_envelope)
+    end
+    for row_index = 1, #master_envelopes.fx do
+      local row = master_envelopes.fx[row_index]
+      row.track_guid = master_guid
+      row.is_master = true
+      append_envelope(automation_fx, row, seen_envelope)
+    end
+  else
+    automation_ok = false
+    automation_gaps[#automation_gaps + 1] = { track_guid = master_guid,
+                                              is_master = true,
+                                              reason = master_envelope_reason }
+  end
+  local master_fx_envelopes, master_fx_reason =
+    fx_envelopes(master, master_guid, true, budget)
+  if master_fx_envelopes then
+    for row_index = 1, #master_fx_envelopes do
+      append_envelope(automation_fx, master_fx_envelopes[row_index], seen_envelope)
+    end
+  else
+    automation_ok = false
+    automation_gaps[#automation_gaps + 1] = { track_guid = master_guid,
+                                              is_master = true,
+                                              reason = master_fx_reason }
+  end
+  local master_chain, master_chain_reason = fx_chain_state(master)
+  if master_chain then
+    fx_state_tracks[#fx_state_tracks + 1] = {
+      track_guid = master_guid, is_master = true,
+      fx_count = master_chain.fx_count, chunk = master_chain.chunk,
+      complete = true,
+    }
+  else
+    fx_state_ok = false
+    fx_state_tracks[#fx_state_tracks + 1] = {
+      track_guid = master_guid, is_master = true, fx_count = -1,
+      chunk = "", complete = false,
+    }
+    fx_state_gaps[#fx_state_gaps + 1] = { track_guid = master_guid,
+                                          is_master = true,
+                                          reason = master_chain_reason }
+  end
+
+  local project_row = project_settings_digest(project)
+  local project_ok = project_row.complete
+
+  local missing = json.array()
+  if not fx_ok then missing[#missing + 1] = "fx" end
+  if not sends_ok then missing[#missing + 1] = "sends" end
+  if not automation_ok then missing[#missing + 1] = "automation" end
+  if not master_ok then missing[#missing + 1] = "master" end
+  if not project_ok then missing[#missing + 1] = "project" end
+  if not fx_state_ok then missing[#missing + 1] = "fx_state" end
+
+  local fields = {
+    tracks = tracks,
+    items = items,
+    tempo = tempo,
+    automation = {
+      tracks = automation_tracks,
+      master = master_envelope_rows,
+      items = automation_items,
+      fx = automation_fx,
+      items_scanned = items_scanned,
+      complete = automation_ok,
+      gaps = automation_gaps,
+    },
+    fx_state = {
+      algorithm = "rpp_fxchain_text_v1",
+      ui_lines_removed = json.array({ "WNDRECT", "SHOW", "LASTSEL", "DOCKED",
+                                      "FLOATPOS", "WAK", "MULTIFXLINK" }),
+      tracks = fx_state_tracks,
+      complete = fx_state_ok,
+      gaps = fx_state_gaps,
+    },
+    project = project_row,
+    item_state = {
+      complete = #item_state_reasons == 0,
+      scanned = items_scanned,
+      reasons = item_state_reasons,
+    },
+  }
+  if master_ok then fields.master = master_row end
+  return {
+    project_id = revision.project_id,
+    path = revision.path,
+    change_count = revision.change_count,
+    digest_version = digest_version,
+    coverage = { tracks = true, items = true, takes = true,
+                 fx = fx_ok, sends = sends_ok, tempo = true,
+                 master = master_ok, automation = automation_ok,
+                 envelopes = automation_ok, project = project_ok,
+                 fx_state = fx_state_ok },
+    missing = missing,
+    fields = fields,
   }
 end
 
@@ -529,7 +1581,7 @@ local function project_tempo_at(arguments)
       effective_quarter_bpm = bpm * 4 / denominator,
     }
   end
-  local revision = project_identity(project, path)
+  local revision = project_identity_state(project, path)
   local source = tempo_marker_count == 0 and "project.base_tempo_no_markers" or
                  "TimeMap_GetTimeSigAtTime"
   return { project_id = revision.project_id, revision = revision,
@@ -538,7 +1590,7 @@ end
 
 local function project_render_settings_read(arguments)
   local project, path = target_project(arguments)
-  local revision = project_identity(project, path)
+  local revision = project_identity_state(project, path)
   local settings = reaper.GetSetProjectInfo(project, "RENDER_SETTINGS", 0, false)
   if not finite_number(settings) then
     fail("api_unavailable", "REAPER returned an invalid RENDER_SETTINGS value")
@@ -559,13 +1611,122 @@ local function project_render_settings_read(arguments)
            render_settings = settings, render_targets = targets, dirty = dirty }
 end
 
-local function project_capture_render(arguments)
+local function project_set_track_mutes(arguments)
   local project, path = target_project(arguments)
   local expected = arguments.expected_revision
+  local revision = project_identity_state(project, path)
+  if not same_revision_fields(expected, revision) then
+    fail("stale_context", "Project changed before the batched mute operation",
+         { expected = expected, current = revision })
+  end
+  local mutes = arguments.mutes
+  if type(mutes) ~= "table" or #mutes == 0 then
+    fail("validation_error", "mutes must be a non-empty array")
+  end
+  local applied = json.array()
+  for index = 1, #mutes do
+    local entry = mutes[index]
+    if type(entry) ~= "table" or type(entry.guid) ~= "string" or
+       entry.guid == "" or type(entry.mute) ~= "boolean" then
+      fail("validation_error", "Each mute entry needs a GUID and a boolean mute",
+           { index = index })
+    end
+    local track = resolve_track(project, entry.guid)
+    if not track then
+      fail("not_found", "A batched mute target is not in the project",
+           { guid = entry.guid })
+    end
+    reaper.SetMediaTrackInfo_Value(track, "B_MUTE", entry.mute and 1 or 0)
+    applied[#applied + 1] = {
+      guid = entry.guid,
+      mute = flag_true(reaper.GetMediaTrackInfo_Value(track, "B_MUTE")),
+    }
+  end
+  local after = project_identity_state(project, path)
+  return { project_id = after.project_id, revision = after,
+           project_after = after, mutes = applied }
+end
+
+local unresolved_sources
+
+local function project_capture_render(arguments)
+  local project, path = target_project(arguments)
+  local previous_active = select(1, reaper.EnumProjects(-1, ""))
+  local switched_active = false
+  if previous_active ~= project then
+    local select_ok, selected = pcall(reaper.SelectProjectInstance, project)
+    if not select_ok or selected == false then
+      fail("api_unavailable", "REAPER could not activate the target project for rendering",
+           { project_id = path or "" })
+    end
+    switched_active = true
+  end
+  local expected = arguments.expected_revision
   local master_only = arguments.master_only == true
-  local revision = project_identity(project, path)
-  if type(expected) ~= "table" or expected.project_id ~= revision.project_id or
-     expected.path ~= revision.path or expected.change_count ~= revision.change_count then
+  local selected_tracks_via_master = arguments.selected_tracks_via_master == true
+  local parallel_via_master = arguments.parallel_via_master == true
+  local probe_mode = arguments.probe_mode == true
+  local render_settings_override = arguments.render_settings
+  if render_settings_override == json.null then render_settings_override = nil end
+  if render_settings_override ~= nil and
+     (not finite_number(render_settings_override) or render_settings_override < 0 or
+      render_settings_override % 1 ~= 0) then
+    fail("validation_error", "render_settings must be a non-negative integer")
+  end
+  if parallel_via_master and not selected_tracks_via_master then
+    fail("validation_error", "parallel_via_master requires selected_tracks_via_master")
+  end
+  -- Optional additive contract: render only these track GUIDs (a bounded batch)
+  -- instead of every project track.  Selection is still restored in full, and
+  -- the one-file/one-GUID mapping below is enforced against this exact set.
+  local track_guids = arguments.track_guids
+  if track_guids == json.null then track_guids = nil end
+  local subset, subset_count = nil, 0
+  if track_guids ~= nil then
+    if type(track_guids) ~= "table" then
+      fail("validation_error", "track_guids must be an array of track GUID strings")
+    end
+    if master_only then
+      fail("validation_error", "track_guids cannot be combined with master_only")
+    end
+    subset = {}
+    for _, guid in ipairs(track_guids) do
+      if type(guid) ~= "string" or guid == "" then
+        fail("validation_error", "track_guids entries must be non-empty strings")
+      end
+      if subset[guid] then
+        fail("validation_error", "track_guids must not repeat a track GUID",
+             { guid = guid })
+      end
+      subset[guid] = true
+      subset_count = subset_count + 1
+    end
+    if subset_count == 0 then
+      fail("validation_error", "track_guids must name at least one track")
+    end
+  end
+  local channels_name = arguments.channels
+  if channels_name == nil or channels_name == json.null then channels_name = "stereo" end
+  if channels_name ~= "stereo" and channels_name ~= "mono" then
+    fail("validation_error", "channels must be \"stereo\" or \"mono\"",
+         { channels = channels_name })
+  end
+  local render_channels = channels_name == "mono" and 1 or 2
+  local sample_rate = arguments.sample_rate
+  if sample_rate == nil or sample_rate == json.null then sample_rate = 0 end
+  if not finite_number(sample_rate) or sample_rate < 0 or sample_rate > 768000 then
+    fail("validation_error",
+         "sample_rate must be 0 (project rate) or a finite rate up to 768000",
+         { sample_rate = sample_rate })
+  end
+  local tail_ms = arguments.tail_ms
+  if tail_ms == nil or tail_ms == json.null then tail_ms = 0 end
+  if not finite_number(tail_ms) or tail_ms < 0 or tail_ms > 3600000 then
+    fail("validation_error", "tail_ms must be a finite number of milliseconds >= 0",
+         { tail_ms = tail_ms })
+  end
+  local revision = project_identity_state(project, path)
+  if not same_revision_fields(expected, revision) then
     fail("stale_context", "Project changed before the analysis render",
          { expected = expected, current = revision })
   end
@@ -592,6 +1753,7 @@ local function project_capture_render(arguments)
 
   local numeric_fields = { "RENDER_SETTINGS", "RENDER_BOUNDSFLAG",
                            "RENDER_CHANNELS", "RENDER_SRATE", "RENDER_ADDTOPROJ",
+                           "RENDER_TAILFLAG", "RENDER_TAILMS",
                            "RENDER_DITHER", "RENDER_NORMALIZE" }
   local string_fields = { "RENDER_FILE", "RENDER_PATTERN", "RENDER_FORMAT",
                           "RENDER_FORMAT2" }
@@ -612,6 +1774,13 @@ local function project_capture_render(arguments)
     end
     prior_strings[name] = value
   end
+  local prior_transport = {
+    play_state = reaper.GetPlayStateEx(project),
+    cursor_s = reaper.GetCursorPositionEx(project),
+    edit_cursor_s = reaper.GetCursorPositionEx(project),
+    play_position_s = reaper.GetPlayPositionEx(project),
+  }
+  local restored_transport = {}
   local prior_dirty = reaper.GetSetProjectInfo(project, "DIRTY", 0, false)
   if not finite_number(prior_dirty) then
     fail("api_unavailable", "REAPER returned an invalid project dirty state")
@@ -652,16 +1821,63 @@ local function project_capture_render(arguments)
     local time_ok = pcall(reaper.GetSet_LoopTimeRange2, project, true, false,
                           prior_time_start, prior_time_end, false)
     if not time_ok then failures[#failures + 1] = "time_selection" end
+    local cursor_ok = pcall(reaper.SetEditCurPos2, project,
+                             prior_transport.cursor_s, false, false)
+    restored_transport = {
+      play_state = reaper.GetPlayStateEx(project),
+      cursor_s = reaper.GetCursorPositionEx(project),
+      edit_cursor_s = reaper.GetCursorPositionEx(project),
+      play_position_s = reaper.GetPlayPositionEx(project),
+      play_position_observed = true,
+      play_position_restorable = false,
+      position_verified = "edit_cursor_s",
+    }
+    if not cursor_ok or math.abs(restored_transport.cursor_s -
+                                 prior_transport.cursor_s) > 1e-6 then
+      failures[#failures + 1] = "edit_cursor"
+    end
+    if restored_transport.play_state ~= prior_transport.play_state then
+      failures[#failures + 1] = "play_state"
+    end
+    if switched_active and previous_active then
+      local active_ok = pcall(reaper.SelectProjectInstance, previous_active)
+      if not active_ok then failures[#failures + 1] = "active_project_tab" end
+    end
     return failures
   end
 
   local ok, capture = xpcall(function()
+    local media_issues = unresolved_sources(project)
+    if #media_issues > 0 then
+      fail("media_unresolved",
+           "Some take sources could not be resolved; the analysis render would be silent",
+           { sources = media_issues })
+    end
+    local subset_found = 0
     for index = 0, track_count - 1 do
       local track = reaper.GetTrack(project, index)
       tracks[index + 1] = track
       selected[index + 1] = reaper.IsTrackSelected(track)
-      reaper.SetTrackSelected(track, true)
+      -- Master-mix renders do not need a selected-track target.  Selecting
+      -- every track here made the master-only path depend on selection state;
+      -- leave the user's selection untouched for that mode.
+      if not master_only then
+        local wanted = true
+        if subset ~= nil then
+          local guid = reaper.GetTrackGUID(track)
+          wanted = subset[guid] == true
+          if wanted then subset_found = subset_found + 1 end
+        end
+        reaper.SetTrackSelected(track, wanted)
+      end
     end
+    if subset ~= nil and subset_found ~= subset_count then
+      fail("validation_error",
+           "track_guids names a track that is not in this project",
+           { requested = subset_count, found = subset_found })
+    end
+    local target_track_count = track_count
+    if subset ~= nil then target_track_count = subset_count end
 
     local function set_number(name, value)
       local ok_set = pcall(reaper.GetSetProjectInfo, project, name, value, true)
@@ -683,7 +1899,19 @@ local function project_capture_render(arguments)
     set_string("RENDER_PATTERN", prefix .. "$tracknumber-$track")
     set_string("RENDER_FORMAT", "evaw")
     set_string("RENDER_FORMAT2", "")
-    set_number("RENDER_SETTINGS", master_only and 0 or 5) -- master mix or stems + master
+    local render_settings = 5
+    if master_only then
+      render_settings = 0
+    elseif selected_tracks_via_master then
+      render_settings = 128
+      if parallel_via_master then render_settings = render_settings + (8 << 16) end
+    end
+    if render_settings_override ~= nil then
+      render_settings = render_settings_override
+      if parallel_via_master then render_settings = render_settings + (8 << 16) end
+    end
+    local includes_master = master_only or (render_settings % 2 == 1)
+    set_number("RENDER_SETTINGS", render_settings)
     if has_section then
       local range_ok = reaper.GetSet_LoopTimeRange2(
         project, true, false, section_start, section_end, false)
@@ -692,31 +1920,84 @@ local function project_capture_render(arguments)
     else
       set_number("RENDER_BOUNDSFLAG", 1) -- entire project
     end
-    set_number("RENDER_CHANNELS", 2)
-    set_number("RENDER_SRATE", 0) -- project sample rate
+    set_number("RENDER_CHANNELS", render_channels)
+    set_number("RENDER_SRATE", sample_rate) -- 0 means project sample rate
+    if tail_ms > 0 then
+      -- REAPER 7 documents RENDER_TAILFLAG as a per-bounds bitmask
+      -- (&1=custom bounds, &2=entire project, &4=time selection), not a
+      -- boolean: a literal 1 would add no tail to the bounds rendered here.
+      local bounds_flag = has_section and 2 or 1
+      set_number("RENDER_TAILFLAG", 2 ^ bounds_flag)
+      set_number("RENDER_TAILMS", tail_ms)
+    else
+      set_number("RENDER_TAILFLAG", 0)
+      set_number("RENDER_TAILMS", 0)
+    end
     set_number("RENDER_ADDTOPROJ", 0)
     set_number("RENDER_DITHER", 16) -- disable render dither/noise shaping
     set_number("RENDER_NORMALIZE", 0) -- no normalize/limit/fade postprocessing
 
+    -- Read back what the render will actually use, so the capture record
+    -- describes the settings rather than the request.
+    local settings_used = {}
+    for _, name in ipairs({ "RENDER_SETTINGS", "RENDER_BOUNDSFLAG",
+                            "RENDER_CHANNELS", "RENDER_SRATE",
+                            "RENDER_TAILFLAG", "RENDER_TAILMS",
+                            "RENDER_ADDTOPROJ" }) do
+      local value = reaper.GetSetProjectInfo(project, name, 0, false)
+      if not finite_number(value) then
+        error("REAPER returned an invalid " .. name .. " after render setup")
+      end
+      settings_used[name] = value
+    end
+    local effective_sample_rate = settings_used.RENDER_SRATE
+    local sample_rate_source = "render_setting"
+    if effective_sample_rate <= 0 then
+      -- RENDER_SRATE=0 defers to the project rate; report that rate and label
+      -- where it came from instead of implying a measured render rate.
+      sample_rate_source = "project_srate"
+      local rate_ok, project_rate = pcall(reaper.GetSetProjectInfo, project,
+                                          "PROJECT_SRATE", 0, false)
+      if rate_ok and finite_number(project_rate) and project_rate > 0 then
+        effective_sample_rate = project_rate
+      else
+        effective_sample_rate = 0
+        sample_rate_source = "unknown"
+      end
+    end
+
     local targets_ok, targets_text = reaper.GetSetProjectInfo_String(
       project, "RENDER_TARGETS", "", false)
-    if not targets_ok or type(targets_text) ~= "string" then
-      error("REAPER could not build the analysis render target list")
-    end
-    for target in targets_text:gmatch("[^;]+") do
-      local parent = target:match("^(.*)[/\\][^/\\]+$")
-      if not same_path(parent, output_dir) or not target:lower():match("%.wav$") then
-        error("REAPER produced an unsafe analysis render target: " .. target)
+    local target_source = "reaper_render_targets"
+    if not targets_ok or type(targets_text) ~= "string" or targets_text == "" then
+      if not probe_mode then
+        error("REAPER could not build the analysis render target list: ok=" ..
+              tostring(targets_ok) .. ", type=" .. type(targets_text) ..
+              ", value=" .. tostring(targets_text) ..
+              ", RENDER_SETTINGS=" .. tostring(reaper.GetSetProjectInfo(project, "RENDER_SETTINGS", 0, false)))
       end
-      local existing = io.open(target, "rb")
-      if existing then
-        existing:close()
-        error("Analysis render target already exists: " .. target)
+      target_source = "scanned_after_render"
+      capture_targets = {}
+    else
+      for target in targets_text:gmatch("[^;]+") do
+        local parent = target:match("^(.*)[/\\][^/\\]+$")
+        if not same_path(parent, output_dir) or not target:lower():match("%.wav$") then
+          error("REAPER produced an unsafe analysis render target: " .. target)
+        end
+        local existing = io.open(target, "rb")
+        if existing then
+          existing:close()
+          error("Analysis render target already exists: " .. target)
+        end
+        capture_targets[#capture_targets + 1] = target
       end
-      capture_targets[#capture_targets + 1] = target
     end
-    if #capture_targets ~= (master_only and 1 or track_count + 1) then
-      error("REAPER did not produce the expected analysis render targets")
+    local expected_target_count = master_only and 1 or
+                                  (includes_master and target_track_count + 1 or
+                                   target_track_count)
+    if #capture_targets > 0 and #capture_targets ~= expected_target_count then
+      error("REAPER did not produce the expected analysis render targets: expected " ..
+            tostring(expected_target_count) .. ", got " .. tostring(#capture_targets))
     end
 
     local action_name = reaper.kbd_getTextFromCmd(
@@ -726,15 +2007,34 @@ local function project_capture_render(arguments)
     end
     reaper.Main_OnCommandEx(42230, 0, project)
 
+    if #capture_targets == 0 then
+      local index = 0
+      while true do
+        local name = reaper.EnumerateFiles(output_dir, index)
+        if not name then break end
+        if name:lower():match("%.wav$") and name:sub(1, #prefix) == prefix then
+          capture_targets[#capture_targets + 1] = output_dir .. "/" .. name
+        end
+        index = index + 1
+      end
+      if #capture_targets ~= expected_target_count then
+        error("Scanned render directory did not contain the expected files: expected " ..
+              tostring(expected_target_count) .. ", got " .. tostring(#capture_targets))
+      end
+    end
+
     local files, seen_tracks, seen_track_count, master_count = json.array(), {}, 0, 0
     for _, target in ipairs(capture_targets) do
       local name = target:match("([^/\\]+)$") or ""
       local rest = name:sub(#prefix + 1)
       local number = tonumber(rest:match("^(%d+)%-")) or 0
       local track_guid, track_name, track_index, is_master
-      if not master_only and number >= 1 and number <= track_count then
+      if number >= 1 and number <= track_count then
         local track = reaper.GetTrack(project, number - 1)
         track_guid = reaper.GetTrackGUID(track)
+        if subset ~= nil and subset[track_guid] ~= true then
+          error("REAPER rendered a track outside the requested capture subset: " .. target)
+        end
         local name_ok
         name_ok, track_name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
         if not name_ok then error("Could not read rendered track name") end
@@ -759,13 +2059,34 @@ local function project_capture_render(arguments)
                             track_index = track_index, is_master = is_master,
                             path = target, bytes = bytes }
     end
-    if master_count ~= 1 or (not master_only and seen_track_count ~= track_count) then
-      error("Rendered files could not be mapped one-to-one to project tracks and master")
+    local expected_master_count = master_only and 1 or (includes_master and 1 or 0)
+    if master_count ~= expected_master_count or
+       (not master_only and seen_track_count ~= target_track_count) then
+      error("Rendered files could not be mapped one-to-one to requested tracks and master: " ..
+            "tracks=" .. tostring(seen_track_count) .. "/" .. tostring(target_track_count) ..
+            ", masters=" .. tostring(master_count) .. "/" .. tostring(expected_master_count))
     end
+    local capture_point = master_only and "native_render_master_only" or
+                          (selected_tracks_via_master and
+                           "native_render_selected_tracks_via_master" or
+                           "native_render_track_stems_plus_master")
     return { project_id = revision.project_id, revision = revision,
-             files = files, capture_point = master_only and
-               "native_render_master_only" or "native_render_track_stems_plus_master",
-             render_action = action_name }
+             files = files, capture_point = capture_point,
+             selected_tracks_via_master = selected_tracks_via_master,
+             parallel_via_master = parallel_via_master,
+             render_settings_requested = render_settings,
+             master_included = includes_master,
+             render_action = action_name,
+             render_settings_used = settings_used,
+             render_targets = capture_targets,
+             target_count = #capture_targets,
+             target_track_count = target_track_count,
+             track_guids = track_guids,
+             target_source = target_source,
+             channels = render_channels,
+             sample_rate = effective_sample_rate,
+             sample_rate_source = sample_rate_source,
+             tail_s = tail_ms / 1000 }
   end, function(err) return err end)
 
   local restore_failures = restore()
@@ -790,8 +2111,24 @@ local function project_capture_render(arguments)
          { output_dir = output_dir, restore_failures = restore_failures,
            files = capture.files })
   end
+  capture.restore_report = { restored = true, failures = json.array(),
+                            dirty_before = prior_dirty,
+                            dirty_after = reaper.GetSetProjectInfo(project, "DIRTY", 0, false),
+                            time_selection_before = { start_s = prior_time_start,
+                                                      end_s = prior_time_end },
+                            time_selection_after = (function()
+                              local start_s, end_s = reaper.GetSet_LoopTimeRange2(
+                                project, false, false, 0, 0, false)
+                              return { start_s = start_s, end_s = end_s }
+                            end)(),
+                            transport_position_before_s = prior_transport.edit_cursor_s,
+                            transport_position_after_s = restored_transport.edit_cursor_s,
+                            transport_position_kind = "edit_cursor_s",
+                            play_position_semantics = "observed_playback_not_project_cursor",
+                            transport_before = prior_transport,
+                            transport_after = restored_transport }
   capture.revision_before = revision
-  capture.revision_after = project_identity(project, path)
+  capture.revision_after = project_identity_state(project, path)
   return capture
 end
 
@@ -800,7 +2137,7 @@ local function projects_list()
   while true do
     local project, path = reaper.EnumProjects(index, "")
     if not project then break end
-    local identity = project_identity(project, path or "")
+    local identity = project_identity_state(project, path or "")
     projects[#projects + 1] = {
       revision = identity,
       name = reaper.GetProjectName(project),
@@ -819,7 +2156,7 @@ local function write_instance_registry()
     reaper_version = reaper.GetAppVersion(),
     started_epoch = tonumber(bridge_session_id:match("^(%x+)"), 16),
     last_seen_epoch = os.time(),
-    active_project = project_identity(active, active_path),
+    active_project = project_identity_state(active, active_path),
     open_projects = projects_list().projects,
   }
   local temporary = registry_path .. ".tmp"
@@ -1081,11 +2418,11 @@ local function api_call(arguments, request_id)
   end
 
   local before_path = project_path_for(call_project)
-  local before = before_path and project_identity(call_project, before_path) or nil
+  local before = before_path and project_identity_state(call_project, before_path) or nil
   local packed = table.pack(pcall(fn, table.unpack(call_args, 1, call_args.n)))
   if not packed[1] then fail("api_call_failed", tostring(packed[2]), { name = name }) end
   local after_path = project_path_for(call_project)
-  local after = after_path and project_identity(call_project, after_path) or json.null
+  local after = after_path and project_identity_state(call_project, after_path) or json.null
   local returns = json.array()
   for index = 2, packed.n do
     local value = packed[index]
@@ -1133,9 +2470,8 @@ local function assert_revision(project, path, expected)
      type(expected.path) ~= "string" or not finite_number(expected.change_count) then
     fail("validation_error", "A complete project revision is required")
   end
-  local current = project_identity(project, path)
-  if current.project_id ~= expected.project_id or current.path ~= expected.path or
-     current.change_count ~= expected.change_count then
+  local current = project_identity_state(project, path)
+  if not same_revision_fields(expected, current) then
     fail("stale_context", "The project changed after the edit plan was prepared",
          { expected = expected, current = current })
   end
@@ -2040,9 +3376,7 @@ local function inspect_edit(project, operation)
 end
 
 local function same_revision(left, right)
-  return type(left) == "table" and type(right) == "table" and
-         left.project_id == right.project_id and left.path == right.path and
-         left.change_count == right.change_count
+  return same_revision_fields(left, right)
 end
 
 local function transaction_preview(arguments, request_id)
@@ -2226,8 +3560,15 @@ local function apply_edit(project, inspected)
     end
     reaper.UpdateItemInProject(target)
   elseif kind == "fx.insert" then
+    -- recFX must be false: true addresses the record-input/monitoring chain,
+    -- where the FX is invisible to TrackFX_GetCount and the mix. A position
+    -- is expressed as a negative instantiate value (-1000 = first slot).
+    local instantiate = -1
+    if finite_number(values.position) then
+      instantiate = -1000 - values.position
+    end
     local index = reaper.TrackFX_AddByName(target, values.name, false,
-                                           values.position or -1)
+                                           instantiate)
     if (not finite_number(index) or index < 0) and values.position == nil then
       -- A cold VST cache can miss on the first lookup; one retry costs nothing.
       index = reaper.TrackFX_AddByName(target, values.name, false, -1)
@@ -2721,7 +4062,7 @@ local function transaction_apply(arguments)
              { plan_id = plan.plan_id, reason = tostring(failure) })
       end
     else
-      local after_failure = project_identity(project, path)
+      local after_failure = project_identity_state(project, path)
       if after_failure.change_count ~= current.change_count then
         local detail = type(failure) == "table" and
                        (failure.message or failure.code or "table error") or
@@ -2741,7 +4082,7 @@ local function transaction_apply(arguments)
   end
 
   local after = outcome.after
-  local after_revision = project_identity(project, path)
+  local after_revision = project_identity_state(project, path)
   transaction_plans[plan.plan_id] = nil
   -- Some REAPER APIs (notably ReorderSelectedTracks) create their own undo
   -- label inside the block. Store the label that is actually on top so undo
@@ -2771,8 +4112,8 @@ local function transaction_undo(arguments)
     fail("stale_context", "The project for this undo is no longer open",
          { project_id = expected.project_id })
   end
-  local current = project_identity(project, path)
-  if current.project_id ~= expected.project_id or current.path ~= expected.path then
+  local current = project_identity_state(project, path)
+  if not same_revision_fields(expected, current) then
     fail("stale_context", "The project identity no longer matches this undo",
          { expected = expected, current = current })
   end
@@ -2795,7 +4136,7 @@ local function transaction_undo(arguments)
          { plan_id = last.plan_id, reason = tostring(result) })
   end
   last_transaction_by_project[current.project_id] = nil
-  local after = project_identity(project, path)
+  local after = project_identity_state(project, path)
   return { undone = true, plan_id = last.plan_id,
            revision_before = current, revision_after = after }
 end
@@ -2846,6 +4187,63 @@ local function fx_list_installed(arguments)
   return { count = #plugins, plugins = plugins }
 end
 
+local function unresolved_source_row(track, track_index, track_name, item, take,
+                                     source, reason)
+  local item_ok, item_guid = false, ""
+  if item then item_ok, item_guid = reaper.GetSetMediaItemInfo_String(
+    item, "GUID", "", false) end
+  local take_ok, take_guid = false, ""
+  if take then take_ok, take_guid = reaper.GetSetMediaItemTakeInfo_String(
+    take, "GUID", "", false) end
+  return {
+    track_index = track_index,
+    track_guid = track and reaper.GetTrackGUID(track) or "",
+    track_name = track_name or "",
+    item_guid = item_ok and item_guid or "",
+    take_guid = take_ok and take_guid or "",
+    source = source and reaper.GetMediaSourceFileName(source) or "",
+    source_type = source and reaper.GetMediaSourceType(source) or "",
+    reason = reason,
+  }
+end
+
+-- Reporting only: a capture must never silently render an unresolved take
+-- source.  The fixture/project must be opened with media online; this check
+-- returns the exact take paths so the caller can repair the project instead of
+-- receiving structurally valid digital silence.
+function unresolved_sources(project)
+  local unresolved = json.array()
+  local track_count = reaper.CountTracks(project)
+  for track_index = 0, track_count - 1 do
+    local track = reaper.GetTrack(project, track_index)
+    local track_mute = reaper.GetMediaTrackInfo_Value(track, "B_MUTE") ~= 0
+    local name_ok, track_name = reaper.GetSetMediaTrackInfo_String(
+      track, "P_NAME", "", false)
+    if not name_ok then track_name = "Track " .. (track_index + 1) end
+    local item_count = reaper.CountTrackMediaItems(track)
+    for item_index = 0, item_count - 1 do
+      local item = reaper.GetTrackMediaItem(track, item_index)
+      local take = reaper.GetActiveTake(item)
+      if take and not reaper.TakeIsMIDI(take) then
+        local item_mute = reaper.GetMediaItemInfo_Value(item, "B_MUTE") ~= 0
+        local source = reaper.GetMediaItemTake_Source(take)
+        local source_length = source and select(1, reaper.GetMediaSourceLength(source)) or 0
+        if not (track_mute or item_mute) then
+          if not source then
+            unresolved[#unresolved + 1] = unresolved_source_row(
+              track, track_index, track_name, item, take, nil, "source_missing")
+          elseif not finite_number(source_length) or source_length <= 0 then
+            unresolved[#unresolved + 1] = unresolved_source_row(
+              track, track_index, track_name, item, take, source,
+              "source_unresolved")
+          end
+        end
+      end
+    end
+  end
+  return unresolved
+end
+
 local function write_accessor_wav(path, sample_rate, channels, frames,
                                   accessor, start_s, gain)
   local file, open_error = io.open(path, "wb")
@@ -2866,30 +4264,57 @@ local function write_accessor_wav(path, sample_rate, channels, frames,
              "data", u32(data_bytes))
   local chunk_frames = 48000
   local buffer = reaper.new_array(chunk_frames * channels)
-  local position = 0
+  local zero = string.pack("<f", 0.0)
+  local accessor_start = reaper.GetAudioAccessorStartTime(accessor)
+  local accessor_end = reaper.GetAudioAccessorEndTime(accessor)
+  local accessor_empty = not finite_number(accessor_start) or
+                         not finite_number(accessor_end) or
+                         accessor_end <= accessor_start
+  local position, zero_blocks = 0, 0
   while position < frames do
     local count = math.min(chunk_frames, frames - position)
-    local received = reaper.GetAudioAccessorSamples(
-      accessor, sample_rate, channels, start_s + position / sample_rate,
-      count, buffer)
-    if received == 0 then
+    local received = 0
+    if not accessor_empty then
+      received = reaper.GetAudioAccessorSamples(
+        accessor, sample_rate, channels, start_s + position / sample_rate,
+        count, buffer)
+    end
+    if not finite_number(received) then
       file:close()
-      error("REAPER returned no audio accessor samples at frame " .. position)
+      error("REAPER returned a non-finite audio accessor sample count at frame " ..
+            position)
     end
-    local packed = {}
-    for index = 1, count * channels do
-      packed[index] = string.pack("<f", buffer[index] * gain)
+    if received == -1 then
+      file:close()
+      error("REAPER rejected an audio accessor sample request at frame " .. position)
     end
-    file:write(table.concat(packed))
+    if accessor_empty or received == 0 then
+      -- An empty track (or a time range outside the accessor) is intentional
+      -- silence, not a failure.  Write an explicit zero block so the file has
+      -- the same duration as every other captured stem.
+      file:write(string.rep(zero, count * channels))
+      zero_blocks = zero_blocks + 1
+    else
+      -- GetAudioAccessorSamples returns 1 for "audio returned", not the
+      -- sample count.  The buffer is already count * channels samples long;
+      -- never treat 1 as a one-sample block.
+      local packed = {}
+      for index = 1, count * channels do
+        packed[index] = string.pack("<f", buffer[index] * gain)
+      end
+      file:write(table.concat(packed))
+    end
     position = position + count
   end
   file:close()
-  return data_bytes + 44
+  return { bytes = data_bytes + 44, zero_blocks = zero_blocks,
+           accessor_start_s = accessor_start, accessor_end_s = accessor_end,
+           accessor_empty = accessor_empty, frames = frames }
 end
 
 local function project_sample_tracks(arguments)
   local project, path = target_project(arguments)
-  local revision = project_identity(project, path)
+  local revision = project_identity_state(project, path)
   if reaper.GetPlayStateEx(project) ~= 0 then
     fail("validation_error", "Stop playback before sampling audio",
          { play_state = reaper.GetPlayStateEx(project) })
@@ -2916,33 +4341,55 @@ local function project_sample_tracks(arguments)
   if frame_count <= 0 or frame_count > 48000 * 60 * 60 then
     fail("validation_error", "requested sample range is invalid")
   end
-  local files = json.array()
-  local track_count = reaper.CountTracks(project)
-  for index = 0, track_count - 1 do
-    local track = reaper.GetTrack(project, index)
-    local accessor = reaper.CreateTrackAudioAccessor(track)
-    if not accessor then
-      fail("api_unavailable", "Could not create an audio accessor for track " .. index)
-    end
-    local name_ok, name = reaper.GetSetMediaTrackInfo_String(
-      track, "P_NAME", "", false)
-    if not name_ok then name = "Track " .. (index + 1) end
-    local safe_name = name:gsub("[^%w%-_ ]", "_")
-    if #safe_name > 40 then safe_name = safe_name:sub(1, 40) end
-    local file_path = output_dir .. "/rali-" .. job_id .. "-" ..
-                      string.format("%02d", index + 1) .. "-" .. safe_name .. ".wav"
-    local gain = reaper.GetMediaTrackInfo_Value(track, "D_VOL")
-    if not finite_number(gain) then gain = 1 end
-    local bytes = write_accessor_wav(file_path, sample_rate, 2, frame_count,
-                                     accessor, start_s, gain)
-    reaper.DestroyAudioAccessor(accessor)
-    files[#files + 1] = { source_guid = reaper.GetTrackGUID(track),
-                          name = name, track_index = index, is_master = false,
-                          path = file_path, bytes = bytes }
+  local media_issues = unresolved_sources(project)
+  if #media_issues > 0 then
+    fail("media_unresolved",
+         "Some take sources could not be resolved; accessor audio would be silent",
+         { sources = media_issues })
   end
-  return { project_id = revision.project_id, revision = revision,
-           files = files, capture_point = "native_audio_accessor_tracks",
-           sample_rate = sample_rate, frame_count = frame_count }
+  local ok, result = xpcall(function()
+    local files = json.array()
+    local track_count = reaper.CountTracks(project)
+    for index = 0, track_count - 1 do
+      local track = reaper.GetTrack(project, index)
+      local accessor = reaper.CreateTrackAudioAccessor(track)
+      if not accessor then
+        fail("api_unavailable", "Could not create an audio accessor for track " .. index)
+      end
+      reaper.AudioAccessorUpdate(accessor)
+      local name_ok, name = reaper.GetSetMediaTrackInfo_String(
+        track, "P_NAME", "", false)
+      if not name_ok then name = "Track " .. (index + 1) end
+      local safe_name = name:gsub("[^%w%-_ ]", "_")
+      if #safe_name > 40 then safe_name = safe_name:sub(1, 40) end
+      local file_path = output_dir .. "/rali-" .. job_id .. "-" ..
+                        string.format("%02d", index + 1) .. "-" .. safe_name .. ".wav"
+      local gain = reaper.GetMediaTrackInfo_Value(track, "D_VOL")
+      if not finite_number(gain) then gain = 1 end
+      local written = write_accessor_wav(file_path, sample_rate, 2, frame_count,
+                                         accessor, start_s, gain)
+      reaper.DestroyAudioAccessor(accessor)
+      files[#files + 1] = { source_guid = reaper.GetTrackGUID(track),
+                            name = name, track_index = index, is_master = false,
+                            path = file_path, bytes = written.bytes,
+                            zero_blocks = written.zero_blocks,
+                            accessor_start_s = written.accessor_start_s,
+                            accessor_end_s = written.accessor_end_s,
+                            accessor_empty = written.accessor_empty,
+                            frames = written.frames }
+    end
+    return { project_id = revision.project_id, revision = revision,
+             files = files, capture_point = "native_audio_accessor_tracks",
+             sample_rate = sample_rate, frame_count = frame_count }
+  end, function(err) return err end)
+  if not ok then
+    if type(result) == "table" and result.bridge_error then
+      fail(result.code, result.message, result.details)
+    end
+    fail("capture_failed", "Audio accessor sampling failed: " .. tostring(result))
+  end
+  result.revision_after = project_identity_state(project, path)
+  return result
 end
 
 local operations = {
@@ -2950,14 +4397,17 @@ local operations = {
     local project, path = active_project()
     return { service = "reaper-workbench", protocol = protocol_version,
              bridge_session = bridge_session_id,
-             reaper_version = reaper.GetAppVersion(), project = project_identity(project, path),
+             reaper_version = reaper.GetAppVersion(),
+             project = project_identity_state(project, path),
              open_projects = projects_list() }
   end,
   ["projects.list"] = projects_list,
   ["project.context"] = project_context,
+  ["project.digest"] = project_digest,
   ["project.tempo_at"] = project_tempo_at,
   ["project.render_settings.read"] = project_render_settings_read,
   ["project.capture_render"] = project_capture_render,
+  ["project.set_track_mutes"] = project_set_track_mutes,
   ["project.sample_tracks"] = project_sample_tracks,
   ["fx.list_installed"] = fx_list_installed,
   ["fx.list_params"] = fx_list_params,

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import mimetypes
 import os
 import re
 import uuid
@@ -16,6 +18,7 @@ from ..errors import ArtifactCleanupError, ValidationError
 _MANIFEST_NAME = ".reaper-audio-job.json"
 _JOB_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _ARTIFACT_NAME = re.compile(r"^[^<>:\"/\\|?*\x00-\x1f]{1,128}$")
+_HASH_CHUNK_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +27,22 @@ class CleanupReport:
     removed_files: tuple[str, ...]
     preserved_paths: tuple[str, ...]
     removed_job_directory: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RegisteredArtifact:
+    """Content identity of one manifest-owned audio file.
+
+    ``sha256`` is 64 lowercase hexadecimal characters, ``bytes`` is the exact
+    file size that was hashed, and ``mime`` is sniffed from the filename with a
+    binary fallback for unknown extensions.
+    """
+
+    path: Path
+    filename: str
+    bytes: int
+    sha256: str
+    mime: str
 
 
 class AudioArtifactWorkspace:
@@ -53,6 +72,7 @@ class AudioArtifactWorkspace:
             raise ValidationError("Artifact job directory escaped its managed root")
         self.manifest_path = self.directory / _MANIFEST_NAME
         self._artifact_names: list[str] = []
+        self._assets: list[dict[str, object]] = []
         self._closed = False
         self._created_epoch = datetime.now(timezone.utc).timestamp()
         self._write_manifest(status="active")
@@ -83,22 +103,67 @@ class AudioArtifactWorkspace:
         self._write_manifest(status="active")
         return path
 
+    def register_asset(self, path: str | os.PathLike[str]) -> RegisteredArtifact:
+        """Register one host-created file and return its content identity."""
+        return self.register_assets((path,))[0]
+
+    def register_assets(
+        self, paths: tuple[str | os.PathLike[str], ...] | list[str | os.PathLike[str]],
+    ) -> tuple[RegisteredArtifact, ...]:
+        """Register host-created files and record their measured content identity.
+
+        Every input must already exist as a non-empty, regular, non-link file
+        directly in this job directory. Validation and hashing are completed
+        for the whole batch before the manifest changes, so a malformed bridge
+        response cannot partially register a set of renders.
+        """
+        validated = self._validate_pending_assets(paths)
+        assets = tuple(
+            RegisteredArtifact(
+                path=resolved,
+                filename=filename,
+                bytes=size,
+                sha256=_stream_sha256(resolved, expected_bytes=size),
+                mime=_artifact_mime(filename),
+            )
+            for filename, resolved, size in validated
+        )
+
+        previous_names = list(self._artifact_names)
+        previous_assets = [dict(asset) for asset in self._assets]
+        self._artifact_names.extend(asset.filename for asset in assets)
+        self._assets.extend(
+            {"name": asset.filename, "bytes": asset.bytes,
+             "sha256": asset.sha256, "mime": asset.mime}
+            for asset in assets
+        )
+        try:
+            self._write_manifest(status="active")
+        except Exception:
+            self._artifact_names = previous_names
+            self._assets = previous_assets
+            raise
+        return assets
+
     def register_existing_files(
         self, paths: tuple[str | os.PathLike[str], ...] | list[str | os.PathLike[str]],
     ) -> tuple[Path, ...]:
-        """Register host-created files in this job so manifest cleanup owns them.
+        """Compatibility wrapper returning only the registered paths.
 
-        Every input must already exist as a regular, non-link file directly in
-        this job directory. Validation is completed for the whole batch before
-        the manifest changes, so a malformed bridge response cannot partially
-        register a set of renders.
+        New callers should prefer :meth:`register_assets`, which also reports
+        the byte size, SHA-256 digest and media type of every owned file.
         """
+        return tuple(asset.path for asset in self.register_assets(paths))
+
+    def _validate_pending_assets(
+        self, paths: tuple[str | os.PathLike[str], ...] | list[str | os.PathLike[str]],
+    ) -> list[tuple[str, Path, int]]:
         if self._closed:
             raise ValidationError("Cannot register artifacts after workspace close")
         if not isinstance(paths, (tuple, list)) or not paths:
             raise ValidationError("paths must be a non-empty list of rendered files")
 
-        validated: list[tuple[str, Path]] = []
+        validated: list[tuple[str, Path, int]] = []
         seen: set[str] = set()
         for value in paths:
             if not isinstance(value, (str, os.PathLike)):
@@ -129,21 +194,24 @@ class AudioArtifactWorkspace:
                 raise ValidationError("Rendered artifact must be a direct child of its job directory",
                                       details={"path": str(path),
                                                "job_directory": str(self.directory_real)})
-            if filename in self._artifact_names:
+            if filename in self._artifact_names or any(
+                    asset.get("name") == filename for asset in self._assets):
                 raise ValidationError("Rendered artifact is already registered",
                                       details={"filename": filename})
-            validated.append((filename, resolved))
+            try:
+                size = resolved.stat().st_size
+            except OSError as exc:
+                raise ValidationError("Rendered artifact cannot be inspected",
+                                      details={"path": str(path),
+                                               "reason": str(exc)}) from exc
+            if size <= 0:
+                raise ValidationError("Rendered artifact must not be empty",
+                                      details={"path": str(path),
+                                               "filename": filename})
+            validated.append((filename, resolved, size))
+        return validated
 
-        previous_names = list(self._artifact_names)
-        self._artifact_names.extend(filename for filename, _ in validated)
-        try:
-            self._write_manifest(status="active")
-        except Exception:
-            self._artifact_names = previous_names
-            raise
-        return tuple(path for _, path in validated)
-
-    def close(self) -> CleanupReport:
+    def close(self, *, reclaim_orphans: bool = False) -> CleanupReport:
         if self._closed:
             return CleanupReport(self.job_id, (), (), not self.directory.exists())
         report = _cleanup_manifest_job(
@@ -152,6 +220,7 @@ class AudioArtifactWorkspace:
             self.directory_real,
             expected_job_id=self.job_id,
             expected_names=tuple(self._artifact_names),
+            reclaim_orphans=reclaim_orphans,
         )
         self._closed = report.removed_job_directory
         return report
@@ -177,6 +246,7 @@ class AudioArtifactWorkspace:
             "status": status,
             "created_epoch": self._created_epoch,
             "artifact_names": list(self._artifact_names),
+            "assets": [dict(asset) for asset in self._assets],
         }
         temp_path = self.directory / f".{_MANIFEST_NAME}.{self.job_id}.tmp"
         if temp_path.exists() or temp_path.is_symlink():
@@ -295,6 +365,38 @@ def cleanup_audio_job(
     )
 
 
+def _stream_sha256(path: Path, *, expected_bytes: int) -> str:
+    """Hash a registered file in bounded chunks and verify it stayed stable."""
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with path.open("rb") as stream:
+            while True:
+                chunk = stream.read(_HASH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                total += len(chunk)
+    except OSError as exc:
+        raise ValidationError("Rendered artifact cannot be hashed",
+                              details={"path": str(path),
+                                       "reason": str(exc)}) from exc
+    if total != expected_bytes:
+        raise ValidationError("Rendered artifact changed while it was hashed",
+                              details={"path": str(path),
+                                       "expected_bytes": expected_bytes,
+                                       "hashed_bytes": total})
+    return digest.hexdigest()
+
+
+def _artifact_mime(filename: str) -> str:
+    """Return the media type for an owned artifact name."""
+    if Path(filename).suffix.lower() == ".wav":
+        return "audio/wav"
+    mime, _encoding = mimetypes.guess_type(filename, strict=False)
+    return mime or "application/octet-stream"
+
+
 def _safe_artifact_name(name: object) -> bool:
     if (not isinstance(name, str) or _ARTIFACT_NAME.fullmatch(name) is None or
             name in {".", "..", _MANIFEST_NAME} or name[-1:] in {" ", "."}):
@@ -399,10 +501,21 @@ def _cleanup_manifest_job(
                     path.unlink()
             if preserved:
                 return CleanupReport(expected_job_id, tuple(removed),
-                                     tuple(preserved), False)
+                                     _unique(preserved), False)
             directory.rmdir()
             removed_directory = True
         except OSError:
             preserved.extend(str(path) for path in directory.iterdir())
 
-    return CleanupReport(expected_job_id, tuple(removed), tuple(preserved), removed_directory)
+    return CleanupReport(expected_job_id, tuple(removed), _unique(preserved),
+                         removed_directory)
+
+
+def _unique(paths: list[str]) -> tuple[str, ...]:
+    """Order-preserving de-duplication for cleanup reports.
+
+    A file that could not be unlinked is preserved by the name pass *and* seen
+    again by the final directory scan; reporting it twice would make the
+    preserved set look larger than the files actually left behind.
+    """
+    return tuple(dict.fromkeys(paths))

@@ -9,11 +9,12 @@ from reaper_audio.models import AudioBuffer, Section
 
 
 def _tone(source: str, frequency: float, sample_rate: int = 8_000,
-          amplitude: float = 0.2, start_s: float = 0.0) -> AudioBuffer:
+          amplitude: float = 0.2, start_s: float = 0.0,
+          provenance: dict | None = None) -> AudioBuffer:
     time = np.arange(sample_rate, dtype=np.float64) / sample_rate
     samples = amplitude * np.sin(2 * np.pi * frequency * time)
     return AudioBuffer(samples=samples, sample_rate=sample_rate, source=source,
-                       start_s=start_s)
+                       start_s=start_s, provenance=provenance or {})
 
 
 def test_bundle_runs_full_measurement_and_reference_comparison_once() -> None:
@@ -39,10 +40,45 @@ def test_bundle_runs_full_measurement_and_reference_comparison_once() -> None:
     assert timeline["coverage"]["status"] == "available"
     assert timeline["coverage"]["comparable_ticks"] > 0
     assert len(timeline["cells"][0]["bands"]) == 28
-    assert result["coverage"]["partial_loudness"] == "available"
-    assert set(result["partial_loudness"]["sources"]) == {"track-a"}
+    # No render provenance was declared, so the reconstruction gate withholds
+    # per-source values instead of attributing them to the master.
+    assert result["coverage"]["partial_loudness"] == "unavailable: missing_provenance"
+    assert result["partial_loudness"]["status"] == "unavailable"
+    assert result["partial_loudness"]["sources"] == {}
     tape_cell = result["sources"]["track-a"]["curves"]["temporal_profile"]["cells"][0]
+    assert "partial_loudness" not in tape_cell
+
+
+def test_partial_loudness_runs_when_renders_declare_node_stage_and_window() -> None:
+    sample_rate = 8_000
+    rng = np.random.default_rng(3)
+    stem_a = rng.standard_normal((sample_rate, 1)) * 0.05
+    stem_b = rng.standard_normal((sample_rate, 1)) * 0.04
+    common = {"stage": "sum_pre_master_fx", "channel_view": "stereo"}
+    buffers = {
+        "a": AudioBuffer(stem_a, sample_rate, source="a",
+                         provenance={"node": "track:A", **common}),
+        "b": AudioBuffer(stem_b, sample_rate, source="b",
+                         provenance={"node": "track:B", **common}),
+        "master": AudioBuffer(stem_a + stem_b, sample_rate, source="master",
+                              provenance={"node": "master", **common}),
+    }
+
+    result = analyze_bundle(buffers, mix_key="master", partial_hop_s=0.1)
+
+    assert result["coverage"]["partial_loudness"] == "available"
+    partial = result["partial_loudness"]
+    assert partial["status"] == "available"
+    assert partial["node"] == "master"
+    assert partial["stage"] == "sum_pre_master_fx"
+    assert partial["n_sources"] == 2
+    assert partial["gate"]["status"] == "pass"
+    assert set(partial["sources"]) == {"a", "b"}
+    tape_cell = result["sources"]["a"]["curves"]["temporal_profile"]["cells"][0]
     assert "partial_loudness" in tape_cell
+    assert tape_cell["partial_loudness"]["node"] == "master"
+    assert "partial_to_solo_ratio" in tape_cell["partial_loudness"]
+    assert "relative_audibility" not in tape_cell["partial_loudness"]
     assert set(tape_cell["partial_loudness"]["regions"]) == {
         "sub", "bass", "lowmid", "mid", "upmid", "pres", "air",
     }

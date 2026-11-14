@@ -101,6 +101,19 @@ def _band_balance_timeline(source_reports: Mapping[str, MeasurementReport]) -> d
     }
 
 
+def _render_provenance(buffer: AudioBuffer | None) -> dict:
+    """Declared render facts a buffer may carry for the attribution gate.
+
+    ``partial.attribute_partial_loudness`` needs to know which node, stage and
+    channel view a render came from. Buffers that do not carry those keys stay
+    undeclared, and the gate then reports missing provenance instead of
+    attributing anything.
+    """
+    provenance = buffer.provenance if isinstance(buffer, AudioBuffer) else {}
+    return {key: provenance[key] for key in ("node", "stage", "channel_view", "window")
+            if provenance.get(key) is not None}
+
+
 def analyze_bundle(
     sources: Mapping[str, AudioBuffer],
     *,
@@ -281,20 +294,32 @@ def analyze_bundle(
     band_balance_timeline = _band_balance_timeline(source_reports)
 
     partial_loudness = None
+    partial_coverage = "not_requested: pass mix_key to identify the rendered mix source"
     if mix_key is not None:
         partial_sources = {key: audio for key, audio in sources.items() if key != mix_key}
+        mix_render = _render_provenance(sources[mix_key])
         partial_loudness = attribute_partial_loudness(
             sources[mix_key], partial_sources, section=section,
             model=partial_model, hop_s=partial_hop_s,
+            node=mix_render.get("node"), stage=mix_render.get("stage"),
+            channel_view=mix_render.get("channel_view"),
+            source_provenance={key: _render_provenance(audio)
+                               for key, audio in partial_sources.items()},
         )
-        partial_time = partial_loudness["sources"]
-        for source_id, source_data in partial_time.items():
+        if partial_loudness["status"] != "available":
+            partial_coverage = f"unavailable: {partial_loudness['reason']}"
+        else:
+            partial_coverage = "available"
+        for source_id, source_data in (partial_loudness.get("sources") or {}).items():
             profile = source_reports[source_id].curves["temporal_profile"]
             series = source_data["time_series"]
             source_times = np.asarray(series["time_s"], dtype=np.float64)
             for cell, time_s in zip(profile["cells"], profile["times"]):
                 cell["partial_loudness"] = {
                     "model": partial_loudness["model"],
+                    "status": partial_loudness["status"],
+                    "node": partial_loudness["node"],
+                    "stage": partial_loudness["stage"],
                     "mix_sones": float(np.interp(time_s, source_times,
                                                  series["mix_sones"])),
                     "source_solo_sones": float(np.interp(
@@ -303,8 +328,8 @@ def analyze_bundle(
                     "source_partial_sones": float(np.interp(
                         time_s, source_times, series["source_partial_sones"]
                     )),
-                    "relative_audibility": float(np.interp(
-                        time_s, source_times, series["relative_audibility"]
+                    "partial_to_solo_ratio": float(np.interp(
+                        time_s, source_times, series["partial_to_solo_ratio"]
                     )),
                     "regions": {
                         name: {
@@ -314,8 +339,8 @@ def analyze_bundle(
                             "source_partial_sones": float(np.interp(
                                 time_s, source_times, region_series["source_partial_sones"]
                             )),
-                            "relative_audibility": float(np.interp(
-                                time_s, source_times, region_series["relative_audibility"]
+                            "partial_to_solo_ratio": float(np.interp(
+                                time_s, source_times, region_series["partial_to_solo_ratio"]
                             )),
                         }
                         for name, region in source_data["regions"].items()
@@ -353,8 +378,7 @@ def analyze_bundle(
             "pairwise_comparisons": "complete" if include_pairwise else
                 "not_requested: enable include_pairwise for all source pairs",
             "pairwise_phase": phase_coverage,
-            "partial_loudness": "available" if partial_loudness is not None else
-                "not_requested: pass mix_key to identify the rendered mix source",
+            "partial_loudness": partial_coverage,
             "cross_source_band_timeline":
                 band_balance_timeline["coverage"]["status"],
             "interpretation": (

@@ -6,10 +6,21 @@ roles or recommended edits.
 """
 from __future__ import annotations
 
+from bisect import bisect_left
+
 import numpy as np
 
 HOP_S = 0.002          # 2 мс — хватает на 32-е при 300 BPM (37 мс)
 WIN_S = 0.004          # окно огибающей 4 мс
+
+
+def _has_near_event(event_times: list[float], candidate_t: float,
+                    tolerance_s: float = 0.05) -> bool:
+    """Exact nearest-neighbour replacement for a linear event scan."""
+    pos = bisect_left(event_times, candidate_t)
+    return ((pos < len(event_times) and
+             abs(candidate_t - event_times[pos]) < tolerance_s) or
+            (pos > 0 and abs(candidate_t - event_times[pos - 1]) < tolerance_s))
 
 
 def _envelope(samples: np.ndarray, fs: int, hop_s: float = HOP_S,
@@ -21,12 +32,19 @@ def _envelope(samples: np.ndarray, fs: int, hop_s: float = HOP_S,
     hop = max(1, int(hop_s * fs))
     win = max(hop, int(win_s * fs))
     n = max(1, (len(data) - win) // hop + 1)
-    peaks = np.zeros(n)
-    rmss = np.zeros(n)
-    for i in range(n):
-        seg = data[i * hop:i * hop + win]
-        peaks[i] = np.max(np.abs(seg))
-        rmss[i] = np.sqrt(np.mean(seg ** 2))
+    if len(data) < win:
+        # Keep the historical short-input behavior: the one window is shorter
+        # than win and is measured as-is.
+        peaks = np.zeros(1)
+        rmss = np.zeros(1)
+        segments = [data[0:win]]
+        peaks[0] = np.max(np.abs(segments[0]))
+        rmss[0] = np.sqrt(np.mean(segments[0] ** 2))
+    else:
+        windows = np.lib.stride_tricks.sliding_window_view(data, win, axis=0)
+        windows = windows[::hop][:n]
+        peaks = np.max(np.abs(windows), axis=(1, 2))
+        rmss = np.sqrt(np.mean(windows ** 2, axis=(1, 2)))
     times = np.arange(n) * hop / fs
     return times, peaks, rmss
 
@@ -133,14 +151,18 @@ def detect_events(stereo: np.ndarray, fs: int = 44100, hop_s: float = HOP_S,
 
     # --- скачки громкости (внезапно громко)
     w = max(1, int(spike_window_s / hop_s))
+    event_times = sorted(ev["t"] for ev in events)
     for i in range(w, len(db)):
         jump = db[i] - db[i - w]
         if jump >= spike_db and db[i] > -40:
-            if any(abs(times[i] - e["t"]) < 0.05 for e in events):
+            candidate_t = float(times[i])
+            if _has_near_event(event_times, candidate_t):
                 continue
-            events.append({"t": round(float(times[i]), 3), "kind": "spike",
+            rounded_t = round(candidate_t, 3)
+            events.append({"t": rounded_t, "kind": "spike",
                            "level_db": round(float(db[i]), 1),
                            "jump_db": round(float(jump), 1)})
+            event_times.insert(bisect_left(event_times, rounded_t), rounded_t)
 
     # --- перегруз
     clip_idx = np.where(np.any(np.abs(x) >= 0.999, axis=1))[0]

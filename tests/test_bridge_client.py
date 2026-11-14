@@ -142,6 +142,16 @@ def test_capture_render_validates_track_and_master_files(tmp_path, monkeypatch) 
             "revision": {**revision, "identity_basis": "master_track_guid_and_project_path"},
             "revision_after": revision,
             "capture_point": "native_render_track_stems_plus_master",
+            "render_action": "Render project",
+            "render_settings_used": {
+                "RENDER_SETTINGS": 1, "RENDER_BOUNDSFLAG": 1, "RENDER_CHANNELS": 2,
+                "RENDER_SRATE": 0, "RENDER_TAILFLAG": 0, "RENDER_TAILMS": 0,
+                "RENDER_ADDTOPROJ": 0,
+            },
+            "channels": 2,
+            "sample_rate": 48000,
+            "tail_s": 0.0,
+            "restore_report": {"restored": True, "failures": []},
             "files": [
                 {"source_guid": "{TRACK}", "name": "Guitar", "track_index": 0,
                  "is_master": False, "path": str(track_path),
@@ -162,6 +172,53 @@ def test_capture_render_validates_track_and_master_files(tmp_path, monkeypatch) 
     assert observed["arguments"]["output_dir"] == str(tmp_path.resolve())
 
 
+def test_capture_render_accepts_selected_tracks_via_master_batch(tmp_path, monkeypatch) -> None:
+    bridge = ReaperBridge(tmp_path)
+    revision = {"project_id": "project-1", "change_count": 8, "path": "C:/mix.rpp"}
+    track_path = tmp_path / "track.wav"
+    track_path.write_bytes(b"batch track" + bytes(64))
+    observed = {}
+
+    def fake_call(operation, arguments=None, *, timeout_s=10.0):
+        observed["operation"] = operation
+        observed["arguments"] = arguments
+        return {
+            "project_id": "project-1",
+            "revision": revision,
+            "revision_after": revision,
+            "capture_point": "native_render_selected_tracks_via_master",
+            "render_action": "Render project",
+            "render_settings_used": {
+                "RENDER_SETTINGS": 128, "RENDER_BOUNDSFLAG": 1, "RENDER_CHANNELS": 2,
+                "RENDER_SRATE": 48000, "RENDER_TAILFLAG": 0, "RENDER_TAILMS": 0,
+                "RENDER_ADDTOPROJ": 0,
+            },
+            "channels": 2,
+            "sample_rate": 48000,
+            "tail_s": 0.0,
+            "restore_report": {"restored": True, "failures": []},
+            "master_included": False,
+            "files": [
+                {"source_guid": "{TRACK}", "name": "Guitar", "track_index": 0,
+                 "is_master": False, "path": str(track_path),
+                 "bytes": track_path.stat().st_size},
+            ],
+        }
+
+    monkeypatch.setattr(bridge, "call", fake_call)
+    result = bridge.capture_render(
+        expected_revision=revision, output_dir=tmp_path, job_id="job-batch",
+        expected_track_count=1, selected_tracks_via_master=True,
+        parallel_via_master=True, render_settings=128, sample_rate=48000,
+    )
+
+    assert len(result["files"]) == 1
+    assert observed["arguments"]["selected_tracks_via_master"] is True
+    assert observed["arguments"]["parallel_via_master"] is True
+    assert observed["arguments"]["render_settings"] == 128
+    assert observed["arguments"]["master_only"] is False
+
+
 def test_capture_render_rejects_incomplete_render_set(tmp_path, monkeypatch) -> None:
     bridge = ReaperBridge(tmp_path)
     revision = {"project_id": "project-1", "change_count": 8, "path": "C:/mix.rpp"}
@@ -171,6 +228,16 @@ def test_capture_render_rejects_incomplete_render_set(tmp_path, monkeypatch) -> 
         "project_id": "project-1", "revision": revision,
         "revision_after": revision,
         "capture_point": "native_render_track_stems_plus_master",
+        "render_action": "Render project",
+        "render_settings_used": {
+            "RENDER_SETTINGS": 1, "RENDER_BOUNDSFLAG": 1, "RENDER_CHANNELS": 2,
+            "RENDER_SRATE": 0, "RENDER_TAILFLAG": 0, "RENDER_TAILMS": 0,
+            "RENDER_ADDTOPROJ": 0,
+        },
+        "channels": 2,
+        "sample_rate": 48000,
+        "tail_s": 0.0,
+        "restore_report": {"restored": True, "failures": []},
         "files": [{"source_guid": "{MASTER}", "name": "MASTER", "track_index": -1,
                    "is_master": True, "path": str(audio_path),
                    "bytes": audio_path.stat().st_size}],
@@ -252,3 +319,118 @@ def test_default_bridge_requires_explicit_choice_for_multiple_instances(tmp_path
 
     with pytest.raises(ValidationError, match="Multiple REAPER instances"):
         ReaperBridge()._resolve_runtime_dir()
+
+
+def _subset_response(revision, files, *, echo, master_included=False):
+    return {
+        "project_id": "project-1", "revision": revision,
+        "revision_after": revision,
+        "capture_point": "native_render_selected_tracks_via_master",
+        "render_action": "Render project",
+        "render_settings_used": {
+            "RENDER_SETTINGS": 128, "RENDER_BOUNDSFLAG": 1, "RENDER_CHANNELS": 2,
+            "RENDER_SRATE": 48000, "RENDER_TAILFLAG": 0, "RENDER_TAILMS": 0,
+            "RENDER_ADDTOPROJ": 0,
+        },
+        "channels": 2,
+        "sample_rate": 48000,
+        "tail_s": 0.0,
+        "restore_report": {"restored": True, "failures": []},
+        "master_included": master_included,
+        "target_track_count": len(files),
+        "track_guids": echo,
+        "files": files,
+    }
+
+
+def _subset_files(tmp_path, guids, indexes):
+    files = []
+    for position, (guid, index) in enumerate(zip(guids, indexes, strict=True)):
+        path = tmp_path / f"subset-{position}.wav"
+        path.write_bytes(b"subset render" + bytes(64))
+        files.append({"source_guid": guid, "name": f"Track {index}",
+                      "track_index": index, "is_master": False,
+                      "path": str(path), "bytes": path.stat().st_size})
+    return files
+
+
+def test_capture_render_accepts_a_track_subset_outside_expected_index_range(
+        tmp_path, monkeypatch) -> None:
+    bridge = ReaperBridge(tmp_path)
+    revision = {"project_id": "project-1", "change_count": 8, "path": "C:/mix.rpp"}
+    guids = ["{TRACK-A}", "{TRACK-B}"]
+    files = _subset_files(tmp_path, guids, [5, 30])
+    observed = {}
+
+    def fake_call(operation, arguments=None, *, timeout_s=10.0):
+        observed["arguments"] = arguments
+        return _subset_response(revision, files, echo=list(guids))
+
+    monkeypatch.setattr(bridge, "call", fake_call)
+    result = bridge.capture_render(
+        expected_revision=revision, output_dir=tmp_path, job_id="job-subset",
+        expected_track_count=2, selected_tracks_via_master=True,
+        parallel_via_master=True, track_guids=guids, render_settings=128,
+        sample_rate=48000,
+    )
+
+    assert len(result["files"]) == 2
+    assert observed["arguments"]["track_guids"] == guids
+    assert result["target_track_count"] == 2
+
+
+def test_capture_render_subset_requires_matching_expected_track_count(tmp_path) -> None:
+    bridge = ReaperBridge(tmp_path)
+    revision = {"project_id": "project-1", "change_count": 8, "path": "C:/mix.rpp"}
+    with pytest.raises(ValidationError, match="subset size"):
+        bridge.capture_render(expected_revision=revision, output_dir=tmp_path,
+                              job_id="job-subset", expected_track_count=3,
+                              selected_tracks_via_master=True,
+                              track_guids=["{A}", "{B}"])
+
+
+def test_capture_render_subset_rejects_empty_duplicate_and_master_only(tmp_path) -> None:
+    bridge = ReaperBridge(tmp_path)
+    revision = {"project_id": "project-1", "change_count": 8, "path": "C:/mix.rpp"}
+    with pytest.raises(ValidationError, match="track_guids"):
+        bridge.capture_render(expected_revision=revision, output_dir=tmp_path,
+                              job_id="job-subset", expected_track_count=0,
+                              selected_tracks_via_master=True, track_guids=[])
+    with pytest.raises(ValidationError, match="repeat"):
+        bridge.capture_render(expected_revision=revision, output_dir=tmp_path,
+                              job_id="job-subset", expected_track_count=2,
+                              selected_tracks_via_master=True,
+                              track_guids=["{A}", "{A}"])
+    with pytest.raises(ValidationError, match="master_only"):
+        bridge.capture_render(expected_revision=revision, output_dir=tmp_path,
+                              job_id="job-subset", expected_track_count=1,
+                              master_only=True, track_guids=["{A}"])
+
+
+def test_capture_render_subset_requires_a_bridge_echo(tmp_path, monkeypatch) -> None:
+    bridge = ReaperBridge(tmp_path)
+    revision = {"project_id": "project-1", "change_count": 8, "path": "C:/mix.rpp"}
+    guids = ["{TRACK-A}", "{TRACK-B}"]
+    files = _subset_files(tmp_path, guids, [0, 1])
+    monkeypatch.setattr(bridge, "call", lambda *args, **kwargs: _subset_response(
+        revision, files, echo=None))
+    with pytest.raises(BridgeUnavailable, match="track subset"):
+        bridge.capture_render(expected_revision=revision, output_dir=tmp_path,
+                              job_id="job-subset", expected_track_count=2,
+                              selected_tracks_via_master=True, track_guids=guids,
+                              sample_rate=48000)
+
+
+def test_capture_render_subset_rejects_a_file_outside_the_subset(tmp_path,
+                                                                 monkeypatch) -> None:
+    bridge = ReaperBridge(tmp_path)
+    revision = {"project_id": "project-1", "change_count": 8, "path": "C:/mix.rpp"}
+    guids = ["{TRACK-A}", "{TRACK-B}"]
+    files = _subset_files(tmp_path, ["{TRACK-A}", "{TRACK-C}"], [0, 7])
+    monkeypatch.setattr(bridge, "call", lambda *args, **kwargs: _subset_response(
+        revision, files, echo=list(guids)))
+    with pytest.raises(BridgeUnavailable, match="outside the requested capture subset"):
+        bridge.capture_render(expected_revision=revision, output_dir=tmp_path,
+                              job_id="job-subset", expected_track_count=2,
+                              selected_tracks_via_master=True, track_guids=guids,
+                              sample_rate=48000)
