@@ -256,13 +256,28 @@ is not a frozen historical snapshot.
 
 ## Analyze and listen
 
-Call `reaper_analyze` once **after the complete-view receipt for this project and
-revision** to run the available analysis suite on all project tracks and the master.
-It can analyze a project-time section (`start_s`,
-`end_s`), compare full reference files through `reference_paths`, select
-reference-file-local excerpts with `reference_windows`, request selected phase
-comparisons, or request all pairwise comparisons. Pairwise work grows with
-source count; use it when it supports the current question.
+`reaper_analyze` has two project-audio modes. For a live project, call it after
+the complete-view receipt for that project and revision; without `capture_id` it
+renders and analyzes every project track and the master. If an exact durable
+capture already exists, use its `capture_id` and `archive_root` from
+`reaper_capture_snapshot`, together with the receipt acknowledged for that same
+capture. This archive mode reads the verified capture WAVs and makes no REAPER
+bridge call or project render. For the exact captured window with no rendered
+tail, stored per-source measurements are reused. A selected subwindow, a
+rendered tail, or stored measurements that do not exactly cover the requested
+window cause the WAV to be remeasured from the archive; they still do not cause
+a REAPER render. The result is bound to that capture's revision and is not
+evidence of any later project edits. Capture mode rejects requests to change
+sample rate, channel layout, or add a render tail rather than silently creating
+a new render.
+
+Both modes can analyze a project-time section (`start_s`, `end_s`), compare full
+reference files through `reference_paths`, select reference-file-local excerpts
+with `reference_windows`, request selected phase comparisons, or request all
+pairwise comparisons. Pairwise work grows with source count; use it when it
+supports the current question. Prefer archive mode to compare references with
+the exact audio and measurements already delivered in a capture; make a fresh
+capture only when the project state or requested signal is genuinely different.
 
 Project and reference time are separate timelines. Never assume that a project
 selection such as 40–48 seconds identifies the matching passage in a reference

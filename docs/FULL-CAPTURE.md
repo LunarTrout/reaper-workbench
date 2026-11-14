@@ -3,6 +3,21 @@
 A full capture is one immutable record linking the project map, one audio asset
 per project track plus the master, and one analysis report per asset.
 
+## Reuse a capture for reference analysis
+
+`reaper_analyze(capture_id=..., archive_root=..., panorama_receipt=...)` can
+compare reference files with an existing `reaper_capture_snapshot` without
+rendering the project again. The receipt must acknowledge the panorama for that
+exact capture. On the exact capture window, when no rendered tail extends the
+measured signal, the server reuses the stored per-source analysis reports. For
+a selected subwindow or an analysis that needs samples, it reads the verified
+content-addressed WAVs and analyzes the requested interval; this still does not
+call REAPER or create another render. Sample rate, channel layout, and render
+tail cannot be changed in this mode. The comparison is evidence for the
+capture's revision only; it cannot authorize claims about later edits. The
+analysis lease points to durable archive audio, so releasing the lease does not
+delete the capture.
+
 ## Master render gate
 
 The master-only render is validated before a capture is accepted. The gate is
