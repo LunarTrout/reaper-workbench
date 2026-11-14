@@ -249,7 +249,13 @@ server = MCPServer(
         "mean an audio-capable client delivered sound to the model. Only that complete receipt unlocks analysis, exact "
         "queries and edits. A partial set returns the missing page ids; a stale revision needs a new open. "
         "Create a capture with reaper_capture_snapshot only when no capture matches the "
-        "revision. Do not interpret project audio or edit from a partial panorama. Exact "
+        "revision. Do not interpret project audio or edit from a partial panorama. If "
+        "reaper_capture_snapshot returns panorama_capacity_exceeded with details.capture_id "
+        "and says the canonical record remains archived, only one-shot delivery failed: do "
+        "not capture again. Open that exact capture with reaper_panorama_open using the same "
+        "project_id/archive_root, fetch every page and acknowledge all hashes, then use "
+        "archive-mode reaper_analyze for that capture and receipt. Its measurements apply "
+        "only to the archived revision. Exact "
         "high-frequency rows "
         "(relation edges, series cells, MIDI notes, envelope points) come from "
         "reaper_panorama_query by semantic selection. "
@@ -319,7 +325,12 @@ def _next_action(code: str) -> str:
         "analysis_unavailable": "Inspect capture and analysis details, then retry a smaller time range if appropriate.",
         "capture_master_invalid": "The capture is archived as invalid evidence; inspect master_attempts and re-render after fixing the master signal path.",
         "media_unresolved": "Inspect the named take source paths and online/offline state; bring the media online before capturing rather than accepting silence.",
-        "panorama_capacity_exceeded": "Request a smaller capture section or raise the explicit panorama capacity; the canonical record remains archived.",
+        "panorama_capacity_exceeded": ("If details include capture_id and say the canonical record remains archived, "
+                                         "do not repeat reaper_capture_snapshot: open that exact capture with "
+                                         "reaper_panorama_open using the same project_id/archive_root, fetch every "
+                                         "page, acknowledge all hashes, then use archive-mode reaper_analyze for that "
+                                         "capture revision. Otherwise inspect the full error before deciding whether "
+                                         "a new capture is needed."),
         "panorama_binding_invalid": "Do not use this sidecar; rebuild the panorama from the verified canonical record.",
         "artifact_cleanup_failed": "Do not delete the directory manually; inspect the manifest and preserved paths.",
         "render_budget_exceeded": "Choose a shorter interval or a lower sample rate; the candidate is not delivered over budget.",
