@@ -546,3 +546,26 @@ def test_status_never_echoes_legacy_page_state(tmp_path: Path) -> None:
         "max_response_bytes": 24576,
         "fits": True,
     }
+
+
+def test_project_id_matching_normalizes_path_separators_and_case(tmp_path: Path) -> None:
+    root = _archive(tmp_path)
+    archived = "reaper:{AB}:C:/Music/Track.rpp"
+    _capture(root, "cap_0000000N", archived, 7)
+    lifecycle = PanoramaLifecycle(root, page_bytes=180)
+
+    requested = r"reaper:{ab}:c:\music\track.rpp"
+    opened = lifecycle.open(requested)
+    assert opened["status"] == "complete"
+    status = lifecycle.status(requested, opened["handle"])
+    assert status["latest"]["capture_id"] == "cap_0000000N"
+    assert status["handle"]["delivered"] is True
+
+
+def test_revisions_match_ignores_path_separator_and_case() -> None:
+    from reaper_audio.context.lifecycle import revisions_match
+
+    stored = _revision("reaper:{AB}:C:/Music/Track.rpp", 7)
+    asked = dict(stored, project_id=r"reaper:{ab}:c:\music\track.rpp",
+                 path=r"c:\music\track.rpp")
+    assert revisions_match(stored, asked) is True
