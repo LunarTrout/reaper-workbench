@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from reaper_audio.context.lifecycle import PanoramaLifecycle, fact_root
+from reaper_audio.context.lifecycle import (
+    PanoramaLifecycle, document_hash, fact_root,
+)
 from reaper_audio.context.full_capture import CaptureArchive
 from reaper_audio.context.panorama import PANORAMA_SCHEMA_VERSION
 from reaper_audio.errors import StaleContext, ValidationError
@@ -571,3 +573,46 @@ def test_revisions_match_ignores_path_separator_and_case() -> None:
     asked = dict(stored, project_id="reaper:{ab}:c:\\music\\track.rpp",
                  path="c:\\music\\track.rpp")
     assert revisions_match(stored, asked) is True
+
+
+def test_projection_view_root_is_accepted_for_full_and_structural_tokens(
+        tmp_path: Path) -> None:
+    """A real panorama view hash is not the capture document hash.
+
+    Full tokens and structural-edit delta chains must anchor on the capture
+    document while carrying the projected view root; comparing the two roots
+    directly made every undo fail closed on a real (non-fixture) capture.
+    """
+    from reaper_audio.context.changes import next_view_root
+
+    root = _archive(tmp_path)
+    _capture(root, "cap_00000001", "project-1", 1)
+    lifecycle = PanoramaLifecycle(root)
+    document = lifecycle._document("cap_00000001")
+    document_sha = document_hash(document)
+    view_root = "a" * 64
+    first = _revision("project-1", 1)
+    full = lifecycle._mint_context(
+        "project-1", "cap_00000001", first, fact_root(document), document_sha,
+        kind="full", view_root=view_root)
+    assert lifecycle.require_receipt(full["token"], "project-1", first)["complete"]
+
+    delta_id, delta_sha = "dl_projection", "b" * 64
+    second = _revision("project-1", 2)
+    record = {
+        "delta_id": delta_id, "delta_hash": delta_sha, "project_id": "project-1",
+        "kind": "edit",
+        "base": {"view_root": view_root, "document_hash": document_sha,
+                 "revision": first},
+        "target": {"revision": second},
+    }
+    (lifecycle.deltas_dir / f"{delta_id}.json").write_text(
+        json.dumps(record), encoding="utf-8")
+    successor = lifecycle._mint_context(
+        "project-1", "cap_00000001", second, fact_root(document), document_sha,
+        kind="delta", predecessor=full["token"], delta_id=delta_id,
+        view_root=next_view_root(view_root, delta_sha),
+        delta_chain=[{"delta_id": delta_id, "delta_hash": delta_sha,
+                      "revision": second}])
+    assert lifecycle.require_receipt(successor["token"], "project-1",
+                                     second)["complete"]

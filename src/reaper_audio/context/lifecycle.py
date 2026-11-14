@@ -2779,8 +2779,15 @@ class PanoramaLifecycle:
         """
         chain = data.get("delta_chain")
         if not isinstance(chain, list) or not chain:
-            if str(data.get("view_root")) != str(data.get("document_hash")):
-                raise StaleContext("Panorama view root does not match its capture")
+            # A full capture token may carry a view root that differs from the
+            # capture document hash: the view is a projection, so its sheet
+            # hash is not the document hash.  Anchor the token on the capture
+            # document instead of comparing two different kinds of root.
+            capture_id = str(data.get("capture_id") or "")
+            if capture_id and self._index_row(capture_id) is not None:
+                if str(data.get("document_hash") or "") != document_hash(
+                        self._document(capture_id)):
+                    raise StaleContext("Panorama view root does not match its capture")
             return
         # The chain is rooted in one immutable capture.  Recompute its document
         # hash instead of trusting the token's copy: a replaced or truncated
@@ -2793,7 +2800,15 @@ class PanoramaLifecycle:
         if str(data.get("document_hash") or "") != document_hash(base_document):
             raise StaleContext("Delta context base document no longer matches its hash",
                                details={"capture_id": capture_id})
-        current = str(data.get("document_hash"))
+        first = chain[0] if isinstance(chain[0], Mapping) else {}
+        first_id = str(first.get("delta_id") or "")
+        first_record = self._load_change(first_id) if first_id else {}
+        first_base = first_record.get("base")
+        anchor = first_base if isinstance(first_base, Mapping) else {}
+        if str(anchor.get("document_hash") or "") != str(data.get("document_hash")):
+            raise StaleContext("Panorama delta chain starts from another capture",
+                               details={"delta_id": first_id})
+        current = str(anchor.get("view_root") or data.get("document_hash"))
         previous_revision: Mapping[str, Any] | None = None
         for entry in chain:
             if not isinstance(entry, Mapping):

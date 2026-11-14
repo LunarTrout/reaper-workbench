@@ -72,6 +72,42 @@ _LAST_PANORAMA_ROOT: str | None = None
 _API_GATE_BYPASS = threading.local()
 
 
+
+def _focus_reaper_window() -> bool:
+    """Bring REAPER to the foreground before a native render.
+
+    REAPER may close media files while its main window is inactive; the bridge
+    then reads zero-length sources and refuses to render silence.  Focusing the
+    host reopens them.  Best effort: never raises, never blocks a render.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        found: list[int] = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _collect(hwnd, _lparam):
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length:
+                buffer = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buffer, length + 1)
+                if "REAPER" in buffer.value:
+                    found.append(hwnd)
+            return True
+
+        user32.EnumWindows(_collect, 0)
+        for hwnd in found:
+            user32.ShowWindow(hwnd, 9)
+            if user32.SetForegroundWindow(hwnd):
+                time.sleep(0.35)
+                return True
+    except Exception:
+        return False
+    return bool(found)
+
 def _panorama_lifecycle(archive_root: str | None = None,
                         page_bytes: int | None = None) -> PanoramaLifecycle:
     """Resolve the lifecycle store for an archive; keep one per absolute root."""
@@ -90,7 +126,8 @@ def _require_panorama_receipt(receipt: str | None, project_id: str,
                               expected_revision: Mapping[str, Any] | None,
                               archive_root: str | None = None,
                               expected_fact_root: str | None = None,
-                              *, require_audio_fresh: bool = False) -> dict[str, Any]:
+                              *, require_audio_fresh: bool = False,
+                              expected_capture_id: str | None = None) -> dict[str, Any]:
     """Fail closed unless a complete, revision-matched panorama receipt exists."""
     if not receipt:
         raise ValidationError(
@@ -103,13 +140,16 @@ def _require_panorama_receipt(receipt: str | None, project_id: str,
     lifecycle = _panorama_lifecycle(archive_root)
     return lifecycle.require_receipt(receipt, project_id, expected_revision,
                                      expected_fact_root=expected_fact_root,
-                                     require_audio_fresh=require_audio_fresh)
+                                     require_audio_fresh=require_audio_fresh,
+                                     expected_capture_id=expected_capture_id)
 
 
 def _require_interpretation_receipt(receipt: str | None, project_id: str,
                                     expected_revision: Mapping[str, Any] | None,
                                     archive_root: str | None = None,
-                                    expected_fact_root: str | None = None) -> dict[str, Any]:
+                                    expected_fact_root: str | None = None,
+                                    *,
+                                    expected_capture_id: str | None = None) -> dict[str, Any]:
     """Gate model-facing interpretation, not the bootstrap capture itself.
 
     The first full capture creates the evidence document and is deliberately
@@ -119,6 +159,11 @@ def _require_interpretation_receipt(receipt: str | None, project_id: str,
     current. A structural delta can authorize edits but never audio
     interpretation: only a fresh capture does that. The server cannot observe
     private model reasoning; this gates tool access, not thought.
+
+    ``expected_capture_id`` binds the receipt to the capture the evidence was
+    measured from. Without it a receipt is checked against the latest capture
+    in the archive, which invalidates an older analysis as soon as any newer
+    capture is written, even though its revision and fact root still match.
     """
     if not receipt:
         raise ValidationError(
@@ -131,7 +176,8 @@ def _require_interpretation_receipt(receipt: str | None, project_id: str,
                      "gate": "panorama_interpretation"})
     return _require_panorama_receipt(receipt, project_id, expected_revision,
                                      archive_root, expected_fact_root,
-                                     require_audio_fresh=True)
+                                     require_audio_fresh=True,
+                                     expected_capture_id=expected_capture_id)
 
 
 def _require_capture_read_receipt(receipt: str | None, project_id: str,
@@ -623,6 +669,21 @@ def _prune_analysis_state() -> None:
     cleanup_stale_audio_jobs(_AUDIO_ROOT, max_age_s=_ANALYSIS_TTL_S, now_epoch=now)
 
 
+def _record_capture_id(record: Mapping[str, Any]) -> str | None:
+    """Return the capture an analysis record measured, when it names one.
+
+    Analysis is bound to the revision before its own render churn; that
+    revision carries the capture id.  Interpretation gates must compare the
+    receipt to this capture, never to whatever capture was archived later.
+    """
+    revision = record.get("revision")
+    if isinstance(revision, Mapping):
+        value = revision.get("capture_id")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _report_without_local_paths(report: dict[str, Any]) -> dict[str, Any]:
     safe = dict(report)
     safe.pop("audio_files", None)
@@ -937,6 +998,7 @@ def reaper_analyze(project_id: str | None = None,
     sample_rate are the render request. All three options affect only the
     project capture: reference files and reference windows are read unchanged.
     """
+    _focus_reaper_window()
     if (start_s is None) != (end_s is None):
         raise ValidationError("start_s and end_s must be supplied together")
     section = Section(start_s, end_s) if start_s is not None else None
@@ -1142,6 +1204,7 @@ def reaper_edit_map(analysis_id: str,
     _require_interpretation_receipt(
         panorama_receipt, str(record.get("project_id") or ""),
         record.get("revision"), archive_root,
+        expected_capture_id=_record_capture_id(record),
     )
     points = tempo_points_from_report(report)
     edit_map = build_edit_map_from_report(
@@ -1179,6 +1242,7 @@ def reaper_mix_evidence(analysis_id: str,
     _require_interpretation_receipt(
         panorama_receipt, str(record.get("project_id") or ""),
         record.get("revision"), archive_root,
+        expected_capture_id=_record_capture_id(record),
     )
     evidence = build_mix_evidence(report)
     return {
@@ -1447,6 +1511,7 @@ def reaper_render_candidate(
     candidate for this project; release it with
     ``reaper_release(analysis_id=candidate_id)`` or let its lease expire.
     """
+    _focus_reaper_window()
     if not isinstance(plan_id, str) or not plan_id:
         raise ValidationError("plan_id must be the id returned by reaper_edit preview/apply")
     if not isinstance(project_id, str) or not project_id:
@@ -1932,7 +1997,7 @@ def reaper_save(mode: str,
         result_value["delta"] = None
         result_value["next_call"] = {
             "tool": "reaper_capture_snapshot",
-            "project_id": project_id,
+            "project_id": str(after_revision.get("project_id") or project_id),
             "then": ("Saving moved the project revision or path; the current context "
                      "token no longer matches. Capture again or refresh the structural "
                      "context before editing. No factual delta is invented for a save."),
@@ -2507,9 +2572,10 @@ def reaper_capture_snapshot(project_id: str,
 
     The bootstrap call returns capture/archive metadata only.  It deliberately
     does not return the panorama payload: call ``reaper_panorama_open`` for the
-    new capture and read the one-response project view (receipt and context
-    token included) before interpreting.
+    new capture, fetch every page it announces with ``reaper_panorama_page``,
+    then ``reaper_panorama_ack`` with every page hash before interpreting.
     """
+    _focus_reaper_window()
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)
     _current_context(session, expected)
@@ -2531,13 +2597,15 @@ def reaper_capture_snapshot(project_id: str,
         "interpretation_allowed": False,
         "complete_view_required": True,
         "reason": ("bootstrap capture returns metadata only; open the panorama to receive "
-                   "the whole project view and its receipt in one response"),
+                   "page 1 and the manifest, fetch every page, then acknowledge them"),
         "next_action": {
             "tool": "reaper_panorama_open",
             "project_id": project_id,
             "archive_root": archive_root,
             "capture_id": safe.get("capture_id"),
-            "returns": ["view", "receipt", "context_token"],
+            "returns": ["page_1", "manifest"],
+            "then": ("fetch every page_id with reaper_panorama_page, then call "
+                     "reaper_panorama_ack with every page_hash in order"),
         },
     }
     serialization_end = time.perf_counter()
