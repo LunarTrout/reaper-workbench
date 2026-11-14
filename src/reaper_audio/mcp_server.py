@@ -7,6 +7,7 @@ process memory.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from functools import wraps
 from math import isfinite
 from pathlib import Path
@@ -26,9 +27,11 @@ from pydantic import StrictInt
 
 from .analysis.artifacts import cleanup_audio_job, cleanup_stale_audio_jobs
 from .analysis.audio import load_audio
+from .analysis.bundle import analyze_bundle
 from .analysis.edit_map_report import (build_edit_map_from_report,
                                        tempo_points_from_report)
 from .analysis.mix_evidence import build_mix_evidence
+from .analysis.metrics import measure_audio
 from .daw.session import EditOperation, EditPlan, ProjectRevision, ProjectSession
 from .daw.full_capture import FullCaptureService
 from .context.full_capture import CaptureArchive, FullCaptureRecord
@@ -42,7 +45,7 @@ from .context.identity import identity_from_mapping
 from .errors import (BridgeUnavailable, PanoramaBindingError,
                      PanoramaCapacityError, ReaperAudioError, StaleContext,
                      ValidationError)
-from .models import Section
+from .models import AudioBuffer, MeasurementReport, MetricValue, Section
 from .reaper.api_catalog import get_api_catalog
 from .daw.checkpoint import checkpoint_root, save_checkpoint
 from .reaper.bridge_client import ReaperBridge
@@ -683,6 +686,36 @@ def _api_resource(name: str) -> dict[str, Any]:
 def _analysis_artifact_path(record: dict[str, Any], source_guid: str) -> Path:
     path_text = record.get("audio_files", {}).get(source_guid)
     job_id = record.get("artifact_job_id")
+    archive_root_text = record.get("archive_root")
+    if isinstance(archive_root_text, str) and archive_root_text:
+        expected = record.get("archive_audio_hashes", {}).get(source_guid)
+        if not isinstance(expected, str) or len(expected) != 64:
+            raise ValidationError("Archived audio resource has no verified content hash",
+                                  details={"source_guid": source_guid})
+        if not isinstance(path_text, str):
+            raise ValidationError("The requested source has no retained audio resource",
+                                  details={"source_guid": source_guid})
+        root = Path(archive_root_text).expanduser().absolute()
+        if (root.is_symlink() or getattr(root, "is_junction", lambda: False)() or
+                not root.is_dir()):
+            raise ValidationError("The capture archive root is unavailable or unsafe")
+        root_real = root.resolve(strict=True)
+        path = Path(path_text)
+        if path.is_symlink() or getattr(path, "is_junction", lambda: False)() or not path.is_file():
+            raise ValidationError("The archived audio resource is no longer a regular file")
+        resolved = path.resolve(strict=True)
+        try:
+            relative = resolved.relative_to(root_real)
+        except ValueError as exc:
+            raise ValidationError("Archived audio resource is outside its capture archive") from exc
+        if (relative.parts[:2] != ("audio", "sha256") or len(relative.parts) != 3 or
+                relative.name != f"{expected}.wav"):
+            raise ValidationError("Archived audio resource does not match its content address",
+                                  details={"source_guid": source_guid})
+        if resolved.stat().st_size > _MAX_AUDIO_BYTES:
+            raise ValidationError("Audio resource exceeds the per-resource transfer limit",
+                                  details={"limit_bytes": _MAX_AUDIO_BYTES})
+        return resolved
     if not isinstance(path_text, str) or not isinstance(job_id, str):
         raise ValidationError("The requested source has no retained audio resource",
                               details={"source_guid": source_guid})
@@ -803,6 +836,172 @@ def _analysis_windows(report: dict[str, Any], section: Section | None,
         "tail_included_in_measurement": (False if measured is not None or
                                          tail_s == 0 else None),
     }
+
+
+def _capture_audio_path(archive: CaptureArchive,
+                        asset: Mapping[str, Any]) -> Path:
+    relative = asset.get("archive_audio")
+    if not isinstance(relative, str) or not relative.startswith("audio/sha256/"):
+        raise ValidationError("Capture audio is not stored in the content-addressed archive",
+                              details={"source_guid": asset.get("source_guid")})
+    path = (archive.root_real / relative).resolve(strict=True)
+    try:
+        relative_path = path.relative_to(archive.root_real)
+    except ValueError as exc:
+        raise ValidationError("Capture audio escaped its archive",
+                              details={"source_guid": asset.get("source_guid")}) from exc
+    if (len(relative_path.parts) != 3 or relative_path.parts[:2] != ("audio", "sha256") or
+            path.is_symlink() or getattr(path, "is_junction", lambda: False)()):
+        raise ValidationError("Capture audio path is not a regular content-addressed asset",
+                              details={"source_guid": asset.get("source_guid")})
+    return path
+
+
+def _capture_measurement_report(source_guid: str, raw: Mapping[str, Any], *,
+                                capture_id: str, asset_sha256: str,
+                                project_start_s: float,
+                                project_end_s: float) -> MeasurementReport:
+    """Decode one archived JSON report and align its file-relative time axis."""
+    raw_metrics = raw.get("metrics")
+    raw_curves = raw.get("curves")
+    raw_provenance = raw.get("provenance")
+    if (not isinstance(raw_metrics, Mapping) or not isinstance(raw_curves, Mapping) or
+            not isinstance(raw_provenance, Mapping)):
+        raise ValidationError("Archived source analysis is incomplete",
+                              details={"capture_id": capture_id,
+                                       "source_guid": source_guid})
+    sample_rate = raw.get("sample_rate")
+    channels = raw.get("channels")
+    duration_s = raw.get("duration_s")
+    if (isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or sample_rate <= 0 or
+            isinstance(channels, bool) or not isinstance(channels, int) or channels <= 0 or
+            isinstance(duration_s, bool) or not isinstance(duration_s, (int, float)) or
+            not isfinite(float(duration_s)) or duration_s <= 0):
+        raise ValidationError("Archived source analysis has an invalid audio format",
+                              details={"capture_id": capture_id,
+                                       "source_guid": source_guid})
+
+    metrics: dict[str, MetricValue] = {}
+    for name, cell in raw_metrics.items():
+        if not isinstance(cell, Mapping) or not isinstance(cell.get("unit"), str):
+            raise ValidationError("Archived metric lacks its value/unit record",
+                                  details={"capture_id": capture_id,
+                                           "source_guid": source_guid,
+                                           "metric": str(name)})
+        value = cell.get("value")
+        confidence = cell.get("confidence")
+        if value is not None and (
+                isinstance(value, bool) or not isinstance(value, (int, float)) or
+                not isfinite(float(value))):
+            raise ValidationError("Archived metric value is not finite numeric data",
+                                  details={"capture_id": capture_id,
+                                           "source_guid": source_guid,
+                                           "metric": str(name)})
+        if confidence is not None and (
+                isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or
+                not isfinite(float(confidence))):
+            raise ValidationError("Archived metric confidence is invalid",
+                                  details={"capture_id": capture_id,
+                                           "source_guid": source_guid,
+                                           "metric": str(name)})
+        note = cell.get("note")
+        metrics[str(name)] = MetricValue(
+            value=None if value is None else float(value),
+            unit=cell["unit"],
+            confidence=None if confidence is None else float(confidence),
+            note=note if isinstance(note, str) else None,
+        )
+
+    provenance = _jsonable(raw_provenance)
+    measured = provenance.get("measured_section_s")
+    if not isinstance(measured, Mapping):
+        raw_section = raw.get("section")
+        measured = (raw_section.get("measured_section_s")
+                    if isinstance(raw_section, Mapping) else None)
+    measured_start = (measured.get("start_s")
+                      if isinstance(measured, Mapping) else 0.0)
+    if (isinstance(measured_start, bool) or
+            not isinstance(measured_start, (int, float)) or
+            not isfinite(float(measured_start))):
+        measured_start = 0.0
+    shift_s = project_start_s - float(measured_start)
+    curves = _jsonable(raw_curves)
+
+    def shift_axis(container: dict[str, Any], field: str) -> None:
+        values = container.get(field)
+        if isinstance(values, list):
+            container[field] = [float(value) + shift_s
+                                if isinstance(value, (int, float)) and
+                                not isinstance(value, bool) else value
+                                for value in values]
+
+    for field in ("rms_400ms_time_s", "spectrogram_time_s"):
+        shift_axis(curves, field)
+    temporal = curves.get("temporal_profile")
+    if isinstance(temporal, dict):
+        shift_axis(temporal, "times")
+        tempo = temporal.get("tempo")
+        if isinstance(tempo, dict):
+            for point in tempo.get("points") or []:
+                if isinstance(point, dict):
+                    value = point.get("time_s")
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        point["time_s"] = float(value) + shift_s
+                    window = point.get("window_s")
+                    if isinstance(window, dict):
+                        for field in ("start", "end"):
+                            value = window.get(field)
+                            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                                window[field] = float(value) + shift_s
+
+    events = curves.get("events_2ms")
+    if isinstance(events, dict):
+        for event in events.get("events") or []:
+            if isinstance(event, dict):
+                for field in ("t", "time_s"):
+                    value = event.get(field)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        event[field] = float(value) + shift_s
+
+    provenance["source_capture_id"] = capture_id
+    provenance["asset_sha256"] = asset_sha256
+    provenance["start_s"] = project_start_s
+    provenance["measured_section_s"] = {
+        "start_s": project_start_s, "end_s": project_end_s,
+    }
+    return MeasurementReport(
+        source=source_guid,
+        sample_rate=sample_rate,
+        channels=channels,
+        duration_s=float(duration_s),
+        section=Section(project_start_s, project_end_s),
+        metrics=metrics,
+        curves=curves,
+        provenance=provenance,
+        coverage=_jsonable(raw.get("coverage") or {}),
+    )
+
+
+def _capture_audio_buffer(archive: CaptureArchive, asset: Mapping[str, Any], *,
+                          project_start_s: float, project_end_s: float,
+                          capture_start_s: float, capture_id: str) -> AudioBuffer:
+    source_guid = str(asset.get("source_guid") or "")
+    path = _capture_audio_path(archive, asset)
+    local_section = Section(project_start_s - capture_start_s,
+                            project_end_s - capture_start_s)
+    decoded = load_audio(path, local_section)
+    provenance = {
+        **decoded.provenance,
+        "capture_id": capture_id,
+        "asset_sha256": asset.get("sha256"),
+        "node": source_guid,
+        "stage": asset.get("stage"),
+        "channel_view": f"{decoded.channels}_channels",
+        "window": {"start_s": project_start_s, "end_s": project_end_s},
+    }
+    return AudioBuffer(samples=decoded.samples, sample_rate=decoded.sample_rate,
+                       source=source_guid, start_s=project_start_s,
+                       provenance=provenance)
 
 
 @server.tool()
@@ -1148,6 +1347,382 @@ def reaper_project(project_id: str | None = None,
     return context
 
 
+def _analyze_archived_capture(*, capture_id: str, project_id: str | None,
+                              expected_revision: dict[str, Any] | None,
+                              start_s: float | None, end_s: float | None,
+                              include_pairwise: bool,
+                              phase_pairs: list[tuple[str, str]] | str | None,
+                              include_partial_loudness: bool,
+                              reference_requests: list[dict[str, Any]],
+                              artifact_role: str, detail: str,
+                              tail_ms: int, channels: str,
+                              sample_rate: int | None,
+                              panorama_receipt: str | None,
+                              archive_root: str | None) -> dict[str, Any]:
+    """Compare references to one exact archived capture without a REAPER render."""
+    if not archive_root:
+        raise ValidationError("archive_root is required when capture_id is supplied")
+    if tail_ms:
+        raise ValidationError("tail_ms cannot be added to archived capture audio")
+    if channels != "stereo":
+        raise ValidationError("channels is a live-render option; archived analysis preserves captured channels")
+
+    archive = CaptureArchive(archive_root)
+    captured = archive.read(capture_id)
+    if project_id is not None and project_id != captured.project_id:
+        raise StaleContext("Requested project_id does not match the archived capture",
+                           details={"project_id": project_id,
+                                    "capture_project_id": captured.project_id,
+                                    "capture_id": capture_id})
+    if expected_revision is not None:
+        expected = ProjectRevision.from_dict(expected_revision)
+        allowed_revisions = [captured.revision_before]
+        if captured.revision_after is not None:
+            allowed_revisions.append(captured.revision_after)
+        if not any(ProjectRevision.from_dict(dict(value)) == expected
+                   for value in allowed_revisions):
+            raise StaleContext("expected_revision does not belong to this archived capture",
+                               details={"capture_id": capture_id,
+                                        "expected": expected.to_dict(),
+                                        "capture_revision_before": captured.revision_before,
+                                        "capture_revision_after": captured.revision_after})
+
+    panorama_revision = captured.revision_after or captured.revision_before
+    _require_capture_read_receipt(
+        panorama_receipt, captured.project_id, panorama_revision,
+        captured.capture_id, archive_root,
+    )
+    window = captured.time_window
+    capture_start = float(window["project_start_s"])
+    capture_end = float(window["project_end_s"])
+    selected_start = capture_start if start_s is None else float(start_s)
+    selected_end = capture_end if end_s is None else float(end_s)
+    if selected_start < capture_start or selected_end > capture_end:
+        raise ValidationError("Requested interval is outside the archived capture window",
+                              details={"capture_id": capture_id,
+                                       "capture_window": {"start_s": capture_start,
+                                                          "end_s": capture_end},
+                                       "requested_window": {"start_s": selected_start,
+                                                            "end_s": selected_end}})
+    selected_section = Section(selected_start, selected_end)
+    capture_duration = capture_end - capture_start
+    selected_duration = selected_end - selected_start
+
+    assets = [dict(row) for row in captured.audio]
+    assets_by_guid = {str(row["source_guid"]): row for row in assets}
+    if len(assets_by_guid) != len(assets):
+        raise ValidationError("Archived capture has duplicate source identities",
+                              details={"capture_id": capture_id})
+    master_ids = [guid for guid, row in assets_by_guid.items()
+                  if row.get("is_master") is True]
+    if len(master_ids) != 1:
+        raise ValidationError("Archived capture must contain exactly one master audio asset",
+                              details={"capture_id": capture_id,
+                                       "master_count": len(master_ids)})
+    master_id = master_ids[0]
+    if sample_rate is not None and any(
+            int(row.get("sample_rate") or 0) != sample_rate for row in assets):
+        raise ValidationError("sample_rate differs from the archived capture; it cannot be resampled without a new render",
+                              details={"requested_sample_rate": sample_rate,
+                                       "captured_sample_rates": sorted({
+                                           int(row.get("sample_rate") or 0) for row in assets})})
+    raw_analysis = captured.analysis
+    if not isinstance(raw_analysis, Mapping) or set(raw_analysis) != set(assets_by_guid):
+        raise ValidationError("Archived capture analysis does not cover every audio source",
+                              details={"capture_id": capture_id,
+                                       "audio_sources": len(assets_by_guid),
+                                       "analysis_sources": (len(raw_analysis)
+                                                            if isinstance(raw_analysis, Mapping)
+                                                            else 0)})
+
+    phase_source_ids: set[str] = set()
+    if phase_pairs == "all":
+        phase_source_ids = set(assets_by_guid)
+    elif isinstance(phase_pairs, list):
+        for pair in phase_pairs:
+            phase_source_ids.update(pair)
+    raw_source_ids = set(phase_source_ids)
+    if include_partial_loudness:
+        raw_source_ids.update(assets_by_guid)
+    if raw_source_ids - set(assets_by_guid):
+        raise ValidationError("Requested phase source is not part of the archived capture",
+                              details={"unknown_source_ids": sorted(
+                                  raw_source_ids - set(assets_by_guid))})
+
+    reference_audio: dict[str, AudioBuffer] = {}
+    reference_sections: dict[str, Section] = {}
+    reference_inputs: list[dict[str, Any]] = []
+    for request in reference_requests:
+        reference_section = request["section"]
+        loaded = load_audio(request["path"], reference_section)
+        key_base = request["name"]
+        key = key_base
+        suffix = 2
+        while key in reference_audio:
+            key = f"{key_base}_{suffix}"
+            suffix += 1
+        reference_audio[key] = loaded
+        if reference_section is not None:
+            reference_sections[key] = reference_section
+        reference_inputs.append({
+            "reference_id": key,
+            "selection": request["selection"],
+            "window": None if reference_section is None else {
+                "start_s": reference_section.start_s,
+                "end_s": reference_section.end_s,
+            },
+        })
+
+    capture_tail_s = max(
+        0.0,
+        max(float(row.get("duration_s") or 0.0) for row in assets) - capture_duration,
+    )
+    exact_full_window = (
+        abs(selected_start - capture_start) <= 1e-9 and
+        abs(selected_end - capture_end) <= 1e-9
+    )
+    precomputed_usable = exact_full_window and capture_tail_s <= 1e-6
+    if precomputed_usable:
+        shared_band_count: int | None = None
+        for guid, raw in raw_analysis.items():
+            duration = raw.get("duration_s") if isinstance(raw, Mapping) else None
+            rate = assets_by_guid[guid].get("sample_rate")
+            tolerance = 1.0 / float(rate) if isinstance(rate, int) and rate > 0 else 1e-6
+            if (not isinstance(duration, (int, float)) or isinstance(duration, bool) or
+                    abs(float(duration) - capture_duration) > tolerance):
+                precomputed_usable = False
+                break
+            curves = raw.get("curves")
+            profile = curves.get("temporal_profile") if isinstance(curves, Mapping) else None
+            cells = profile.get("cells") if isinstance(profile, Mapping) else None
+            if not isinstance(cells, (list, tuple)) or not cells:
+                precomputed_usable = False
+                break
+            for cell in cells:
+                bands = cell.get("bands") if isinstance(cell, Mapping) else None
+                if not isinstance(bands, (list, tuple)) or not bands:
+                    precomputed_usable = False
+                    break
+                if any(isinstance(value, bool) or
+                       not isinstance(value, (int, float)) or
+                       not isfinite(float(value)) for value in bands):
+                    precomputed_usable = False
+                    break
+                if shared_band_count is None:
+                    shared_band_count = len(bands)
+                elif len(bands) != shared_band_count:
+                    precomputed_usable = False
+                    break
+            if not precomputed_usable:
+                break
+
+    from .daw.analysis_policy import available_memory_bytes
+
+    decoded_bytes = 0
+    for guid in raw_source_ids:
+        asset = assets_by_guid[guid]
+        frames = int(asset.get("frames") or 0)
+        channels_count = int(asset.get("channels") or 0)
+        asset_duration = float(asset.get("duration_s") or 0.0)
+        if frames > 0 and channels_count > 0 and asset_duration > 0:
+            selected_frames = min(frames, int(round(frames * selected_duration / asset_duration)))
+            decoded_bytes += selected_frames * channels_count * 8
+    available = available_memory_bytes() if raw_source_ids else None
+    estimated_working_bytes = decoded_bytes * 2
+    memory_budget = None if available is None else int(available * 0.70)
+    if memory_budget is not None and estimated_working_bytes > memory_budget:
+        raise ValidationError("Archived raw-audio analysis exceeds the memory-safe budget",
+                              details={"capture_id": capture_id,
+                                       "selected_sources": sorted(raw_source_ids),
+                                       "decoded_audio_bytes": decoded_bytes,
+                                       "estimated_working_bytes": estimated_working_bytes,
+                                       "memory_budget_bytes": memory_budget,
+                                       "next_action": "select fewer phase pairs or omit partial loudness"})
+
+    source_reports: dict[str, MeasurementReport] = {}
+    raw_buffers: dict[str, AudioBuffer | None] = {guid: None for guid in assets_by_guid}
+    for guid, asset in assets_by_guid.items():
+        if precomputed_usable:
+            source_reports[guid] = _capture_measurement_report(
+                guid, raw_analysis[guid], capture_id=capture_id,
+                asset_sha256=str(asset["sha256"]),
+                project_start_s=capture_start, project_end_s=capture_end,
+            )
+            if guid in raw_source_ids:
+                raw_buffers[guid] = _capture_audio_buffer(
+                    archive, asset, project_start_s=selected_start,
+                    project_end_s=selected_end, capture_start_s=capture_start,
+                    capture_id=capture_id,
+                )
+        else:
+            audio_buffer = _capture_audio_buffer(
+                archive, asset, project_start_s=selected_start,
+                project_end_s=selected_end, capture_start_s=capture_start,
+                capture_id=capture_id,
+            )
+            source_reports[guid] = replace(
+                measure_audio(audio_buffer), section=selected_section, source=guid)
+            if guid in raw_source_ids:
+                raw_buffers[guid] = audio_buffer
+
+    report = analyze_bundle(
+        {guid: raw_buffers[guid] for guid in assets_by_guid},
+        references=reference_audio or None,
+        reference_sections=reference_sections or None,
+        include_pairwise=include_pairwise,
+        phase_pairs=phase_pairs,
+        anchor_key=master_id,
+        mix_key=master_id if include_partial_loudness else None,
+        precomputed_reports=source_reports,
+    )
+
+    track_map = {
+        str(row.get("guid")): row for row in captured.project_map.get("tracks", [])
+        if isinstance(row, Mapping) and row.get("guid")
+    }
+    master_context = captured.project_map.get("master")
+    if not isinstance(master_context, Mapping):
+        master_context = {}
+    source_rows: list[dict[str, Any]] = []
+    audio_files: dict[str, str] = {}
+    audio_hashes: dict[str, str] = {}
+    for guid, source_report in report["sources"].items():
+        asset = assets_by_guid[guid]
+        audio_files[guid] = str(_capture_audio_path(archive, asset))
+        audio_hashes[guid] = str(asset["sha256"])
+        context = master_context if asset.get("is_master") else track_map.get(guid, {})
+        track_context = {
+            "guid": guid,
+            "name": asset.get("name") or context.get("name", ""),
+            "volume": context.get("volume"),
+            "pan": context.get("pan"),
+            "mute": context.get("mute"),
+            "solo": context.get("solo"),
+            "is_master": bool(asset.get("is_master")),
+        }
+        asset_context = {
+            key: asset.get(key) for key in (
+                "asset_id", "source_guid", "name", "is_master", "stage",
+                "capture_method", "sample_rate", "channels", "frames",
+                "duration_s", "bytes", "sha256", "signal_window",
+                "capture_revision", "render_key", "render_key_complete",
+                "render_dependencies",
+            ) if key in asset
+        }
+        source_report["track_context"] = track_context
+        source_report["capture"] = asset_context
+        source_rows.append({
+            "source_guid": guid,
+            "name": track_context["name"],
+            "is_master": track_context["is_master"],
+            "volume": track_context["volume"],
+            "pan": track_context["pan"],
+            "mute": track_context["mute"],
+            "capture": asset_context,
+            "metrics": source_report.get("metrics", {}),
+        })
+
+    analysis_revision = dict(captured.revision_before)
+    analysis_revision["capture_id"] = capture_id
+    revision_after = dict(captured.revision_after or captured.revision_before)
+    revision_after["capture_id"] = capture_id
+    capture_info = {
+        "capture_id": capture_id,
+        "integrity_sha256": captured.integrity_sha256,
+        "audio_sources": len(assets),
+        "analysis_reused": precomputed_usable,
+        "render_performed": False,
+    }
+    analysis_windows = {
+        "project_section": {"start_s": selected_start, "end_s": selected_end},
+        "measured": {"start_s": selected_start, "end_s": selected_end},
+        "captured_file": {"start_s": 0.0,
+                           "end_s": max(float(row.get("duration_s") or 0.0)
+                                        for row in assets)},
+        "tail_s": capture_tail_s,
+        "tail_included_in_measurement": False,
+    }
+    report["project"] = {
+        "project_id": captured.project_id,
+        "path": captured.project_path,
+        "revision": analysis_revision,
+        "capture_id": capture_id,
+    }
+    report["capture"] = capture_info
+    report["capture_binding"] = {
+        "project_id": captured.project_id,
+        "capture_id": capture_id,
+        "evidence_revision": analysis_revision,
+        "revision_after_capture": revision_after,
+        "time_window": {"start_s": capture_start, "end_s": capture_end},
+        "asset_sha256": audio_hashes,
+    }
+    report["analysis_windows"] = analysis_windows
+    report["reference_inputs"] = reference_inputs
+    report["execution"] = {
+        "project_audio_source": "verified_archived_capture",
+        "reaper_render_performed": False,
+        "source_metrics": "reused" if precomputed_usable else "remeasured_from_archived_wav",
+        "project_time_origin_s": capture_start,
+    }
+    project_tempo = captured.project_map.get("tempo", {})
+    report["project_tempo"] = project_tempo
+
+    analysis_id = f"a-{int(time.time())}-{os.urandom(6).hex()}"
+    record = {
+        "analysis_id": analysis_id,
+        "project_id": captured.project_id,
+        "revision": analysis_revision,
+        "revision_after": revision_after,
+        "role": artifact_role,
+        "artifact_job_id": None,
+        "audio_files": audio_files,
+        "archive_audio_hashes": audio_hashes,
+        "archive_root": str(archive.root_real),
+        "capture_id": capture_id,
+        "report": report,
+        "expires_at": time.time() + _ANALYSIS_TTL_S,
+    }
+    role_key = (captured.project_id, artifact_role)
+    with _LOCK:
+        previous_id = _analysis_roles.get(role_key)
+        _analysis_records[analysis_id] = record
+        _analysis_roles[role_key] = analysis_id
+    if previous_id:
+        _cleanup_analysis_record(previous_id)
+
+    for row in source_rows:
+        guid = row["source_guid"]
+        row["audio_uri"] = (f"reaper://analyses/{analysis_id}/audio/"
+                            f"{quote(guid, safe='')}")
+    result = {
+        "ok": True,
+        "analysis_id": analysis_id,
+        "artifact_role": artifact_role,
+        "lease_expires_in_seconds": _ANALYSIS_TTL_S,
+        "project": report["project"],
+        "initial_context_revision": analysis_revision,
+        "evidence_revision": analysis_revision,
+        "revision_after_capture": revision_after,
+        "capture_id": capture_id,
+        "section": {"start_s": selected_start, "end_s": selected_end},
+        "analysis_windows": analysis_windows,
+        "reference_inputs": reference_inputs,
+        "source_count_including_master": len(source_rows),
+        "sources": source_rows,
+        "coverage": report.get("coverage", {}),
+        "project_tempo": project_tempo,
+        "capture": capture_info,
+        "execution": report["execution"],
+        "report_uri": f"reaper://analyses/{analysis_id}/report",
+        "resource_note": ("Audio resources point to hash-verified durable capture WAVs. "
+                          "Releasing this analysis lease never deletes the archived capture."),
+    }
+    if detail == "full":
+        result["report"] = report
+    return result
+
+
 @server.tool()
 @_guard
 def reaper_analyze(project_id: str | None = None,
@@ -1167,22 +1742,23 @@ def reaper_analyze(project_id: str | None = None,
                    channels: str = "stereo",
                    sample_rate: StrictInt | None = None,
                    panorama_receipt: str | None = None,
-                   archive_root: str | None = None) -> dict[str, Any]:
+                   archive_root: str | None = None,
+                   capture_id: str | None = None) -> dict[str, Any]:
     """Run the complete available audio suite on all tracks and the rendered master.
 
-    This is one batch operation. It returns a concise report plus temporary
-    audio-resource URIs for listening. Capture is a processed REAPER render;
-    no project items/stems are added. reference_paths analyzes complete files;
-    reference_windows selects source-file-local windows independently from the
-    project section. artifact_role holds one lease each for temporary, baseline,
-    or final; replacing a role releases its previous temporary audio files.
+    With no capture_id, this is one batch operation that renders and analyzes
+    the current project. With capture_id, it reuses one exact, receipt-verified
+    archived capture and does not call the REAPER bridge or render the project.
+    It returns a concise report plus analysis-scoped audio-resource URIs.
+    reference_paths analyzes complete files; reference_windows selects
+    source-file-local windows independently from the project section.
+    artifact_role holds one lease each for temporary, baseline, or final.
 
     tail_ms asks REAPER to render extra audio past the project section so
     reverb decays survive; the extra tail is never measured. channels and
     sample_rate are the render request. All three options affect only the
     project capture: reference files and reference windows are read unchanged.
     """
-    _focus_reaper_window()
     if (start_s is None) != (end_s is None):
         raise ValidationError("start_s and end_s must be supplied together")
     section = Section(start_s, end_s) if start_s is not None else None
@@ -1212,6 +1788,29 @@ def reaper_analyze(project_id: str | None = None,
     reference_requests = _reference_requests(reference_paths, reference_windows)
 
     _prune_analysis_state()
+    if capture_id is not None:
+        if not isinstance(capture_id, str) or not capture_id.strip():
+            raise ValidationError("capture_id must be a non-empty string or null")
+        return _analyze_archived_capture(
+            capture_id=capture_id,
+            project_id=project_id,
+            expected_revision=expected_revision,
+            start_s=start_s,
+            end_s=end_s,
+            include_pairwise=include_pairwise,
+            phase_pairs=phase_pairs,
+            include_partial_loudness=include_partial_loudness,
+            reference_requests=reference_requests,
+            artifact_role=artifact_role,
+            detail=detail,
+            tail_ms=tail_ms,
+            channels=channels,
+            sample_rate=sample_rate,
+            panorama_receipt=panorama_receipt,
+            archive_root=archive_root,
+        )
+
+    _focus_reaper_window()
     session = _session(project_id, bridge_session_id)
     expected = (_revision(expected_revision, project_id=project_id)
                 if expected_revision is not None else None)
@@ -2276,7 +2875,13 @@ def analysis_audio_resource(analysis_id: str, source_guid: str) -> bytes:
         _cleanup_analysis_record(analysis_id)
         raise ValidationError("Audio resource lease has expired or was released",
                               details={"analysis_id": analysis_id})
-    return _analysis_artifact_path(record, source_guid).read_bytes()
+    audio = _analysis_artifact_path(record, source_guid).read_bytes()
+    expected = record.get("archive_audio_hashes", {}).get(source_guid)
+    if isinstance(expected, str) and hashlib.sha256(audio).hexdigest() != expected:
+        raise ValidationError("Archived audio resource failed its content hash check",
+                              details={"source_guid": source_guid,
+                                       "capture_id": record.get("capture_id")})
+    return audio
 
 
 @server.tool()
