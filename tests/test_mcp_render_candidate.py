@@ -190,8 +190,7 @@ def test_counter_advance_returns_post_render_revision_and_token(
         bridge_session_id="bridge-candidate", sample_rate=8_000,
     )
 
-    assert result["revision_after"]["change_count"] == 5
-    assert result["revision_after_render"]["change_count"] == 6
+    assert result["revision"]["change_count"] == 6
     assert result["context_advance"]["status"] == "advanced"
     assert result["context_advance"]["context_token"] == "token-after-render"
     assert result["completeness"]["post_render_revision_current"] is True

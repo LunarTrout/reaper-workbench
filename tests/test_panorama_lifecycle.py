@@ -165,11 +165,11 @@ def test_changes_since_is_revision_bound_and_reports_ops(tmp_path: Path) -> None
 
     delta = lifecycle.changes_since("project-1", base_capture_id="cap_00000001",
                                     base_fact_root=base_root)
-    assert delta["status"] == "delta"
+    assert delta["status"] == "change_set"
     assert delta["from_root"] == base_root
     assert delta["to_root"] != base_root
     assert any(op["path"] == "/project/body" for op in delta["ops"])
-    assert delta["to_revision"]["change_count"] == 2
+    assert delta["revision"]["change_count"] == 2
     assert delta["invalidations"]
     assert delta["invalidations"][0]["requires_recapture"] is True
 
@@ -201,41 +201,47 @@ def test_delta_ack_advances_context_without_replaying_pages(tmp_path: Path) -> N
 
     _capture(root, "cap_00000002", "project-1", 2, body=2)
     delta = lifecycle.changes_since("project-1", context_token=full["context_token"])
-    assert delta["status"] == "delta"
+    assert delta["status"] == "change_set"
     assert delta["continuity"] is True
-    assert delta["delta_id"].startswith("dl_")
-    successor = lifecycle.delta_ack(delta["delta_id"], delta["delta_hash"],
+    record = max((json.loads(item.read_text(encoding="utf-8"))
+                             for item in lifecycle.deltas_dir.glob("dl_*.json")),
+                        key=lambda item: item.get("created_at") or 0)
+    assert record["delta_id"].startswith("dl_")
+    successor = lifecycle.delta_ack(record["delta_id"], record["delta_hash"],
                                     full["context_token"])
     assert successor["complete"] is True
     assert successor["context_token"] != full["context_token"]
     assert successor["kind"] == "delta"
 
-    target_revision = delta["to_revision"]
+    target_revision = delta["revision"]
     assert lifecycle.require_receipt(successor["context_token"], "project-1",
                                       target_revision)["complete"] is True
     with pytest.raises(StaleContext):
         lifecycle.require_receipt(full["context_token"], "project-1", target_revision)
 
-    repeated = lifecycle.delta_ack(delta["delta_id"], delta["delta_hash"],
+    repeated = lifecycle.delta_ack(record["delta_id"], record["delta_hash"],
                                    full["context_token"])
     assert repeated["idempotent"] is True
     assert repeated["context_token"] == successor["context_token"]
     with pytest.raises(StaleContext):
-        lifecycle.delta_ack(delta["delta_id"], "not-the-delta-hash",
+        lifecycle.delta_ack(record["delta_id"], "not-the-delta-hash",
                             full["context_token"])
     with pytest.raises(StaleContext):
-        lifecycle.delta_ack(delta["delta_id"], delta["delta_hash"],
+        lifecycle.delta_ack(record["delta_id"], record["delta_hash"],
                             "ct_unknown_or_expired")
 
     _capture(root, "cap_00000003", "project-1", 3, body=3)
     second_delta = lifecycle.changes_since("project-1",
                                             context_token=successor["context_token"])
-    assert second_delta["status"] == "delta"
-    second_successor = lifecycle.delta_ack(second_delta["delta_id"],
-                                           second_delta["delta_hash"],
+    assert second_delta["status"] == "change_set"
+    second_record = max((json.loads(item.read_text(encoding="utf-8"))
+                                    for item in lifecycle.deltas_dir.glob("dl_*.json")),
+                               key=lambda item: item.get("created_at") or 0)
+    second_successor = lifecycle.delta_ack(second_record["delta_id"],
+                                           second_record["delta_hash"],
                                            successor["context_token"])
     assert lifecycle.require_receipt(second_successor["context_token"], "project-1",
-                                      second_delta["to_revision"])["complete"] is True
+                                      second_delta["revision"])["complete"] is True
 
 
 def test_receipt_binds_capture_fact_root_and_project(tmp_path: Path) -> None:
@@ -323,7 +329,7 @@ def test_relations_participate_in_pages_ack_delta_and_slice(tmp_path: Path) -> N
     assert lifecycle.ack(opened["handle"], opened["revision"], hashes)["complete"] is True
 
     delta = lifecycle.changes_since("project-1", base_capture_id="cap_00000001")
-    assert delta["status"] == "delta"
+    assert delta["status"] == "change_set"
     assert any("band_delta_db" in op["path"] for op in delta["ops"])
 
     sliced = lifecycle.slice(opened["handle"], opened["revision"],

@@ -228,3 +228,25 @@ def test_mcp_archived_exact_read_ignores_incomplete_identity(tmp_path) -> None:
     with pytest.raises(StaleContext):
         mcp_server._require_panorama_receipt(
             ack["receipt"], record.project_id, ack["revision"], root)
+
+
+def test_mcp_panorama_query_thaws_a_frozen_archived_view(monkeypatch) -> None:
+    import json
+    from types import MappingProxyType
+
+    frozen = {"status": "query", "read_only": True,
+              "data": {"analysis": (MappingProxyType({"id": "a1", "value": 2.5}),)}}
+
+    class Lifecycle:
+        def query(self, *args, **kwargs):
+            return frozen
+
+    monkeypatch.setattr(mcp_server, "_panorama_lifecycle", lambda root: Lifecycle())
+    monkeypatch.setattr(mcp_server, "_require_capture_read_receipt",
+                        lambda *args, **kwargs: None)
+
+    answer = mcp_server.reaper_panorama_query(
+        revision={"project_id": "project-1", "change_count": 3, "capture_id": "cap_1"},
+        archive_root="archive", handle="handle", panorama_receipt="receipt")
+    json.dumps(answer)
+    assert answer["data"]["analysis"][0]["value"] == 2.5

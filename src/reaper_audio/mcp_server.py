@@ -34,7 +34,7 @@ from .analysis.mix_evidence import build_mix_evidence
 from .analysis.metrics import measure_audio
 from .daw.session import EditOperation, EditPlan, ProjectRevision, ProjectSession
 from .daw.full_capture import FullCaptureService
-from .context.full_capture import CaptureArchive, FullCaptureRecord
+from .context.full_capture import CaptureArchive, FullCaptureRecord, _thaw
 from .context.analysis_store import (analysis_input_fingerprint,
                                      analysis_locations, fingerprint_digest,
                                      load_analysis_record,
@@ -43,7 +43,7 @@ from .context.analysis_store import (analysis_input_fingerprint,
 from .context.analyze_summary import project_analyze_summary
 from .context.audio_delta import build_audio_delta
 from .context.lifecycle import (PanoramaLifecycle, _delivered_bytes,
-                                document_hash, fact_root)
+                                change_update_view, document_hash, fact_root)
 from .context.panorama import (DEFAULT_MAX_BYTES, DEFAULT_MAX_TOKENS,
                                PANORAMA_SCHEMA_VERSION, build_panorama, load_panorama,
                                panorama_path_for_record)
@@ -168,7 +168,7 @@ TOOL_SURFACE: dict[str, dict[str, Any]] = {
         "not_for": "interpreting audio; use panorama or analysis",
     },
     "panorama": {
-        "purpose": "one whole-project view, exact rows by meaning, and revision-bound deltas",
+        "purpose": "one whole-project view, exact rows by meaning, and revision-bound change updates",
         "use_when": "before analysis, edits, or any whole-project conclusion",
         "context": "capture_id + archive_root; mutations need the panorama receipt/context token",
         "tools": ["reaper_panorama_open", "reaper_panorama_page", "reaper_panorama_ack",
@@ -303,7 +303,7 @@ def _require_interpretation_receipt(receipt: str | None, project_id: str,
     allowed without a receipt. Every project-target analysis/interpretation
     call that follows must present one complete, delivered receipt for that
     same project, revision and fact root *and* its audio evidence must still be
-    current. A structural delta can authorize edits but never audio
+    current. A structural change update can authorize edits but never audio
     interpretation: only a fresh capture does that. The server cannot observe
     private model reasoning; this gates tool access, not thought.
 
@@ -473,7 +473,7 @@ server = MCPServer(
                  "ReaScript API and resident local bridge, with one revision-bound "
                  "project panorama delivered whole when it fits or as a complete "
                  "lossless page set when it does not, exact semantic queries, and "
-                 "factual deltas that are themselves pageable."),
+                 "factual change updates that are themselves pageable."),
     instructions=(
         "REAPER Workbench. Find the task with reaper_capabilities(mode=\"tools\") — "
         "the surface is grouped by session, project, capture, panorama, analysis, edit, "
@@ -515,7 +515,7 @@ server = MCPServer(
         "only to the archived revision. Exact "
         "high-frequency rows "
         "(relation edges, series cells, MIDI notes, envelope points) come from "
-        "reaper_panorama_query by semantic selection. If a query, audio delta or scoped "
+        "reaper_panorama_query by semantic selection. If a query, audio comparison or scoped "
         "analysis result is too large for one measured response, it is delivered as "
         "complete result_page pages; fetch every page and acknowledge the hashes or "
         "manifest hash. Result-page acknowledgement proves reconstruction only and mints "
@@ -528,24 +528,30 @@ server = MCPServer(
         "evidence while they support the next decision; request a new full panorama only "
         "when the next consequential global decision needs fresh whole-project evidence, "
         "the user asks for a complete overview, or before a final whole-project conclusion. "
+        "The latest context_token is the model's current known project state. For routine "
+        "continuity, call reaper_panorama_changes_since with that token; do not restart "
+        "from the first capture. An explicitly named pair of archived captures is a "
+        "separate version comparison, not the normal current-state update. "
         "Every successful mutation (reaper_edit apply/undo, "
-        "reaper_api_call, reaper_action) returns a factual delta bound to the acknowledged "
-        "base. A small delta carries its successor context token in the same response; a "
-        "delta too large for one measured result returns status=delta_page with page 1, a "
-        "manifest and a handle. Fetch every declared delta page, then acknowledge all page "
-        "hashes or the manifest hash; only that complete acknowledgement advances the token "
-        "exactly once. Use advance.context_token for the next structural edit and continue "
-        "editing at the new revision without another full capture. A "
-        "delta never makes stale audio current: its audio_evidence names every invalidated "
-        "source, and project-target analysis refuses until a fresh capture is acknowledged. "
-        "Deltas address objects by stable IDs and semantic paths, not array positions; a "
-        "track insertion or FX move must not be read as a change to every later object. "
-        "A measurement-heavy delta may carry its exact metric ops once in "
+        "reaper_api_call, reaper_action, reaper_render_candidate) returns an update: the "
+        "stable ids it touched with only their new current values, the current revision "
+        "and the successor context token. Unchanged facts are not resent and no internal "
+        "mutation record is exposed. An update too large for one measured result returns "
+        "status=change_page with page 1, a manifest and a handle. Fetch every declared "
+        "change page, then acknowledge all page hashes or the manifest hash; only that "
+        "complete acknowledgement advances the token exactly once. Use the returned "
+        "context_token for the next structural edit and continue editing at the new "
+        "revision without another full capture. An update never makes stale audio "
+        "current: its audio_evidence names every invalidated source, and project-target "
+        "analysis refuses until a fresh capture is acknowledged. Updates address objects "
+        "by stable IDs and semantic paths, not array positions; a track insertion or FX "
+        "move must not be read as a change to every later object. "
+        "A measurement-heavy update may carry its exact metric ops once in "
         "metric_table (integer-indexed columns plus exact dictionaries and a "
         "path_pattern); expand every row and do not treat it as a summary. "
         "Comparability is factual: if method/version, unit, stage, window or grid evidence "
-        "does not match, the delta says unknown or incomparable and still shows the exact "
-        "before/after values; it never emits a better/worse verdict. "
+        "does not match, the comparison says unknown or incomparable and still shows each "
+        "side's exact measured values; it never emits a better/worse verdict. "
         "Raw API calls and Actions have unknown mutation scope and invalidate project audio "
         "conservatively. Use reaper_capabilities and reaper_api_search to discover "
         "operations; do not assume a fixed musical workflow. Project edits are batched as "
@@ -865,7 +871,7 @@ def _record_mutation_delta(*, lifecycle: PanoramaLifecycle, kind: str,
                            base_revision: ProjectRevision,
                            session: ProjectSession, scope: str,
                            operation_facts: list[dict[str, Any]] | None) -> dict[str, Any]:
-    """Attach one factual delta to a successful mutation, or say why not.
+    """Attach one internal mutation record to a successful mutation, or say why not.
 
     A mutation has already happened when this runs.  A delta failure therefore
     cannot be reported as a mutation failure; it is returned as an explicit
@@ -881,7 +887,7 @@ def _record_mutation_delta(*, lifecycle: PanoramaLifecycle, kind: str,
             "reason": "post_mutation_readback_incomplete",
             "readback": {"complete": False, "missing": readback["missing"]},
             "next_call": {"tool": "reaper_capture_snapshot", "project_id": project_id,
-                          "then": ("No structural delta can be minted from this readback; "
+                          "then": ("No structural change update can be minted from this readback; "
                                    "capture again and acknowledge the panorama.")},
         }
     try:
@@ -1769,7 +1775,7 @@ def reaper_project(project_id: str | None = None,
             "receipt_valid": True,
             "interpretation_allowed": fresh,
             "audio_evidence": dict(evidence),
-            "note": ("A structural delta advances edits only; project-audio "
+            "note": ("A structural change update advances edits only; project-audio "
                      "interpretation needs evidence.state == 'current'."),
         }
     else:
@@ -2419,6 +2425,9 @@ def _scoped_analyze_archived(*, capture_id: str,
                       "or before a final whole-project conclusion."),
         "no_quality_verdict": True,
     }
+    # An archived capture is served frozen (mapping proxies and tuples); the
+    # scoped result must be plain JSON before it is measured or paged.
+    result = _thaw(result)
     if _delivered_bytes(result) <= DEFAULT_RESPONSE_BYTES:
         return result
     page = _panorama_lifecycle(archive_root).open_result_pages(
@@ -2472,7 +2481,7 @@ def reaper_analyze(project_id: str | None = None,
     batch: several existing analyzer IDs run against named sources and exact
     song intervals, returning what ran, what was unavailable and a scope marker.
     A scoped result never claims whole-project coverage.  Large scoped results
-    use the same lossless result-page contract as queries and audio deltas.
+    use the same lossless result-page contract as queries and audio comparisons.
     A full panorama is not an automatic next step after edits or micro-analysis;
     request one only when the next consequential global decision needs fresh
     whole-project evidence, when the user asks for a complete overview, or
@@ -2847,10 +2856,11 @@ def reaper_mix_evidence(analysis_id: str,
     With no ``compare_analysis_id`` this summarizes measured mix issues and
     questions; no plugin, EQ frequency, or gain recipe is chosen here.
 
-    With ``compare_analysis_id`` it returns the exact audio-snapshot delta
+    With ``compare_analysis_id`` it returns the exact measured difference
     between the two stored analyses: scalar metrics with units, and series
     compared cell-for-cell on the stored time axis.  Every changed cell is
-    returned; there is no internal 2000-cell truncation.  A delta that does not
+    returned; there is no internal 2000-cell truncation.  This is a measurement
+    comparison, not a mutation record.  A delta that does not
     fit one measured result is delivered as complete ``result_page`` pages over
     ``reaper_panorama_page`` and verified with ``reaper_panorama_ack``.  The
     acknowledgement proves exact reconstruction only; it mints no receipt or
@@ -2901,7 +2911,7 @@ def reaper_mix_evidence(analysis_id: str,
             "analysis_id": analysis_id,
             "compare_analysis_id": compare_analysis_id,
             "revision": record.get("revision"),
-            "target_revision": target.get("revision"),
+            "comparison_revision": target.get("revision"),
             "audio_delta": delta,
         }
         if _delivered_bytes(response) <= DEFAULT_RESPONSE_BYTES:
@@ -2918,7 +2928,7 @@ def reaper_mix_evidence(analysis_id: str,
         page.update({"ok": True, "mode": "compare",
                      "analysis_id": analysis_id,
                      "compare_analysis_id": compare_analysis_id,
-                     "audio_delta_page": True})
+                     "comparison_page": True})
         return page
     evidence = build_mix_evidence(report)
     return {
@@ -2953,6 +2963,29 @@ def _edit_operation_facts(result: Mapping[str, Any]) -> list[dict[str, Any]]:
     return facts
 
 
+def _undo_operation_facts(plan: EditPlan) -> list[dict[str, Any]]:
+    """Reverse the preview facts for an undo that the bridge reports bare.
+
+    Undo restores the preview's before values, so its factual before/after is
+    exactly the inverse of the applied plan.  This keeps the undo update factual
+    even when REAPER returns only revisions for the undo call.
+    """
+    facts: list[dict[str, Any]] = []
+    before_rows = plan.before if isinstance(plan.before, list) else []
+    for index, operation in enumerate(plan.operations):
+        original = before_rows[index] if index < len(before_rows) else {}
+        original = original if isinstance(original, Mapping) else {}
+        facts.append({
+            "operation_index": original.get("operation_index", index + 1),
+            "kind": operation.kind,
+            "target_guid": operation.target_guid,
+            "before": dict(operation.values),
+            "after": original.get("values"),
+            "changes_state": original.get("changes_state", True),
+        })
+    return facts
+
+
 @server.tool()
 @_guard
 def reaper_edit(mode: str,
@@ -2967,12 +3000,13 @@ def reaper_edit(mode: str,
     """Preview, apply, or undo one revision-bound batch of project edits.
 
     preview: supply operations and reason; nothing changes. apply: use the
-    returned plan_id and the same expected_revision; the response carries a
-    factual delta bound to the acknowledged panorama token. undo: use that
-    plan_id and the post-apply revision returned by apply; undo is a new
-    forward revision with its own delta. Each batch may contain up to 256
-    library-supported operations; generic API calls and Actions remain
-    available for operations outside this transaction set.
+    returned plan_id and the same expected_revision; the response carries an
+    incremental update with only the changed current values, the current
+    revision and the context token. undo: use that plan_id and the post-apply
+    revision returned by apply; undo is a new forward revision with its own
+    update. Each batch may contain up to 256 library-supported operations;
+    generic API calls and Actions remain available for operations outside this
+    transaction set.
     """
     if mode not in {"preview", "apply", "undo"}:
         raise ValidationError("mode must be preview, apply, or undo")
@@ -3046,28 +3080,43 @@ def reaper_edit(mode: str,
             raise BridgeUnavailable("REAPER did not return the applied project revision")
         applied = ProjectRevision.from_dict(applied_revision)
         cached["applied_revision"] = applied
+        cached["applied_no_op"] = bool(result.get("no_op"))
+        if cached["applied_no_op"]:
+            return {"mode": "apply", "plan_id": plan_id, "no_op": True,
+                    "undo_available": False,
+                    "revision": applied.to_dict(),
+                    "next_call": {
+                        "tool": None,
+                        "note": ("the plan changed no project fact; nothing was "
+                                 "applied and there is nothing to undo")}}
         delta = _record_mutation_delta(
             lifecycle=_panorama_lifecycle(archive_root), kind="edit",
             receipt=str(panorama_receipt), project_id=project_id,
             base_revision=expected, session=session, scope="known",
             operation_facts=_edit_operation_facts(result))
         advance = delta.get("advance") if isinstance(delta, Mapping) else None
-        if isinstance(advance, Mapping) and advance.get("context_token"):
-            cached["applied_context_token"] = str(advance["context_token"])
+        token = (str(advance["context_token"])
+                 if isinstance(advance, Mapping) and advance.get("context_token") else "")
+        if token:
+            cached["applied_context_token"] = token
         cached["applied_archive_root"] = archive_root
         if not delta.get("delta_id") or not delta.get("acknowledgeable"):
-            return {"mode": "apply", "plan_id": plan_id, "result": result,
-                    "delta": delta, "next_call": delta.get("next_call")}
+            return {"mode": "apply", "plan_id": plan_id,
+                    "status": str(delta.get("status") or "unavailable"),
+                    "reason": delta.get("reason"),
+                    "next_call": delta.get("next_call")}
+        update = change_update_view(_panorama_lifecycle(archive_root), delta,
+                                    context_token=token, project_id=project_id,
+                                    revision=applied.to_dict())
         return {"mode": "apply", "plan_id": plan_id,
-                "result": result,
-                "delta": delta,
+                "update": update,
                 "next_call": {
                     "tool": None,
-                    "context_token": (delta.get("advance") or {}).get("context_token"),
-                    "note": ("the successor token is already in delta.advance.context_token; "
-                             "no acknowledgement call is required to continue structural "
-                             "edits. Project-audio interpretation still needs a fresh "
-                             "capture.")}}
+                    "context_token": token,
+                    "note": ("the update replaces the known fields it names and carries "
+                             "the current context token; no acknowledgement call is "
+                             "required to continue structural edits. Project-audio "
+                             "interpretation still needs a fresh capture.")}}
     applied_revision = cached.get("applied_revision")
     if not isinstance(applied_revision, ProjectRevision) or applied_revision != expected:
         raise StaleContext("Undo needs the exact revision returned by this plan's apply",
@@ -3075,27 +3124,43 @@ def reaper_edit(mode: str,
                                                           if isinstance(applied_revision, ProjectRevision)
                                                           else None),
                                     "provided_revision": expected.to_dict()})
-    result = session.undo(expected_revision=expected)
+    if cached.get("applied_no_op"):
+        raise ValidationError(
+            "This plan applied no change; there is nothing to undo",
+            details={"plan_id": plan_id,
+                     "reason": "a no-op apply records no library transaction, so "
+                               "an undo could only target an earlier edit"})
+    result = session.undo(expected_revision=expected, plan_id=plan_id)
     undone_revision = result.get("revision_after")
+    undo_facts = _edit_operation_facts(result) or _undo_operation_facts(plan)
     delta = _record_mutation_delta(
         lifecycle=_panorama_lifecycle(archive_root), kind="undo",
         receipt=str(panorama_receipt), project_id=project_id,
         base_revision=expected, session=session, scope="known",
-        operation_facts=None)
+        operation_facts=undo_facts)
     with _LOCK:
         _edit_plans.pop(plan_id, None)
-    response = {"mode": "undo", "plan_id": plan_id, "result": result,
-                "revision_after": undone_revision, "delta": delta}
-    if delta.get("delta_id") and delta.get("acknowledgeable"):
-        response["next_call"] = {
-            "tool": None,
-            "context_token": (delta.get("advance") or {}).get("context_token"),
-            "note": ("the successor token is already in delta.advance.context_token; the "
-                     "earlier edit records remain history and no ack call is required"),
-        }
-    else:
-        response["next_call"] = delta.get("next_call")
-    return response
+    advance = delta.get("advance") if isinstance(delta, Mapping) else None
+    token = (str(advance["context_token"])
+             if isinstance(advance, Mapping) and advance.get("context_token") else "")
+    if not delta.get("delta_id") or not delta.get("acknowledgeable"):
+        return {"mode": "undo", "plan_id": plan_id,
+                "status": str(delta.get("status") or "unavailable"),
+                "reason": delta.get("reason"),
+                "next_call": delta.get("next_call")}
+    update = change_update_view(
+        _panorama_lifecycle(archive_root), delta,
+        context_token=token, project_id=project_id,
+        revision=(undone_revision if isinstance(undone_revision, dict)
+                  else expected.to_dict()))
+    return {"mode": "undo", "plan_id": plan_id, "update": update,
+            "next_call": {
+                "tool": None,
+                "context_token": token,
+                "note": ("the update replaces the known fields it names and carries the "
+                         "current context token; the earlier edit records remain history "
+                         "and no acknowledgement call is required"),
+            }}
 
 
 def _advance_candidate_context(*, cached: dict[str, Any], project_id: str,
@@ -3116,9 +3181,7 @@ def _advance_candidate_context(*, cached: dict[str, Any], project_id: str,
         return {
             "status": "unavailable",
             "reason": "no_applied_context_token",
-            "from_revision": applied.to_dict(),
-            "to_revision": post_revision.to_dict(),
-            "revision_after_render": post_revision.to_dict(),
+            "revision": post_revision.to_dict(),
             "next_call": {
                 "tool": "reaper_panorama_refresh",
                 "project_id": project_id,
@@ -3136,24 +3199,22 @@ def _advance_candidate_context(*, cached: dict[str, Any], project_id: str,
     if not next_token:
         return {
             "status": "unavailable",
-            "reason": str(delta.get("reason") or "delta_not_advanceable"),
-            "from_revision": applied.to_dict(),
-            "to_revision": post_revision.to_dict(),
-            "revision_after_render": post_revision.to_dict(),
-            "delta": delta,
+            "reason": str(delta.get("reason") or "change_not_advanceable"),
+            "revision": post_revision.to_dict(),
             "next_call": delta.get("next_call") or {
                 "tool": "reaper_panorama_refresh",
                 "project_id": project_id,
                 "then": "Refresh the panorama before the next structural edit.",
             },
         }
+    update = change_update_view(lifecycle, delta, context_token=str(next_token),
+                                project_id=project_id,
+                                revision=post_revision.to_dict())
     return {
         "status": "advanced",
-        "from_revision": applied.to_dict(),
-        "to_revision": post_revision.to_dict(),
-        "revision_after_render": post_revision.to_dict(),
+        "update": update,
+        "revision": post_revision.to_dict(),
         "context_token": str(next_token),
-        "delta": delta,
         "next_call": delta.get("next_call"),
     }
 
@@ -3282,9 +3343,7 @@ def reaper_render_candidate(
     if post_revision == applied:
         context_advance: dict[str, Any] = {
             "status": "not_required",
-            "from_revision": applied.to_dict(),
-            "to_revision": post_revision.to_dict(),
-            "revision_after_render": post_revision.to_dict(),
+            "revision": post_revision.to_dict(),
             "context_token": cached.get("applied_context_token"),
         }
     else:
@@ -3296,9 +3355,7 @@ def reaper_render_candidate(
             context_advance = {
                 "status": "unavailable",
                 "reason": f"context_advance_failed:{type(exc).__name__}",
-                "from_revision": applied.to_dict(),
-                "to_revision": post_revision.to_dict(),
-                "revision_after_render": post_revision.to_dict(),
+                "revision": post_revision.to_dict(),
                 "next_call": {
                     "tool": "reaper_panorama_refresh",
                     "project_id": project_id,
@@ -3351,9 +3408,8 @@ def reaper_render_candidate(
         "candidate_id": candidate_id,
         "plan_id": plan_id,
         "project_id": project_id,
-        "revision_before": result_map.get("revision_before"),
-        "revision_after": result_map.get("revision_after"),
-        "revision_after_render": result_map.get("revision_after_render"),
+        "revision": (result_map.get("revision_after_render")
+                     or result_map.get("revision_after")),
         "render_key": result_map.get("render_key"),
         "section": result_map.get("section"),
         "duration_s": result_map.get("duration_s"),
@@ -3453,7 +3509,37 @@ def _handle_argument(value: Any, *, kind: str, revision: ProjectRevision,
     raise ValidationError("Host-object API parameters need a typed handle or $reaper_ref",
                           details={"expected_kind": kind,
                                    "example": {"$reaper_ref": {"kind": kind,
-                                                                 "guid": "object GUID"}}})
+                                                                "guid": "object GUID"}}})
+
+
+def _unknown_scope_response(*, delta: Mapping[str, Any] | None,
+                            after: ProjectRevision, project_id: str,
+                            archive_root: str | None,
+                            extra: dict[str, Any]) -> dict[str, Any]:
+    """Model-facing answer for an operation whose change scope is unknown.
+
+    The sealed delta stays internal: the model only sees the new values that
+    replace its known fields, the current revision and the context token.
+    """
+    body: dict[str, Any] = dict(extra)
+    advance = delta.get("advance") if isinstance(delta, Mapping) else None
+    token = (str(advance["context_token"])
+             if isinstance(advance, Mapping) and advance.get("context_token") else "")
+    if isinstance(delta, Mapping) and delta.get("delta_id") and delta.get("acknowledgeable"):
+        body["update"] = change_update_view(_panorama_lifecycle(archive_root), delta,
+                                          context_token=token, project_id=project_id,
+                                          revision=after.to_dict())
+        body["next_call"] = {
+            "tool": None, "context_token": token,
+            "note": ("the update replaces the known fields it names; this operation's "
+                     "scope is unknown, so audio evidence remains stale")}
+        return body
+    body["status"] = str((delta or {}).get("status") or "not_modified")
+    body["revision"] = after.to_dict()
+    body["next_call"] = (delta or {}).get("next_call") or {
+        "tool": "reaper_panorama_status",
+        "note": "no project fact changed; re-read the project context"}
+    return body
 
 
 @server.tool()
@@ -3473,9 +3559,9 @@ def reaper_api_call(name: str,
     or pass a live $reaper_handle returned by an earlier call. Null is accepted
     only for optional parameters. Arrays use ordinary numeric JSON lists.
 
-    A mutating call returns a delta whose scope is explicitly ``unknown``: the
-    server does not pretend to know which tracks a raw API call touched, so all
-    project audio evidence is invalidated conservatively.
+    A mutating call returns a change update whose scope is explicitly
+    ``unknown``: the server does not pretend to know which tracks a raw API call
+    touched, so all project audio evidence is invalidated conservatively.
     """
     if not isinstance(values, list):
         raise ValidationError("values must be a positional JSON array")
@@ -3506,11 +3592,12 @@ def reaper_api_call(name: str,
                                   details={"name": name, "parameter": parameter.name})
         prepared.append(value)
     result = session.bridge.call_api(name, *prepared, timeout_s=float(timeout_s))
-    before_value = result.project_before if isinstance(result.project_before, Mapping) else None
     after_value = result.project_after if isinstance(result.project_after, Mapping) else None
+    after_final = (ProjectRevision.from_dict(dict(after_value))
+                   if isinstance(after_value, Mapping) else expected)
     delta: dict[str, Any] | None = None
     if isinstance(after_value, Mapping):
-        after_revision = ProjectRevision.from_dict(dict(after_value))
+        after_revision = after_final
         if after_revision != expected:
             delta = _record_mutation_delta(
                 lifecycle=_panorama_lifecycle(archive_root), kind="api_call",
@@ -3528,17 +3615,13 @@ def reaper_api_call(name: str,
                      "project_id": project_id,
                      "revision": after_revision.to_dict(),
                      "note": "the API call did not change the observed project revision"}
-    return {"name": result.name,
-            "returns": list(result.returns),
-            "arrays": {str(index): list(items) for index, items in result.arrays.items()},
-            "project_before": before_value,
-            "project_after": after_value,
-            "expected_revision": expected.to_dict(),
-            "delta": delta,
-            "note": ("A raw API call has unknown mutation scope: the delta invalidates "
-                     "project audio conservatively and never claims a precise untouched "
-                     "subset. Re-read the project context before claims."),
-            }
+    return _unknown_scope_response(
+        delta=delta, after=after_final, project_id=project_id,
+        archive_root=archive_root,
+        extra={"name": result.name,
+               "returns": list(result.returns),
+               "arrays": {str(index): list(items)
+                          for index, items in result.arrays.items()}})
 
 
 @server.tool()
@@ -3615,16 +3698,11 @@ def reaper_action(mode: str,
         delta = {"status": "not_modified", "acknowledgeable": False,
                  "project_id": project_id, "revision": after.to_dict(),
                  "note": "the Action did not change the observed project revision"}
-    return {"command_id": command_id, "section_id": section_id,
-            "returns": list(result.returns),
-            "project_before": expected.to_dict(),
-            "project_after": after.to_dict(),
-            "state_changed": after != expected,
-            "delta": delta,
-            "verification": ("Actions have unknown mutation scope: the delta invalidates "
-                             "project audio conservatively; re-read the affected project "
-                             "objects and capture before interpreting audio. Actions are "
-                             "not assumed to be undoable by this server.")}
+    return _unknown_scope_response(
+        delta=delta, after=after, project_id=project_id, archive_root=archive_root,
+        extra={"command_id": command_id, "section_id": section_id,
+               "state_changed": after != expected,
+               "returns": list(result.returns)})
 
 
 @server.tool()
@@ -3640,8 +3718,8 @@ def reaper_save(mode: str,
     """Save through REAPER. save_as is absolute .RPP and refuses overwrite by default.
 
     A save that moves the revision or path sets ``context_invalidated`` and
-    returns no delta: the previous token cannot be reused, and no facts about a
-    new document are invented.
+    returns no changed-value payload: the previous token cannot be reused, and no
+    facts about a new document are invented.
     """
     if mode not in {"save_current", "save_as"}:
         raise ValidationError("mode must be save_current or save_as")
@@ -3649,7 +3727,6 @@ def reaper_save(mode: str,
         raise ValidationError("overwrite_existing must be boolean")
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)
-    before = _current_context(session, expected)
     _require_panorama_receipt(panorama_receipt, project_id, expected.to_dict(),
                               archive_root)
     if mode == "save_current":
@@ -3665,19 +3742,17 @@ def reaper_save(mode: str,
     changed_identity = (ProjectRevision.from_dict(after_revision) != expected)
     result_value = {
         "result": result,
-        "revision_before": before.get("revision"),
-        "revision_after": after_revision,
+        "revision": after_revision,
         "saved": result.get("saved") is True,
         "context_invalidated": changed_identity,
     }
     if changed_identity:
-        result_value["delta"] = None
         result_value["next_call"] = {
             "tool": "reaper_capture_snapshot",
             "project_id": str(after_revision.get("project_id") or project_id),
             "then": ("Saving moved the project revision or path; the current context "
                      "token no longer matches. Capture again or refresh the structural "
-                     "context before editing. No factual delta is invented for a save."),
+                     "context before editing. No changed values are invented for a save."),
         }
     return result_value
 
@@ -3695,7 +3770,7 @@ def reaper_release(analysis_id: str) -> dict[str, Any]:
 MODEL_GUIDE: dict[str, Any] = {
     "schema": "reaper-workbench.model-guide/1",
     "purpose": ("Canonical navigation contract for a model using REAPER Workbench. "
-                "It names the complete panorama path, exact query, semantic deltas, "
+                "It names the complete panorama path, current-state updates, exact query, "
                 "operation discovery and verification; it does not prescribe a genre "
                 "or a fixed mixing recipe."),
     "project_context": {
@@ -3709,6 +3784,14 @@ MODEL_GUIDE: dict[str, Any] = {
         "ack": ("reaper_panorama_ack with every page_hash in order, or with "
                 "manifest_sha256 alone. A partial set returns missing page ids and mints "
                 "no receipt or context token."),
+        "continuity": ("The first complete panorama establishes the model's known "
+                       "project state. Keep the latest context_token as the identity of "
+                       "that state. For routine updates, call "
+                       "reaper_panorama_changes_since with this token; do not repeatedly "
+                       "re-anchor to the first capture or request the whole panorama "
+                       "after each edit. Merge returned changed facts into the known "
+                       "state. A new chat or an unprovable/lost token starts from a full "
+                       "panorama."),
         "stale_or_lost": ("a stale revision needs a new open; reaper_panorama_refresh "
                           "re-opens the current capture. A handle survives a server "
                           "restart but expires after its declared TTL."),
@@ -3741,26 +3824,34 @@ MODEL_GUIDE: dict[str, Any] = {
                     "fresh whole-project evidence, the user asks for a complete overview, "
                     "or before a final whole-project conclusion."),
     },
-    "deltas": {
-        "capture": "reaper_panorama_changes_since from an exact base capture/root.",
-        "mutation": ("reaper_edit / reaper_api_call / reaper_action return a factual "
-                     "delta bound to the acknowledged base."),
-        "inline": "a small delta carries advance.context_token in the same response.",
-        "paged": ("a delta too large for one result returns status='delta_page' with "
-                  "page 1, a manifest and a handle. Fetch every declared delta page, "
+    "updates": {
+        "capture": ("For normal continuity, reaper_panorama_changes_since uses the "
+                    "latest context_token and returns not_modified or only the net "
+                    "current facts newer than that token. An explicit base_capture_id / "
+                    "base_fact_root without a token is an informational archived-capture "
+                    "comparison, not the normal model-state update."),
+        "mutation": ("reaper_edit / reaper_api_call / reaper_action / "
+                     "reaper_render_candidate return an update: stable object ids and "
+                     "only the new current values, the current revision and the "
+                     "successor token. No internal mutation record, base/target "
+                     "revision or before/after pair is exposed."),
+        "inline": "a small update carries context_token in the same response.",
+        "paged": ("an update too large for one result returns status='change_page' with "
+                  "page 1, a manifest and a handle. Fetch every declared change page, "
                   "then ack all hashes or the manifest hash; only that ack advances the "
                   "token, exactly once."),
         "identity": ("ops address stable object ids and semantic paths, not array "
                      "positions; an insertion or FX move must not rename later objects."),
-        "metric_table": ("measurement-heavy deltas may carry the same exact metric ops "
+        "metric_table": ("measurement-heavy updates may carry the same exact metric ops "
                          "once in metric_table: integer-indexed columns plus "
                          "exact dictionaries and path_pattern. Expand every row; no "
                          "changed cell is omitted."),
         "comparability": ("computed only from identity, method/version, metric, unit, "
                           "stage, channel/window and grid criteria. Missing evidence is "
-                          "unknown; a stated mismatch is incomparable; the exact "
-                          "before/after values are still reported. No better/worse "
-                          "verdict."),
+                          "unknown; a stated mismatch is incomparable; each side's exact "
+                          "measured values are still reported in an explicit comparison. "
+                          "A normal state update is not a numeric metric difference. "
+                          "No better/worse verdict."),
     },
     "discovery": {
         "tasks": "reaper_capabilities(mode='tools')",
@@ -3771,7 +3862,7 @@ MODEL_GUIDE: dict[str, Any] = {
     },
     "edits": {
         "flow": ("preview a plan, apply with expected_revision, read back the affected "
-                 "objects and the returned delta. Save only when requested."),
+                 "objects and the returned update. Save only when requested."),
         "authority": ("only a complete panorama receipt/context token unlocks a project "
                       "edit; a read_scope is read-only."),
     },
@@ -3786,7 +3877,7 @@ MODEL_GUIDE: dict[str, Any] = {
 
 @server.resource("reaper://guide/model", name="Model navigation guide",
                  description=("Canonical, always-current MCP navigation contract: full "
-                              "panorama, page ack, exact query, semantic deltas, "
+                              "panorama, page ack, current-state updates, exact query, "
                               "discovery and verification."),
                  mime_type="application/json")
 def model_guide_resource() -> str:
@@ -4681,11 +4772,11 @@ def reaper_panorama_query(revision: dict[str, Any],
                                          "revision+archive_root+handle+panorama_receipt")})
         # A budget refusal issues this read-only binding; it is never a
         # full-view receipt and never unlocks an edit/API/action/save call.
-        return lifecycle.query(
+        return _thaw(lifecycle.query(
             "", revision, data=data, objects=objects, interval=interval,
             series=series, metrics=metrics, kinds=kinds, bands_hz=bands_hz,
             resolution_s=resolution_s, include_pairs=include_pairs,
-            max_response_bytes=max_response_bytes, read_scope=read_scope)
+            max_response_bytes=max_response_bytes, read_scope=read_scope))
     if not handle or not panorama_receipt:
         raise ValidationError(
             "A panorama query requires handle and panorama_receipt from an "
@@ -4702,7 +4793,7 @@ def reaper_panorama_query(revision: dict[str, Any],
         series=series, metrics=metrics, kinds=kinds, bands_hz=bands_hz,
         resolution_s=resolution_s, include_pairs=include_pairs,
         max_response_bytes=max_response_bytes)
-    return result
+    return _thaw(result)
 
 
 @server.tool()
@@ -4712,11 +4803,11 @@ def reaper_panorama_status(project_id: str,
                            handle: str | None = None) -> dict[str, Any]:
     """Report the latest captured revision/root and one handle's delivery state.
 
-    The handle may be a panorama page handle, a paged-delta handle, or a paged
-    exact query/audio/scoped result handle.  A paged delta reports its
-    ``delta_id``/``delta_hash``; a result handle reports ``result_kind`` and
-    ``payload_sha256``; both report page count, received/missing pages and
-    completion without repeating the payload.
+    The handle may be a panorama page handle, a paged change update, or a
+    paged exact query/audio/scoped result handle.  Every paged handle reports
+    its ``payload_sha256``; a result handle also reports ``result_kind``; all
+    report page count, received/missing pages and completion without repeating
+    the payload.
     """
     return _panorama_lifecycle(archive_root).status(project_id, handle)
 
@@ -4728,21 +4819,31 @@ def reaper_panorama_changes_since(project_id: str,
                                   base_capture_id: str | None = None,
                                   base_revision: dict[str, Any] | None = None,
                                   base_fact_root: str | None = None,
-                                  context_token: str | None = None) -> dict[str, Any]:
-    """Return a revision-bound semantic delta from an exact base capture/root.
+                                  context_token: str | None = None,
+                                  bridge_session_id: str | None = None) -> dict[str, Any]:
+    """Return only the facts newer than the supplied context token.
 
-    Pass the latest ``context_token`` to make the delta advanceable. A delta
-    without a token is informational only and cannot unlock mutation. A wrong
-    or missing base returns ``stale_base``; there is no chain horizon, because
-    both exact capture records are present. A delta that fits is delivered inline
-    with its successor token. A larger delta is returned as ``status="delta_page"``
-    with a handle and manifest; fetch every declared delta page and acknowledge
-    all hashes (or the manifest hash) to advance the token exactly once. The
-    delta never omits a change or invents a better/worse verdict.
+    The token is the model's known state: a token already at the newest known
+    revision returns ``not_modified`` and never replays earlier changes. An
+    older token receives the net current values of every sealed mutation after
+    its revision, newest value per field, with the token left un-advanced.
+    Without a token the call compares two exact captures and returns
+    ``status="change_set"``. A wrong or broken base returns ``stale_base``.
+    A large change set is returned as ``status="change_page"`` with a handle and
+    manifest; fetch every declared change page and acknowledge all hashes (or
+    the manifest hash). The update never omits a change or invents a
+    better/worse verdict.
     """
+    live_revision: Mapping[str, Any] | None = None
+    if context_token:
+        try:
+            live_revision = _session(project_id, bridge_session_id).snapshot().get("revision")
+        except Exception:  # noqa: BLE001 - archive-only answer, marked as such
+            live_revision = None
     return _panorama_lifecycle(archive_root).changes_since(
         project_id, base_capture_id=base_capture_id, base_revision=base_revision,
-        base_fact_root=base_fact_root, context_token=context_token)
+        base_fact_root=base_fact_root, context_token=context_token,
+        current_revision=live_revision)
 
 
 @server.tool()

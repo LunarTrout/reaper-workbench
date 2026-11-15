@@ -330,9 +330,16 @@ def test_large_mutation_delta_is_paged_and_advances_exactly_once(tmp_path) -> No
         after_digest=_digest(change_count=2, pan_a=1.0), scope="known",
         operation_facts=facts, readback_complete=True)
 
-    assert delta["status"] == "delta_page"
+    assert delta["status"] == "change_page"
     assert delta["page_count"] > 1
     assert "advance" not in delta
+    assert delta["manifest"]["mode"] == "change_pages"
+    assert "delta_id" not in delta["manifest"]
+    assert "delta_hash" not in delta["manifest"]
+    status = lifecycle.status(PROJECT_ID, delta["handle"])
+    assert status["handle"]["mode"] == "change_pages"
+    assert "delta_id" not in status["handle"]
+    assert "delta_hash" not in status["handle"]
 
     pages = _pages(lifecycle, delta)
     assert max(_page_bytes(page) for page in pages) <= DELTA_PAGE_MAX_BYTES
@@ -466,7 +473,7 @@ def test_capture_delta_has_no_chain_horizon(tmp_path) -> None:
         PROJECT_ID, base_capture_id="cap_00000001",
         base_revision=_revision(1), base_fact_root=None)
     assert result.get("reason") != "chain_too_long"
-    assert result["status"] in {"delta", "delta_page"}
+    assert result["status"] in {"change_update", "change_set", "change_page"}
     assert result.get("from_capture") == "cap_00000001"
 
 
@@ -508,7 +515,7 @@ def test_capture_to_capture_delta_is_paged_and_advances_after_ack(tmp_path) -> N
 
     delta = lifecycle.changes_since(record.project_id, base_capture_id=base_id,
                                     context_token=token)
-    assert delta["status"] == "delta_page"
+    assert delta["status"] == "change_page"
     assert delta["page_count"] > 1
     assert "advance" not in delta
 

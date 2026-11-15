@@ -56,7 +56,9 @@ class FakeBridge:
 
 
 class FakeTransactionBridge:
-    def __init__(self, *, malformed_preview: bool = False):
+    def __init__(self, *, malformed_preview: bool = False,
+                 undo_error: Exception | None = None,
+                 undo_result: dict | None = None):
         self.revision = {
             "project_id": "reaper:test-project",
             "change_count": 4,
@@ -64,6 +66,8 @@ class FakeTransactionBridge:
         }
         self.calls: list[tuple[str, dict]] = []
         self.malformed_preview = malformed_preview
+        self.undo_error = undo_error
+        self.undo_result = undo_result
 
     def project_context(self, project_id: str | None = None, **_: object) -> dict:
         return {"revision": dict(self.revision)}
@@ -80,6 +84,10 @@ class FakeTransactionBridge:
             return {"plan_id": arguments["plan"]["plan_id"],
                     "applied": not dry_run, "dry_run": dry_run}
         if operation == "transaction.undo":
+            if self.undo_error is not None:
+                raise self.undo_error
+            if self.undo_result is not None:
+                return dict(self.undo_result)
             return {"undone": True,
                     "revision_before": arguments["expected_revision"]}
         raise AssertionError(operation)
@@ -579,12 +587,49 @@ def test_project_session_undo_requires_and_checks_project_revision() -> None:
     session = ProjectSession(bridge)
     revision = ProjectRevision.from_dict(bridge.revision)
 
-    result = session.undo(expected_revision=revision)
+    result = session.undo(expected_revision=revision, plan_id="bridge-plan-1")
 
     assert result["undone"] is True
     assert bridge.calls == [("transaction.undo", {
         "expected_revision": bridge.revision,
+        "plan_id": "bridge-plan-1",
     })]
+
+
+def test_project_session_undo_requires_the_plan_id_of_the_transaction() -> None:
+    bridge = FakeTransactionBridge()
+    session = ProjectSession(bridge)  # type: ignore[arg-type]
+    revision = ProjectRevision.from_dict(bridge.revision)
+
+    for plan_id in ("", None, 7):
+        with pytest.raises(ValidationError, match="plan_id"):
+            session.undo(expected_revision=revision,
+                         plan_id=plan_id)  # type: ignore[arg-type]
+    assert bridge.calls == []
+
+
+def test_project_session_undo_fails_closed_when_the_plan_is_not_the_newest() -> None:
+    """A plan-scoped undo refusal must surface; it must never look like success."""
+    refused = StaleContext(
+        "The requested plan is not the newest library transaction",
+        details={"requested_plan_id": "plan-old", "latest_plan_id": "plan-new"})
+    bridge = FakeTransactionBridge(undo_error=refused)
+    session = ProjectSession(bridge)  # type: ignore[arg-type]
+    revision = ProjectRevision.from_dict(bridge.revision)
+
+    with pytest.raises(StaleContext, match="not the newest"):
+        session.undo(expected_revision=revision, plan_id="plan-old")
+    assert bridge.calls == [("transaction.undo", {
+        "expected_revision": bridge.revision, "plan_id": "plan-old"})]
+
+
+def test_project_session_undo_rejects_a_result_that_did_not_undo() -> None:
+    bridge = FakeTransactionBridge(undo_result={"undone": False})
+    session = ProjectSession(bridge)  # type: ignore[arg-type]
+    revision = ProjectRevision.from_dict(bridge.revision)
+
+    with pytest.raises(BridgeUnavailable, match="invalid transaction undo result"):
+        session.undo(expected_revision=revision, plan_id="bridge-plan-1")
 
 
 @pytest.mark.parametrize(

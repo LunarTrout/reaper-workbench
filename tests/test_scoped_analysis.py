@@ -90,3 +90,30 @@ def test_unknown_analyzer_and_source_fail_with_catalog_context(tmp_path, monkeyp
     assert result["ok"] is False
     assert "analyzer" in result["error"]["message"].lower() or \
         "analyzer" in str(result["error"]).lower()
+
+
+def _freeze(value):
+    from types import MappingProxyType
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def test_scoped_batch_survives_a_frozen_archived_capture(tmp_path, monkeypatch) -> None:
+    """An archived capture is served frozen; the scoped result must be JSON."""
+    import json
+
+    monkeypatch.setattr(
+        mcp_server, "_analyze_archived_capture",
+        lambda capture_id, start_s, end_s, **kwargs: _freeze(
+            _full({"start_s": start_s, "end_s": end_s})))
+    result = mcp_server.reaper_analyze(
+        capture_id="cap_1", archive_root=str(tmp_path),
+        analyzers=["metrics", "temporal_profile"],
+        intervals=[{"start_s": 1.0, "end_s": 2.0}])
+
+    assert result["status"] == "scoped_analysis"
+    assert result["runs"][0]["coverage"]["scoped"] is True
+    json.dumps(result, allow_nan=False)

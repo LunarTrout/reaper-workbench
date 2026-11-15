@@ -39,10 +39,10 @@ measured signal features, controlled-degradation benchmarks and explicit defect
 gates. A separate experimental EQ cycle can test one measured candidate change
 and reject it if the measurement moves the wrong way or a defect gate regresses.
 These research tools are not part of the default capture path, do not prescribe
-a mix workflow, and do not produce a universal quality verdict. Their dataset
-scope, method, measured results and limits are documented in the
-[roadmap](docs/ROADMAP.md), [policy](docs/POLICY.md), and
-[measurement methodology](docs/MIX-QUALITY-METHODOLOGY.ru.md).
+a mix workflow, and do not produce a universal quality verdict. Their method
+and limits are documented in [policy](docs/POLICY.md) and
+[measurement methodology](docs/MIX-QUALITY-METHODOLOGY.ru.md); validation status
+is tracked separately in [validation](docs/VALIDATION.md).
 
 ### Audio analysis
 
@@ -113,13 +113,13 @@ The actual report also carries project tempo at each timeline cell, FX/routing c
 
 ### LLM-facing interface
 
-The MCP server currently exposes **29 tools** and **5 resource templates**. The interface covers project-context delivery (open, page, acknowledge, exact query, status, delta and refresh), a plan-bound candidate render (`reaper_render_candidate`), capability discovery, integrated analysis, supported edit batches, listener/spatial diagnostics, timeline context, and lower-level REAPER API functions or Actions. Candidate rendering uses REAPER's native master path and checks settings restoration and project state; if the check detects a mismatch, the WAV is deleted and the request fails closed. Live comparison against a normal REAPER render is still an open validation item; see [Validation status](docs/VALIDATION.md). The server does not publish one tool per ReaScript function.
+The MCP server currently exposes **31 tools**, **5 resource templates** and **2 static resources**. The interface covers project-context delivery (open, page, acknowledge, exact query, status, change updates and refresh), a plan-bound candidate render (`reaper_render_candidate`), capability discovery, integrated analysis, supported edit batches, listener/spatial diagnostics, timeline context, and lower-level REAPER API functions or Actions. Candidate rendering uses REAPER's native master path and checks settings restoration and project state; if the check detects a mismatch, the WAV is deleted and the request fails closed. Live comparison against a normal REAPER render is still an open validation item; see [Validation status](docs/VALIDATION.md). The server does not publish one tool per ReaScript function.
 
-Project context is a paged delivery of one view fixed to one capture and revision. `reaper_panorama_open` returns page 1 plus a manifest of every page id, payload hash and measured page size; `reaper_panorama_page` fetches the rest and `reaper_panorama_ack` verifies every page hash, reconstructs the exact `view_sha256` and mints the receipt plus context token. Pagination preserves that view without further truncation; the view itself is a bounded projection, so dense time series are summarized and linked to exact archived data. Page count adapts to the configured serialized-response budget; larger projects yield more pages. Mutating tools (`reaper_edit` apply/undo, `reaper_api_call`, `reaper_action` invoke, `reaper_save`) and project-target analysis/read tools (`reaper_analyze`, spatial/Flamingo project targets, `reaper_mix_evidence`, `reaper_edit_map`, `reaper_panorama_query`, and `reaper_capture_read`) reject a missing, stale or mismatched token. The bootstrap `reaper_capture_snapshot` is the only no-receipt capture operation and returns capture/archive metadata only, not the view. Exact high-frequency rows — relation edges, series cells, MIDI notes, envelope points — come from one generic semantic query (`reaper_panorama_query`) that returns the exact selection whole when it fits and otherwise as complete result pages, never truncated or narrowed for transport size. Deltas are bound to an exact base capture/fact root and their successor token is delivered in the same response; `refresh` is the normal recovery path after loss or staleness. The receipt guarantees delivery of these exact pages (view hash, revision, fact root), never that a model read or understood them.
+Project context starts with one complete panorama bound to a capture and revision. `reaper_panorama_open` returns the full view when it fits; otherwise it returns page 1 and a manifest, and the model fetches every remaining page before acknowledging the exact view and receiving its context token. Pagination preserves the bounded projection without transport truncation; dense time series are summarized and linked to exact archived data. Page count adapts to the configured response budget. The token represents the latest project state delivered to the model. After a typed edit, the normal `change_update` contains only added, changed or removed facts, using stable object IDs and the new current values; unchanged facts and the original panorama are not repeated. The update carries its successor token, so the model merges it into its known state instead of reloading the whole view after each edit. Oversized updates are delivered completely in pages and advance the token only after acknowledgement. If continuity is lost or cannot be proven, `reaper_panorama_refresh` opens a new full view. An explicit comparison of two archived captures is separate from these current-state updates; it reports factual changes and comparability, never a quality verdict. Numeric audio-metric comparisons are also separate from project-state updates. The receipt guarantees delivery of the exact view pages, not that a model read or understood them.
 
 The page parameters are named `*_bytes` for compatibility, but the current implementation measures the character count of an indented JSON rendering of each result; this is not a UTF-8 wire-byte count or the complete MCP transport envelope, and host-specific limits still need validation. Defaults are 30,000 characters target and 46,000 characters maximum per page. On the archived 41-track / 42-source reference capture the full model view is 46,977 compact bytes and is delivered in 5 pages (31,691 / 27,681 / 14,266 / 38,084 / 25,890 measured characters, max 38,084); the 101-source synthetic fixture (80,717-byte view) needs 12 pages, max 45,185. There is no page-count cap. A section larger than one page is split only at list-element boundaries with its head repeated; a single element that cannot fit raises with its measured size. The view keeps every track/master and all 24 scalar metric columns with units, window, stage and method provenance; exact item/take/audio rows, series cells, relation edges, MIDI notes and envelope points stay addressable by one semantic query. Inline scalar values are explicitly rounded, and `reaper_panorama_query(data=["analysis"], objects=[...], metrics=[...])` returns the unrounded stored values.
 
-The model-facing contract is intentionally broader than preset musical workflows. Mixing, editing, arranging, MIDI authoring, and other tasks are expressed as goals assembled from project inspection, analysis, and REAPER operations; the interface does not impose genre rules or a fixed processing chain. See the [model guide](docs/MCP-README-LLM.md) for tool semantics and context handling, and [the decision record](docs/DECISION-single-response-panorama.md) for the delivery-history decisions.
+The model-facing contract is intentionally broader than preset musical workflows. Mixing, editing, arranging, MIDI authoring, and other tasks are expressed as goals assembled from project inspection, analysis, and REAPER operations; the interface does not impose genre rules or a fixed processing chain. See the [model guide](docs/MCP-README-LLM.md) for tool semantics and context handling, [architecture](docs/ARCHITECTURE.md) for current implementation details, and [historical documents](docs/OLD.md) for superseded drafts.
 
 ### Working principles (not a mixing pipeline)
 
@@ -133,16 +133,19 @@ The model-facing contract is intentionally broader than preset musical workflows
   user's aesthetic judgment separate. Cite units, stage, window and provenance.
 - Treat missing, stale, invalidated or incomparable evidence as a stated gap,
   not as silence or “no change”.
+- Merge each change update into the latest acknowledged state. Do not re-anchor
+  routine updates to the first capture or confuse a numeric audio comparison
+  with a project-state update.
 - After an edit, read the actual state back; if the change affects signal or
   arrangement, recapture before reusing old audio/measurement conclusions.
 - Preserve alternatives and uncertainty; do not infer role or quality from a
   track name, one metric or a genre recipe.
 
 Anti-patterns: treating a spill preview or a hand-reassembled set of query
-answers as the full project view; mutating on a stale context token; applying a
-delta to a different base; labeling a reduced projection “full”; hiding an
-over-budget outcome; or inventing a better/worse verdict without listening and
-evidence.
+answers as the full project view; mutating on a stale context token; merging an
+update into a different or unknown project state; labeling a reduced projection
+“full”; hiding an over-budget outcome; or inventing a better/worse verdict
+without listening and evidence.
 
 ## Installation and connection
 
@@ -187,6 +190,7 @@ The server speaks MCP over stdio. It expects the REAPER bridge to be running in 
 - [Safety and project-state guarantees](docs/SAFETY.md)
 - [MCP guide for language models](docs/MCP-README-LLM.md)
 - [Validation status and release gates](docs/VALIDATION.md)
+- [Historical documents and superseded drafts](docs/OLD.md)
 - [Russian documentation](README.ru.md)
 
 ## License

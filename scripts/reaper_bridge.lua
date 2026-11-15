@@ -39,7 +39,7 @@ local protocol_version = 1
 -- Bridge contract build. Bumped whenever the resident script's request surface
 -- or its guarantees change, so a client can prove which copy is actually
 -- running before it trusts a reload, a capture or an edit.
-local bridge_build = "b5-2026-11-14"
+local bridge_build = "b5-2026-11-15"
 -- A second boot inside the same REAPER Lua state must supersede the first:
 -- two loops would both keep heartbeating and the client would see two live
 -- bridges. Every loop compares this token before it reschedules; the newest
@@ -3339,6 +3339,7 @@ local function read_edit_state(project, operation)
       state.preset = preset_ok and preset or ""
     elseif kind == "fx.move" then
       state.fx_index = fx_index
+      state.fx_count = reaper.TrackFX_GetCount(target)
     elseif kind == "fx.offline" then
       state.offline = reaper.TrackFX_GetOffline(target, fx_index)
     elseif kind == "fx.get_chunk" then
@@ -3434,7 +3435,10 @@ local function inspect_edit(project, operation)
   elseif normalized.kind == "fx.offline" then
     changed = before.offline ~= desired.offline
   elseif normalized.kind == "fx.move" then
-    changed = true
+    -- Reordering a plugin into the slot it already occupies changes nothing.
+    -- TrackFX_CopyToTrack on the same slot can drop the plugin, so it must
+    -- never be called for that case; a one-slot chain has no other order.
+    changed = before.fx_count > 1 and before.fx_index ~= desired.to_index
   elseif normalized.kind == "fx.get_chunk" then
     changed = true
   else
@@ -4189,6 +4193,21 @@ local function transaction_undo(arguments)
   if not last then
     fail("stale_context", "No library transaction is recorded for this project",
          { current = current })
+  end
+  local requested_plan = arguments and arguments.plan_id
+  if type(requested_plan) ~= "string" or requested_plan == "" then
+    fail("validation_error",
+         "transaction.undo requires the plan_id of the transaction to undo",
+         { current = current })
+  end
+  -- Undo must target the transaction the caller names. A no-op apply records
+  -- nothing, so an undo aimed at that plan would otherwise rewind whichever
+  -- transaction is still recorded here.
+  if last.plan_id ~= requested_plan then
+    fail("stale_context",
+         "The requested plan is not the newest library transaction; undo would target a different edit",
+         { requested_plan_id = requested_plan, latest_plan_id = last.plan_id,
+           available_undo = reaper.Undo_CanUndo2(project) })
   end
   local description = reaper.Undo_CanUndo2(project)
   if description ~= last.undo_label then

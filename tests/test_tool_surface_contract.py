@@ -113,7 +113,7 @@ def test_server_instructions_state_the_complete_panorama_and_delta_path() -> Non
     assert "fetching every declared page" in text
     assert "page_id_pattern" in text
     assert "manifest_sha256" in text
-    assert "status=delta_page" in text
+    assert "status=change_page" in text
     assert "result_page" in text
     assert "not an automatic next step" in text
     assert 'reaper_capabilities(mode="tools")' in text or \
@@ -129,10 +129,10 @@ def test_model_guide_resource_carries_the_same_contract() -> None:
     assert guide["project_context"]["start"].startswith("reaper_panorama_open")
     assert "pages are the complete path" in guide["project_context"]["pages"]
     assert "manifest_sha256" in guide["project_context"]["ack"]
-    assert "delta_page" in guide["deltas"]["paged"]
-    assert "stable object ids" in guide["deltas"]["identity"]
-    assert "metric_table" in guide["deltas"]
-    assert "No better/worse" in guide["deltas"]["comparability"]
+    assert "change_page" in guide["updates"]["paged"]
+    assert "stable object ids" in guide["updates"]["identity"]
+    assert "metric_table" in guide["updates"]
+    assert "No better/worse" in guide["updates"]["comparability"]
     assert guide["scoped_analysis"]["catalog"] == \
         "reaper_capabilities(mode='tools').analyzers"
     assert "not an automatic next step" in guide["scoped_analysis"]["no_loop"]
@@ -156,4 +156,46 @@ def test_readme_has_no_single_first_contradiction() -> None:
     assert 'Prefer `mode="single"`' not in text
     assert "default for compatibility" not in text
     assert "size-independent" in text
-    assert "delta_page" in text
+    assert "change_page" in text
+
+
+FORBIDDEN_MUTATION_KEYS = {
+    "delta", "delta_id", "delta_hash", "mutation_delta",
+    "project_before", "project_after",
+    "from_revision", "to_revision",
+    "revision_before", "revision_after",
+    "base_revision", "target_revision", "base", "target",
+}
+
+
+def test_tool_return_literals_expose_no_internal_mutation_record() -> None:
+    """Static guard: no tool returns a dict literal with an internal record key.
+
+    Runtime checks cover the paths built through helpers; this scan makes the
+    rule visible at the surface itself, so a new tool cannot reintroduce
+    ``delta``/``project_before``/``revision_after`` in its own return value.
+    """
+    import ast
+    from pathlib import Path as _Path
+
+    source = _Path(mcp_server.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    def is_tool(node: ast.FunctionDef) -> bool:
+        return any("server.tool" in ast.unparse(item) for item in node.decorator_list)
+
+    offenders: list[tuple[str, int, str]] = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or not is_tool(node):
+            continue
+        for item in ast.walk(node):
+            if not isinstance(item, ast.Return) or item.value is None:
+                continue
+            for literal in ast.walk(item.value):
+                if not isinstance(literal, ast.Dict):
+                    continue
+                for key in literal.keys:
+                    if (isinstance(key, ast.Constant) and isinstance(key.value, str)
+                            and key.value in FORBIDDEN_MUTATION_KEYS):
+                        offenders.append((node.name, literal.lineno, key.value))
+    assert offenders == []

@@ -2046,9 +2046,12 @@ class ProjectSession:
             max_duration_s=max_duration_s, max_bytes=max_bytes,
         )
 
-    def undo(self, *, expected_revision: ProjectRevision) -> dict:
+    def undo(self, *, expected_revision: ProjectRevision,
+             plan_id: str) -> dict:
         if not isinstance(expected_revision, ProjectRevision):
             raise ValidationError("undo requires the revision returned by the applied transaction")
+        if not isinstance(plan_id, str) or not plan_id:
+            raise ValidationError("undo requires the plan_id of the applied transaction")
         current = self.snapshot()
         revision = ProjectRevision.from_dict(current["revision"])
         if revision != expected_revision:
@@ -2056,7 +2059,8 @@ class ProjectSession:
                                details={"expected": expected_revision.to_dict(),
                                         "current": revision.to_dict()})
         result = self.bridge.call("transaction.undo",
-                                  {"expected_revision": expected_revision.to_dict()})
+                                  {"expected_revision": expected_revision.to_dict(),
+                                   "plan_id": plan_id})
         if (not isinstance(result, dict) or result.get("undone") is not True or
                 not isinstance(result.get("revision_before"), dict) or
                 ProjectRevision.from_dict(result["revision_before"]) != expected_revision):

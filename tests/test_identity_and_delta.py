@@ -552,12 +552,306 @@ def test_two_sequential_edits_advance_without_a_new_capture(tmp_path: Path) -> N
     assert second_ack["delta_chain_length"] == 2
     assert second_ack["audio_evidence"]["state"] == "stale"
 
-    # The archive still holds only the revision-1 capture. A capture-to-capture
-    # delta must not claim "not modified" for a context that is already ahead.
-    ahead = lifecycle.changes_since(PROJECT_ID,
-                                    context_token=second_ack["context_token"])
+    # The token at revision 2 is behind the sealed revision-3 edit; only the
+    # fact newer than the token is returned, with the token left un-advanced.
+    ahead = lifecycle.changes_since(PROJECT_ID, context_token=advanced)
+    assert ahead["status"] == "change_update"
+    # The sealed revision-3 token is proven, so it is reused instead of asking
+    # for another capture of the same state.
+    assert ahead["context_token"] == second_ack["context_token"]
+    assert ahead["token_advanced"] is True
+    assert ahead["revision"]["change_count"] == 3
+    assert ahead["measurements"]["state"] == "stale"
+    assert ahead["changed"] == [{
+        "id": f"track:{TRACK_A}",
+        "kind": "track",
+        "fields": [{"field": "volume", "value": 0.5}],
+    }]
+    assert "delta_id" not in ahead
+    assert "objects" not in ahead
+    assert "from_revision" not in ahead and "to_revision" not in ahead
+
+
+def test_changes_since_current_token_returns_not_modified(tmp_path: Path) -> None:
+    """A token already at the newest known revision must not replay history."""
+    root = _archive(tmp_path)
+    _capture(root, "cap_00000001", _revision(1), _digest(change_count=1))
+    lifecycle = PanoramaLifecycle(root, page_bytes=4096)
+    token = _acknowledge(lifecycle)["context_token"]
+
+    first = lifecycle.record_change(
+        kind="edit", context_token=token, project_id=PROJECT_ID,
+        base_revision=_revision(1), target_revision=_revision(2),
+        after_digest=_digest(change_count=2, pan_a=-1.0), scope="known",
+        operation_facts=[{"operation_index": 1, "kind": "track.set",
+                          "target_guid": TRACK_A,
+                          "before": {"pan": 0.0}, "after": {"pan": -1.0},
+                          "changes_state": True}],
+        readback_complete=True)
+    token_two = lifecycle.delta_ack(first["delta_id"], first["delta_hash"],
+                                    token)["context_token"]
+
+    current = lifecycle.changes_since(PROJECT_ID, context_token=token_two,
+                                      current_revision=_revision(2))
+    assert current["status"] == "not_modified"
+    assert current["revision"]["change_count"] == 2
+    assert current["verified_against_live"] is True
+    assert "changed" not in current
+    assert "delta_id" not in current
+
+
+def test_changes_since_older_token_returns_only_later_facts(tmp_path: Path) -> None:
+    """An older token receives the net values after it, newest record wins."""
+    root = _archive(tmp_path)
+    _capture(root, "cap_00000001", _revision(1), _digest(change_count=1))
+    lifecycle = PanoramaLifecycle(root, page_bytes=4096)
+    token_one = _acknowledge(lifecycle)["context_token"]
+
+    first = lifecycle.record_change(
+        kind="edit", context_token=token_one, project_id=PROJECT_ID,
+        base_revision=_revision(1), target_revision=_revision(2),
+        after_digest=_digest(change_count=2, pan_a=-1.0), scope="known",
+        operation_facts=[{"operation_index": 1, "kind": "track.set",
+                          "target_guid": TRACK_A,
+                          "before": {"pan": 0.0}, "after": {"pan": -1.0},
+                          "changes_state": True}],
+        readback_complete=True)
+    token_two = lifecycle.delta_ack(first["delta_id"], first["delta_hash"],
+                                    token_one)["context_token"]
+
+    second = lifecycle.record_change(
+        kind="edit", context_token=token_two, project_id=PROJECT_ID,
+        base_revision=_revision(2), target_revision=_revision(3),
+        after_digest=_digest(change_count=3, pan_a=-0.25, volume_a=0.5), scope="known",
+        operation_facts=[{"operation_index": 1, "kind": "track.set",
+                          "target_guid": TRACK_A,
+                          "before": {"pan": -1.0, "volume": 1.0},
+                          "after": {"pan": -0.25, "volume": 0.5},
+                          "changes_state": True}],
+        readback_complete=True)
+    token_three = lifecycle.delta_ack(second["delta_id"], second["delta_hash"],
+                                      token_two)["context_token"]
+
+    ahead = lifecycle.changes_since(PROJECT_ID, context_token=token_one,
+                                    current_revision=_revision(3))
+    assert ahead["status"] == "change_update"
+    assert ahead["revision"]["change_count"] == 3
+    # The sealed final record's successor token is proven to certify exactly
+    # this revision, so the model does not need another capture.
+    assert ahead["context_token"] == token_three
+    assert ahead["token_advanced"] is True
+    assert ahead["successor"] == "sealed_mutation_token"
+    changed = {row["id"]: {field["field"]: field["value"] for field in row["fields"]}
+               for row in ahead["changed"]}
+    assert changed[f"track:{TRACK_A}"]["pan"] == -0.25   # newest record wins
+    assert changed[f"track:{TRACK_A}"]["volume"] == 0.5  # earlier record kept
+    assert "delta_id" not in ahead and "objects" not in ahead
+
+
+def test_changes_since_incomplete_readback_cannot_advance(tmp_path: Path) -> None:
+    root = _archive(tmp_path)
+    _capture(root, "cap_00000001", _revision(1), _digest(change_count=1))
+    lifecycle = PanoramaLifecycle(root, page_bytes=4096)
+    token_one = _acknowledge(lifecycle)["context_token"]
+
+    first = lifecycle.record_change(
+        kind="edit", context_token=token_one, project_id=PROJECT_ID,
+        base_revision=_revision(1), target_revision=_revision(2),
+        after_digest=_digest(change_count=2, pan_a=-1.0), scope="known",
+        operation_facts=[{"operation_index": 1, "kind": "track.set",
+                          "target_guid": TRACK_A,
+                          "before": {"pan": 0.0}, "after": {"pan": -1.0},
+                          "changes_state": True}],
+        readback_complete=True)
+    token_two = lifecycle.delta_ack(first["delta_id"], first["delta_hash"],
+                                    token_one)["context_token"]
+    second = lifecycle.record_change(
+        kind="edit", context_token=token_two, project_id=PROJECT_ID,
+        base_revision=_revision(2), target_revision=_revision(3),
+        after_digest=_digest(change_count=3, volume_a=0.5), scope="known",
+        operation_facts=[{"operation_index": 1, "kind": "track.set",
+                          "target_guid": TRACK_A,
+                          "before": {"volume": 1.0}, "after": {"volume": 0.5},
+                          "changes_state": True}],
+        readback_complete=False)
+
+    ahead = lifecycle.changes_since(PROJECT_ID, context_token=token_one,
+                                    current_revision=_revision(3))
+    assert ahead["coverage"]["complete"] is False
+    assert ahead["token_advanced"] is False
+    assert ahead["advance_refused"] == "readback_incomplete"
+    assert ahead["context_token"] == token_one
+
+
+def test_changes_since_paged_chain_cannot_advance(tmp_path: Path,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    import reaper_audio.context.lifecycle as lifecycle_module
+
+    root = _archive(tmp_path)
+    _capture(root, "cap_00000001", _revision(1), _digest(change_count=1))
+    lifecycle = PanoramaLifecycle(root, page_bytes=4096)
+    token_one = _acknowledge(lifecycle)["context_token"]
+
+    first = lifecycle.record_change(
+        kind="edit", context_token=token_one, project_id=PROJECT_ID,
+        base_revision=_revision(1), target_revision=_revision(2),
+        after_digest=_digest(change_count=2, pan_a=-1.0), scope="known",
+        operation_facts=[{"operation_index": 1, "kind": "track.set",
+                          "target_guid": TRACK_A,
+                          "before": {"pan": 0.0}, "after": {"pan": -1.0},
+                          "changes_state": True}],
+        readback_complete=True)
+    token_two = lifecycle.delta_ack(first["delta_id"], first["delta_hash"],
+                                    token_one)["context_token"]
+    second = lifecycle.record_change(
+        kind="edit", context_token=token_two, project_id=PROJECT_ID,
+        base_revision=_revision(2), target_revision=_revision(3),
+        after_digest=_digest(change_count=3, volume_a=0.5), scope="known",
+        operation_facts=[{"operation_index": 1, "kind": "track.set",
+                          "target_guid": TRACK_A,
+                          "before": {"volume": 1.0}, "after": {"volume": 0.5},
+                          "changes_state": True}],
+        readback_complete=True)
+    lifecycle.delta_ack(second["delta_id"], second["delta_hash"], token_two)
+
+    # Force the synthesized update over the inline ceiling: it must never be
+    # advanced without full page delivery, and a synthesized chain has no
+    # single sealed record to acknowledge.
+    monkeypatch.setattr(lifecycle_module, "DELTA_INLINE_MAX_BYTES", 1)
+    ahead = lifecycle.changes_since(PROJECT_ID, context_token=token_one,
+                                    current_revision=_revision(3))
+    assert ahead["delivery"]["fits"] is False
+    assert ahead["token_advanced"] is False
+    assert ahead["advance_refused"] == "update_exceeds_inline_limit"
+    assert ahead["context_token"] == token_one
+    assert "page" not in ahead["status"]
+
+
+def test_changes_since_legacy_successor_without_facts_is_not_reused(
+        tmp_path: Path) -> None:
+    root = _archive(tmp_path)
+    _capture(root, "cap_00000001", _revision(1), _digest(change_count=1))
+    lifecycle = PanoramaLifecycle(root, page_bytes=4096)
+    token_one = _acknowledge(lifecycle)["context_token"]
+
+    first = lifecycle.record_change(
+        kind="edit", context_token=token_one, project_id=PROJECT_ID,
+        base_revision=_revision(1), target_revision=_revision(2),
+        after_digest=_digest(change_count=2, pan_a=-1.0), scope="known",
+        operation_facts=[{"operation_index": 1, "kind": "track.set",
+                          "target_guid": TRACK_A,
+                          "before": {"pan": 0.0}, "after": {"pan": -1.0},
+                          "changes_state": True}],
+        readback_complete=True)
+    token_two = lifecycle.delta_ack(first["delta_id"], first["delta_hash"],
+                                    token_one)["context_token"]
+    second = lifecycle.record_change(
+        kind="edit", context_token=token_two, project_id=PROJECT_ID,
+        base_revision=_revision(2), target_revision=_revision(3),
+        after_digest=_digest(change_count=3, volume_a=0.5), scope="known",
+        operation_facts=[{"operation_index": 1, "kind": "track.set",
+                          "target_guid": TRACK_A,
+                          "before": {"volume": 1.0}, "after": {"volume": 0.5},
+                          "changes_state": True}],
+        readback_complete=True)
+    token_three = lifecycle.delta_ack(second["delta_id"], second["delta_hash"],
+                                      token_two)["context_token"]
+
+    # Simulate an archive minted before tokens carried structural facts: the
+    # successor revision is right, but a later token-relative diff would fall
+    # back to the capture and replay known fields, so reuse must be refused.
+    context = json.loads(lifecycle._context_path(token_three).read_text(encoding="utf-8"))
+    context.pop("structural_facts", None)
+    lifecycle._context_path(token_three).write_text(json.dumps(context), encoding="utf-8")
+
+    ahead = lifecycle.changes_since(PROJECT_ID, context_token=token_one,
+                                    current_revision=_revision(3))
+    assert ahead["token_advanced"] is False
+    assert ahead["advance_refused"] == "successor_missing_facts"
+    assert ahead["context_token"] == token_one
+
+
+def test_changes_since_live_ahead_of_archive_is_stale(tmp_path: Path) -> None:
+    """A live revision with no sealed record must not be called not_modified."""
+    root = _archive(tmp_path)
+    _capture(root, "cap_00000001", _revision(1), _digest(change_count=1))
+    lifecycle = PanoramaLifecycle(root, page_bytes=4096)
+    token = _acknowledge(lifecycle)["context_token"]
+
+    ahead = lifecycle.changes_since(PROJECT_ID, context_token=token,
+                                    current_revision=_revision(2))
     assert ahead["status"] == "stale_base"
-    assert ahead["reason"] == "context_ahead_of_capture_archive"
+    assert ahead["reason"] == "live_ahead_of_archive"
+    assert "changed" not in ahead
+
+
+def test_changes_since_broken_chain_is_stale(tmp_path: Path) -> None:
+    """A missing sealed record is never guessed across."""
+    root = _archive(tmp_path)
+    _capture(root, "cap_00000001", _revision(1), _digest(change_count=1))
+    lifecycle = PanoramaLifecycle(root, page_bytes=4096)
+    token_one = _acknowledge(lifecycle)["context_token"]
+
+    first = lifecycle.record_change(
+        kind="edit", context_token=token_one, project_id=PROJECT_ID,
+        base_revision=_revision(1), target_revision=_revision(2),
+        after_digest=_digest(change_count=2, pan_a=-1.0), scope="known",
+        operation_facts=[{"operation_index": 1, "kind": "track.set",
+                          "target_guid": TRACK_A,
+                          "before": {"pan": 0.0}, "after": {"pan": -1.0},
+                          "changes_state": True}],
+        readback_complete=True)
+    token_two = lifecycle.delta_ack(first["delta_id"], first["delta_hash"],
+                                    token_one)["context_token"]
+    second = lifecycle.record_change(
+        kind="edit", context_token=token_two, project_id=PROJECT_ID,
+        base_revision=_revision(2), target_revision=_revision(3),
+        after_digest=_digest(change_count=3, volume_a=0.5), scope="known",
+        operation_facts=[{"operation_index": 1, "kind": "track.set",
+                          "target_guid": TRACK_A,
+                          "before": {"volume": 1.0}, "after": {"volume": 0.5},
+                          "changes_state": True}],
+        readback_complete=True)
+    lifecycle.delta_ack(second["delta_id"], second["delta_hash"], token_two)
+
+    # Remove the 1 -> 2 record; the remaining 2 -> 3 record cannot bridge a
+    # revision-1 token, so the answer must fail closed.
+    for path in lifecycle.deltas_dir.glob("*.json"):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if (record.get("record_kind") == "mutation_delta"
+                and (record.get("base") or {}).get("revision", {}).get("change_count") == 1):
+            path.unlink()
+
+    ahead = lifecycle.changes_since(PROJECT_ID, context_token=token_one,
+                                    current_revision=_revision(3))
+    assert ahead["status"] == "stale_base"
+    assert ahead["reason"] == "unrecorded_changes"
+    assert "changed" not in ahead
+
+
+def test_change_update_fallback_names_the_object_id_not_the_operation_id() -> None:
+    """When the sealed object diff is empty, operation facts still merge by object id."""
+    from reaper_audio.context.lifecycle import change_update_view
+
+    delta = {
+        "delta_id": "chg_test", "delta_hash": "hash",
+        "objects": {"changed": []},
+        "operation_facts": [{
+            "operation_index": 1, "kind": "track.set", "target_guid": TRACK_A,
+            "before": {"volume": 0.55}, "after": {"volume": 0.5},
+            "changes_state": True,
+        }],
+        "audio_evidence": {"state": "stale", "invalidated_sources": ["trk_a"]},
+        "readback": {"complete": True},
+        "target": {"revision": _revision(2)},
+    }
+    update = change_update_view(None, delta, context_token="ct_test",
+                                project_id=PROJECT_ID, revision=_revision(2))
+    assert update["status"] == "change_update"
+    assert update["changed"] == [{
+        "id": f"track:{TRACK_A}", "kind": "track",
+        "fields": [{"field": "volume", "value": 0.5}],
+    }]
 
 
 def test_no_op_delta_advances_structure_but_cannot_claim_audio_fresh(
@@ -693,13 +987,16 @@ def test_changes_since_delivers_the_successor_token_in_the_same_response(
 
     result = lifecycle.changes_since(PROJECT_ID, base_capture_id="cap_00000001",
                                      context_token=base["context_token"])
-    assert result["status"] == "delta"
+    assert result["status"] == "change_set"
     assert result["advance"]["advanced"] is True
     successor = result["advance"]["context_token"]
     assert successor and successor != base["context_token"]
     gate = lifecycle.require_receipt(successor, PROJECT_ID, _revision(2))
     assert gate["complete"] is True
     # The explicit re-ack is idempotent and yields the same successor.
-    repeated = lifecycle.delta_ack(result["delta_id"], result["delta_hash"],
+    record = max((json.loads(item.read_text(encoding="utf-8"))
+                             for item in lifecycle.deltas_dir.glob("dl_*.json")),
+                        key=lambda item: item.get("created_at") or 0)
+    repeated = lifecycle.delta_ack(record["delta_id"], record["delta_hash"],
                                    base["context_token"])
     assert repeated["context_token"] == successor

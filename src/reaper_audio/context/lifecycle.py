@@ -615,8 +615,7 @@ def delivery_status(state: Mapping[str, Any]) -> dict[str, Any]:
         progress["manifest_sha256"] = state.get("manifest_sha256")
         out.update(progress)
         if mode == "delta_pages":
-            out["delta_id"] = state.get("delta_id")
-            out["delta_hash"] = state.get("delta_hash")
+            out["payload_sha256"] = state.get("payload_sha256")
         if mode == "result_pages":
             out["result_kind"] = state.get("result_kind")
             out["payload_sha256"] = state.get("payload_sha256")
@@ -925,6 +924,526 @@ def _merge_view_pages(pages: Sequence[Mapping[str, Any]]) -> OrderedDict[str, An
             raise ValidationError("Page fragments are not valid JSON",
                                   details={"section": key, "error": str(exc)}) from exc
     return merged
+
+
+def _find_mutation_chain(self, *, project_id: str, base_capture_id: str,
+                         base_revision: Mapping[str, Any],
+                         target_revision: Mapping[str, Any],
+                         records_out: list[dict[str, Any]] | None = None
+                         ) -> dict[str, Any] | None:
+    """Merge the sealed mutation records that link base to target.
+
+    Several edits can advance the context without a new capture.  Each record
+    was sealed against its own token, so the ordered chain is an exact history;
+    merging it yields the current values the model is missing, with the newest
+    record winning per field.  A gap in the chain returns ``None`` so the caller
+    keeps the conservative ``stale_base`` answer.
+    """
+    def _count(value: Any) -> int | None:
+        if not isinstance(value, Mapping):
+            return None
+        number = value.get("change_count")
+        return number if isinstance(number, int) else None
+
+    start = _count(base_revision)
+    target = _count(target_revision)
+    if start is None or target is None or target <= start:
+        return None
+    try:
+        paths = list(self.deltas_dir.glob("*.json"))
+    except OSError:
+        return None
+    by_base: dict[int, dict[str, Any]] = {}
+    for path in paths:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if not isinstance(record, Mapping):
+            continue
+        if str(record.get("record_kind")) != "mutation_delta":
+            continue
+        if normalize_project_id(record.get("project_id")) != normalize_project_id(project_id):
+            continue
+        base = record.get("base") if isinstance(record.get("base"), Mapping) else {}
+        if str(base.get("capture_id") or "") != base_capture_id:
+            continue
+        count = _count(base.get("revision"))
+        if count is None:
+            continue
+        previous = by_base.get(count)
+        created = record.get("created_at")
+        created_value = float(created) if isinstance(created, (int, float)) else 0.0
+        previous_created = (float(previous.get("created_at") or 0.0)
+                            if previous is not None else -1.0)
+        if previous is None or created_value >= previous_created:
+            by_base[count] = dict(record)
+    chain: list[dict[str, Any]] = []
+    cursor = start
+    seen: set[int] = set()
+    while cursor != target:
+        if cursor in seen or len(chain) > 64:
+            return None
+        seen.add(cursor)
+        record = by_base.get(cursor)
+        if record is None:
+            return None
+        record_target = record.get("target") if isinstance(record.get("target"), Mapping) else {}
+        next_count = _count(record_target.get("revision"))
+        if next_count is None or next_count <= cursor:
+            return None
+        chain.append(record)
+        cursor = next_count
+    if not chain:
+        return None
+    if records_out is not None:
+        records_out.extend(chain)
+    objects: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    invalidated_sources: set[str] = set()
+    invalidated_analyses: set[str] = set()
+    fresh_sources: set[str] = set()
+    stale = False
+    complete = True
+    for record in chain:
+        payload = record.get("payload") if isinstance(record.get("payload"), Mapping) else {}
+        for entry in _changed_facts(payload):
+            stable_id = entry["id"]
+            if stable_id not in objects:
+                objects[stable_id] = {"id": stable_id,
+                                      "object_kind": str(entry["kind"]),
+                                      "fields": {}}
+                order.append(stable_id)
+            for field in entry["fields"]:
+                objects[stable_id]["fields"][field["field"]] = field["value"]
+        audio = payload.get("audio_evidence") if isinstance(payload.get("audio_evidence"), Mapping) else {}
+        stale = stale or str(audio.get("state") or "") == "stale"
+        invalidated_sources.update(str(item) for item in audio.get("invalidated_sources") or [])
+        invalidated_analyses.update(str(item) for item in audio.get("invalidated_analysis_ids") or [])
+        fresh_sources.update(str(item) for item in audio.get("fresh_sources") or [])
+        readback = payload.get("readback") if isinstance(payload.get("readback"), Mapping) else {}
+        complete = complete and bool(readback.get("complete", True))
+    changed = [{
+        "id": stable_id,
+        "object_kind": objects[stable_id]["object_kind"],
+        "fields": [{"field": name, "after": value}
+                   for name, value in objects[stable_id]["fields"].items()],
+    } for stable_id in order]
+    return {
+        "objects": {"changed": changed},
+        "target": {"revision": dict(target_revision)},
+        "audio_evidence": {
+            "state": "stale" if stale or invalidated_sources or invalidated_analyses else "current",
+            "invalidated_sources": sorted(invalidated_sources),
+            "invalidated_analysis_ids": sorted(invalidated_analyses),
+            "fresh_sources": sorted(fresh_sources),
+        },
+        "readback": {"complete": complete},
+    }
+
+
+def _revision_count(value: Any) -> int | None:
+    if not isinstance(value, Mapping):
+        return None
+    count = value.get("change_count")
+    return count if isinstance(count, int) else None
+
+
+def _newest_mutation_revision(self, project_id: str,
+                              base_capture_id: str) -> dict[str, Any] | None:
+    """Newest sealed mutation target for this capture, or None."""
+    best: dict[str, Any] | None = None
+    best_count = -1
+    try:
+        paths = list(self.deltas_dir.glob("*.json"))
+    except OSError:
+        return None
+    for path in paths:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if not isinstance(record, Mapping):
+            continue
+        if str(record.get("record_kind")) != "mutation_delta":
+            continue
+        if normalize_project_id(record.get("project_id")) != normalize_project_id(project_id):
+            continue
+        base = record.get("base") if isinstance(record.get("base"), Mapping) else {}
+        if str(base.get("capture_id") or "") != base_capture_id:
+            continue
+        target = record.get("target") if isinstance(record.get("target"), Mapping) else {}
+        revision = target.get("revision")
+        count = _revision_count(revision)
+        if count is None:
+            continue
+        if count > best_count:
+            best = dict(revision)
+            best_count = count
+    return best
+
+
+def _reusable_successor(self, *, records: Sequence[Mapping[str, Any]],
+                         supplied_token: str, project_id: str,
+                         capture_id: str,
+                         target_revision: Mapping[str, Any],
+                         reason_out: list[str] | None = None) -> str | None:
+    """Return the sealed final successor token only when every hop proves out.
+
+    Reuse requires the record to be acknowledged, its successor context to
+    exist, match this project and capture, carry the record's exact target
+    revision, chain from the previous token, and hold the post-mutation
+    structural facts a later token-relative diff needs.  Anything short of that
+    returns ``None`` so the caller keeps the conservative no-advance answer
+    instead of handing out an unverifiable token.
+    """
+    def refuse(reason: str) -> None:
+        if reason_out is not None:
+            reason_out.append(reason)
+        return None
+
+    if not records:
+        return refuse("successor_missing")
+    expected_previous = str(supplied_token or "")
+    final_token = ""
+    for record in records:
+        if record.get("acked") is not True:
+            return refuse("successor_not_acknowledged")
+        token = str(record.get("successor_token") or "")
+        if not token:
+            return refuse("successor_missing")
+        try:
+            context = self._load_context(token)
+        except (StaleContext, ValueError, OSError):
+            return refuse("successor_missing")
+        if str(context.get("token") or "") != token:
+            return refuse("successor_identity_mismatch")
+        if (normalize_project_id(context.get("project_id")) !=
+                normalize_project_id(project_id)):
+            return refuse("successor_identity_mismatch")
+        if str(context.get("capture_id") or "") != capture_id:
+            return refuse("successor_capture_mismatch")
+        if str(context.get("predecessor") or "") != expected_previous:
+            return refuse("successor_predecessor_mismatch")
+        record_target = (record.get("target")
+                         if isinstance(record.get("target"), Mapping) else {})
+        if not revisions_match(context.get("revision"),
+                               record_target.get("revision")):
+            return refuse("successor_revision_mismatch")
+        expected_previous = token
+        final_token = token
+    if not final_token:
+        return refuse("successor_missing")
+    try:
+        final_context = self._load_context(final_token)
+    except (StaleContext, ValueError, OSError):
+        return refuse("successor_missing")
+    if not revisions_match(final_context.get("revision"), target_revision):
+        return refuse("successor_revision_mismatch")
+    facts = final_context.get("structural_facts")
+    if not isinstance(facts, Mapping) or facts.get("available") is not True:
+        return refuse("successor_missing_facts")
+    return final_token
+
+
+def _changes_after_token(self, *, project_id: str, base_capture_id: str,
+                         base_revision: Mapping[str, Any],
+                         token_revision: Mapping[str, Any] | None,
+                         context_token: str,
+                         current_revision: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return only facts newer than the supplied token.
+
+    The token is the model's known state, not the capture.  A token already at
+    the newest known revision yields ``not_modified``; an older token receives
+    the net values of every sealed mutation after its revision.  When the live
+    revision is supplied it must not exceed the archive's newest record: an
+    unseen live revision is reported as ``live_ahead_of_archive`` instead of a
+    false ``not_modified``.
+    """
+    token_count = _revision_count(token_revision)
+    if token_count is None:
+        return {"status": "stale_base", "reason": "context_revision_unknown",
+                "project_id": project_id, "base_capture_id": base_capture_id,
+                "next_call": {"tool": "reaper_capture_snapshot",
+                              "project_id": project_id}}
+    newest = _newest_mutation_revision(self, project_id, base_capture_id)
+    newest_count = _revision_count(newest)
+    if newest_count is None:
+        newest_count = _revision_count(base_revision) or token_count
+    live_count = _revision_count(current_revision)
+    if live_count is not None and live_count < token_count:
+        return {"status": "stale_base", "reason": "token_ahead_of_live",
+                "project_id": project_id,
+                "context_revision": _normalise_revision(token_revision),
+                "live_revision": _normalise_revision(current_revision or {}),
+                "next_call": {"tool": "reaper_capture_snapshot",
+                              "project_id": project_id}}
+    if live_count is not None and live_count > max(newest_count, token_count):
+        return {"status": "stale_base", "reason": "live_ahead_of_archive",
+                "project_id": project_id,
+                "context_revision": _normalise_revision(token_revision),
+                "live_revision": _normalise_revision(current_revision or {}),
+                "newest_recorded_revision": newest_count,
+                "next_call": {"tool": "reaper_capture_snapshot",
+                              "project_id": project_id},
+                "note": ("the live project is newer than every sealed record and "
+                         "capture in this archive; capture again instead of assuming "
+                         "the token is current")}
+    target_count = live_count if live_count is not None else max(newest_count, token_count)
+    if target_count == token_count:
+        return {"status": "not_modified", "project_id": project_id,
+                "revision": _normalise_revision(token_revision),
+                "context_token": context_token,
+                "verified_against_live": live_count is not None,
+                "basis": ("live_revision" if live_count is not None
+                          else "capture_archive")}
+    if target_count < token_count:
+        return {"status": "stale_base", "reason": "token_ahead_of_archive",
+                "project_id": project_id,
+                "context_revision": _normalise_revision(token_revision),
+                "newest_recorded_revision": newest_count,
+                "next_call": {"tool": "reaper_capture_snapshot",
+                              "project_id": project_id}}
+    target_revision = (dict(current_revision) if isinstance(current_revision, Mapping)
+                       else dict(newest or base_revision))
+    chain_records: list[dict[str, Any]] = []
+    chain = _find_mutation_chain(self, project_id=project_id,
+                                 base_capture_id=base_capture_id,
+                                 base_revision=token_revision or {},
+                                 target_revision=target_revision,
+                                 records_out=chain_records)
+    if chain is None:
+        return {"status": "stale_base", "reason": "unrecorded_changes",
+                "project_id": project_id,
+                "context_revision": _normalise_revision(token_revision),
+                "target_revision": _normalise_revision(target_revision),
+                "next_call": {"tool": "reaper_capture_snapshot",
+                              "project_id": project_id},
+                "note": ("sealed records do not bridge the token to the target "
+                         "revision; capture again instead of guessing")}
+    update = _change_update_response(self, {"payload": chain},
+                                     context_token=context_token,
+                                     project_id=project_id,
+                                     capture_id=base_capture_id,
+                                     revision=target_revision,
+                                     allow_pages=False)
+    inline = (update.get("status") == "change_update"
+              and update.get("delivery", {}).get("fits") is True
+              and update.get("coverage", {}).get("complete") is True)
+    successor = None
+    refusal: list[str] = []
+    if inline:
+        successor = _reusable_successor(
+            self, records=chain_records, supplied_token=context_token,
+            project_id=project_id, capture_id=base_capture_id,
+            target_revision=target_revision, reason_out=refusal)
+    if successor is not None:
+        # The model now knows every net fact up to the target revision, and the
+        # sealed final token is proven to certify exactly that revision, so no
+        # capture is needed before the next structural edit.
+        update["context_token"] = successor
+        update["token_advanced"] = True
+        update["successor"] = "sealed_mutation_token"
+        update["next_call"] = {
+            "tool": "reaper_panorama_changes_since",
+            "context_token": successor,
+            "note": ("merge changed facts into the current known state; this token "
+                     "now certifies the current revision")}
+        return update
+    update["token_advanced"] = False
+    if update.get("advance_refused") is None:
+        update["advance_refused"] = ("readback_incomplete"
+                                     if update.get("coverage", {}).get("complete") is False
+                                     else (refusal[0] if refusal else "successor_unproven"))
+    update["next_call"] = {
+        "tool": "reaper_capture_snapshot",
+        "project_id": project_id,
+        "note": ("these are the facts newer than the supplied token, but the token "
+                 "itself is not advanced; open a capture for an editable token at "
+                 "the current revision")}
+    return update
+
+
+def _find_mutation_delta(self, *, project_id: str, base_capture_id: str,
+                         base_revision: Mapping[str, Any],
+                         target_revision: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return the newest sealed mutation delta matching exact endpoints."""
+    best: dict[str, Any] | None = None
+    best_created = -1.0
+    try:
+        paths = list(self.deltas_dir.glob("*.json"))
+    except OSError:
+        return None
+    for path in paths:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if not isinstance(record, Mapping):
+            continue
+        if str(record.get("record_kind")) != "mutation_delta":
+            continue
+        if normalize_project_id(record.get("project_id")) != normalize_project_id(project_id):
+            continue
+        base = record.get("base") if isinstance(record.get("base"), Mapping) else {}
+        target = record.get("target") if isinstance(record.get("target"), Mapping) else {}
+        if str(base.get("capture_id") or "") != base_capture_id:
+            continue
+        if not revisions_match(base.get("revision"), base_revision):
+            continue
+        if not revisions_match(target.get("revision"), target_revision):
+            continue
+        created = record.get("created_at")
+        created_value = float(created) if isinstance(created, (int, float)) else 0.0
+        if created_value >= best_created:
+            best, best_created = dict(record), created_value
+    return best
+
+_OPERATION_OBJECT_KINDS = frozenset({"track", "item", "take", "send",
+                                     "envelope", "marker", "region"})
+
+
+def _changed_facts(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Project one sealed payload onto stable ids with current values only.
+
+    The object diff is preferred; when the bridge reported no object rows (for
+    example an undo that reverses the preview), the operation facts carry the
+    same information and are named by object id instead of operation name.
+    """
+    changed: list[dict[str, Any]] = []
+    objects = payload.get("objects") if isinstance(payload.get("objects"), Mapping) else {}
+    for entry in objects.get("changed") or []:
+        if not isinstance(entry, Mapping):
+            continue
+        raw_id = str(entry.get("id") or "")
+        kind = str(entry.get("object_kind") or "")
+        stable_id = (raw_id if ":" in raw_id else
+                     f"{kind}:{raw_id}" if kind and raw_id else raw_id)
+        fields = [{"field": str(field.get("field")), "value": field.get("after")}
+                  for field in (entry.get("fields") or [])
+                  if isinstance(field, Mapping) and field.get("field")]
+        if stable_id and fields:
+            changed.append({"id": stable_id, "kind": kind, "fields": fields})
+    if not changed:
+        for fact in payload.get("operation_facts") or []:
+            if not isinstance(fact, Mapping):
+                continue
+            raw_id = str(fact.get("target_guid") or "")
+            kind = str(fact.get("kind") or "object")
+            family = kind.split(".", 1)[0].lower()
+            object_kind = family if family in _OPERATION_OBJECT_KINDS else kind
+            stable_id = (raw_id if ":" in raw_id else
+                         f"{object_kind}:{raw_id}" if raw_id else raw_id)
+            before_value = fact.get("before")
+            after_value = fact.get("after")
+            before = before_value if isinstance(before_value, Mapping) else {}
+            after = after_value if isinstance(after_value, Mapping) else {}
+            fields = [{"field": name, "value": after.get(name)}
+                      for name in sorted(set(before) | set(after))
+                      if before.get(name) != after.get(name)]
+            if stable_id and fields:
+                changed.append({"id": stable_id, "kind": object_kind, "fields": fields})
+    return changed
+
+
+def _change_update_response(self, record: Mapping[str, Any], *,
+                            context_token: str, project_id: str,
+                            capture_id: str,
+                            revision: Mapping[str, Any],
+                            allow_pages: bool = True) -> dict[str, Any]:
+    """Return only the changed facts since the acknowledged context token.
+
+    The sealed mutation record is server-side provenance, not the model-facing
+    payload.  The model receives one incremental update that can be merged into
+    its current known project state; unchanged facts and the original panorama
+    are deliberately not repeated.
+    """
+    payload = record.get("payload")
+    if not isinstance(payload, Mapping):
+        raise StaleContext("Stored mutation record has no payload",
+                           details={"delta_id": record.get("delta_id")})
+    target = payload.get("target") if isinstance(payload.get("target"), Mapping) else {}
+    changed = _changed_facts(payload)
+    audio = payload.get("audio_evidence") if isinstance(payload.get("audio_evidence"), Mapping) else {}
+    result: dict[str, Any] = {
+        "schema_version": "reaper-workbench.change-update/1",
+        "status": "change_update",
+        "project_id": project_id,
+        "revision": _normalise_revision(target.get("revision") or revision),
+        "changed": changed,
+        "measurements": {
+            "state": str(audio.get("state") or "stale"),
+            "reason": "project_revision_changed",
+            "invalidated_sources": list(audio.get("invalidated_sources") or []),
+            "invalidated_analysis_ids": list(audio.get("invalidated_analysis_ids") or []),
+            "fresh_sources": list(audio.get("fresh_sources") or []),
+            "note": ("structural/project facts only; audio measurements remain "
+                     "stale until a fresh analysis produces new evidence"),
+        },
+        "coverage": {
+            "scope": "incremental",
+            "complete": bool(payload.get("readback", {}).get("complete", True)),
+            "unchanged_facts_included": False,
+        },
+        "context_token": context_token,
+        "token_advanced": True,
+        "next_call": {
+            "tool": "reaper_panorama_changes_since",
+            "context_token": context_token,
+            "note": ("merge changed facts into the current known state; unchanged "
+                     "facts are not resent and audio evidence remains stale"),
+        },
+    }
+    for _ in range(3):
+        size = _delivered_bytes(result)
+        delivery = result.setdefault("delivery", {})
+        if delivery.get("bytes") == size:
+            break
+        delivery["bytes"] = size
+    result["delivery"]["fits"] = result["delivery"]["bytes"] <= DELTA_INLINE_MAX_BYTES
+    if result["delivery"]["bytes"] > DELTA_INLINE_MAX_BYTES:
+        if not allow_pages:
+            result["delivery"]["fits"] = False
+            result["token_advanced"] = False
+            result["advance_refused"] = "update_exceeds_inline_limit"
+            result["next_call"] = {
+                "tool": "reaper_capture_snapshot", "project_id": project_id,
+                "note": ("this synthesized update is too large to deliver inline "
+                         "and has no single sealed record to acknowledge; capture "
+                         "again instead of advancing without full delivery")}
+            return result
+        return self._open_delta_pages(
+            delta_id=str(record.get("delta_id")),
+            delta_hash=str(record.get("delta_hash")), payload=dict(result),
+            kind="change_update", project_id=project_id,
+            capture_id=capture_id, revision=revision,
+            base_context_token=context_token,
+            base_capture_id=capture_id, target_capture_id=None)
+    return result
+
+
+def change_update_view(lifecycle: "PanoramaLifecycle | None",
+                       delta: Mapping[str, Any], *,
+                       context_token: str, project_id: str,
+                       revision: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a sealed mutation record onto the model-facing change update.
+
+    The sealed record stays server-side audit provenance.  The model receives
+    one incremental update: stable ids, only the new values that replace known
+    fields, the current revision and context token, and audio freshness
+    reported separately from structural facts.
+    """
+    payload = delta.get("payload")
+    if not isinstance(payload, Mapping):
+        payload = delta
+    base = payload.get("base")
+    capture_id = str(base.get("capture_id") or "") if isinstance(base, Mapping) else ""
+    record = {"payload": payload,
+              "delta_id": delta.get("delta_id"),
+              "delta_hash": delta.get("delta_hash")}
+    return _change_update_response(lifecycle, record, context_token=context_token,
+                                   project_id=project_id, capture_id=capture_id,
+                                   revision=revision)
 
 
 class PanoramaLifecycle:
@@ -1280,7 +1799,8 @@ class PanoramaLifecycle:
                       delta_id: str | None = None,
                       view_root: str | None = None,
                       delta_chain: Sequence[Mapping[str, Any]] | None = None,
-                      audio_evidence: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                      audio_evidence: Mapping[str, Any] | None = None,
+                      structural_facts: Mapping[str, Any] | None = None) -> dict[str, Any]:
         token = "ct_" + secrets.token_urlsafe(24)
         evidence = dict(audio_evidence or {})
         evidence.setdefault("state", "current")
@@ -1303,6 +1823,8 @@ class PanoramaLifecycle:
             "delta_id": delta_id,
             "created_at": time.time(),
         }
+        if isinstance(structural_facts, Mapping):
+            data["structural_facts"] = dict(structural_facts)
         _atomic_write(self._context_path(token), canonical_bytes(data))
         return data
 
@@ -1498,15 +2020,15 @@ class PanoramaLifecycle:
                 "view_sha256": delivery.get("view_sha256") or state.get("view_sha256"),
                 "delivery": delivery,
             }
-            if str(state.get("mode")) in {"view_pages", "delta_pages", "result_pages"}:
-                result["handle"]["mode"] = state.get("mode")
-            if str(state.get("mode")) == "delta_pages":
+            mode = str(state.get("mode"))
+            if mode in {"view_pages", "delta_pages", "result_pages"}:
+                result["handle"]["mode"] = ("change_pages" if mode == "delta_pages"
+                                              else mode)
+            if mode == "delta_pages":
                 result["handle"].update({
-                    "delta_id": state.get("delta_id"),
-                    "delta_hash": state.get("delta_hash"),
                     "payload_sha256": state.get("payload_sha256"),
                 })
-            if str(state.get("mode")) == "result_pages":
+            if mode == "result_pages":
                 result["handle"].update({
                     "result_kind": state.get("result_kind"),
                     "payload_sha256": state.get("payload_sha256"),
@@ -1991,10 +2513,8 @@ class PanoramaLifecycle:
         pages = list(state["delta_pages"])
         count = len(pages)
         manifest: dict[str, Any] = {
-            "mode": "delta_pages",
+            "mode": "change_pages",
             "kind": state["delta_kind"],
-            "delta_id": state["delta_id"],
-            "delta_hash": state["delta_hash"],
             "payload_sha256": state["payload_sha256"],
             "payload_bytes": state["payload_bytes"],
             "page_count": count,
@@ -2008,7 +2528,7 @@ class PanoramaLifecycle:
             "complete": False,
             "next_call": {
                 "tool": "reaper_panorama_page",
-                "then": ("fetch every declared delta page in order, then call "
+                "then": ("fetch every declared change page in order, then call "
                          "reaper_panorama_ack with every page_hash in order (or with "
                          "this manifest_sha256 alone); only a complete acknowledgement "
                          "advances the context token"),
@@ -2055,10 +2575,8 @@ class PanoramaLifecycle:
         complete = bool(state.get("complete"))
         envelope: dict[str, Any] = {
             "schema_version": LIFECYCLE_SCHEMA,
-            "status": "delta_page",
+            "status": "change_page",
             "kind": state["delta_kind"],
-            "delta_id": state["delta_id"],
-            "delta_hash": state["delta_hash"],
             "payload_sha256": state["payload_sha256"],
             "payload_bytes": state["payload_bytes"],
             "project_id": state["project_id"],
@@ -2170,8 +2688,7 @@ class PanoramaLifecycle:
             response: dict[str, Any] = {
                 "schema_version": LIFECYCLE_SCHEMA,
                 "status": "incomplete", "complete": False,
-                "kind": state["delta_kind"], "delta_id": state["delta_id"],
-                "delta_hash": state["delta_hash"],
+                "kind": state["delta_kind"],
                 "page_count": len(pages),
                 **progress,
             }
@@ -2223,12 +2740,11 @@ class PanoramaLifecycle:
             return {
                 "schema_version": LIFECYCLE_SCHEMA, "status": "complete",
                 "complete": True, "kind": state["delta_kind"],
-                "delta_id": state["delta_id"], "delta_hash": state["delta_hash"],
                 "payload_sha256": state["payload_sha256"],
                 "reconstructed": True, "verified_by": verified_by,
                 "page_count": len(pages), "manifest_sha256": manifest_hash,
                 "advance": None,
-                "note": ("informational delta: no context token was supplied, so the "
+                "note": ("informational change set: no context token was supplied, so the "
                          "complete page set was verified but no token is advanced"),
             }
         advanced = self.delta_ack(str(state["delta_id"]), str(state["delta_hash"]),
@@ -2239,7 +2755,6 @@ class PanoramaLifecycle:
         return {
             "schema_version": LIFECYCLE_SCHEMA, "status": "complete",
             "complete": True, "kind": state["delta_kind"],
-            "delta_id": state["delta_id"], "delta_hash": state["delta_hash"],
             "payload_sha256": state["payload_sha256"],
             "reconstructed": True, "verified_by": verified_by,
             "page_count": len(pages), "manifest_sha256": manifest_hash,
@@ -2251,8 +2766,8 @@ class PanoramaLifecycle:
                 "revision": advanced.get("revision"),
                 "view_root": advanced.get("view_root"),
                 "audio_evidence": advanced.get("audio_evidence"),
-                "guarantee": ("this exact complete delta (delta_hash, payload_sha256) "
-                              "was delivered and acknowledged; the successor token is "
+                "guarantee": ("this exact complete change set (payload_sha256) was "
+                              "delivered and acknowledged; the successor token is "
                               "valid for the target revision"),
             },
             "context_token": advanced.get("context_token"),
@@ -3011,7 +3526,8 @@ class PanoramaLifecycle:
                       base_capture_id: str | None = None,
                       base_revision: Mapping[str, Any] | None = None,
                       base_fact_root: str | None = None,
-                      context_token: str | None = None) -> dict[str, Any]:
+                      context_token: str | None = None,
+                      current_revision: Mapping[str, Any] | None = None) -> dict[str, Any]:
         latest = self.latest_capture(project_id)
         if latest is None:
             raise ValidationError("No capture exists for this project",
@@ -3062,23 +3578,16 @@ class PanoramaLifecycle:
                     "actual_root": base_root}
         target_capture_id = str(latest["capture_id"])
         if target_capture_id == base_capture_id:
-            token_revision = (context_record.get("revision")
-                              if context_record is not None else None)
-            if (context_record is not None and
-                    not revisions_match(token_revision, base_revision_value)):
-                return {"status": "stale_base",
-                        "reason": "context_ahead_of_capture_archive",
-                        "project_id": project_id,
-                        "base_capture_id": base_capture_id,
-                        "context_revision": _normalise_revision(token_revision or {}),
-                        "capture_revision": base_revision_value,
-                        "next_call": {"tool": "reaper_capture_snapshot",
-                                      "project_id": project_id},
-                        "note": ("the current context is already ahead of the newest "
-                                 "capture, so a capture-to-capture delta cannot describe "
-                                 "the acknowledged revision; capture again")}
-            return {"status": "not_modified", "project_id": project_id,
-                    "revision": base_revision_value, "fact_root": base_root}
+            if context_record is None:
+                return {"status": "not_modified", "project_id": project_id,
+                        "revision": base_revision_value, "fact_root": base_root}
+            return _changes_after_token(
+                self, project_id=project_id, base_capture_id=base_capture_id,
+                base_revision=base_revision_value,
+                token_revision=context_record.get("revision"),
+                context_token=str(context_token or ""),
+                current_revision=current_revision)
+
         ids = {str(row["capture_id"]) for row in self.archive.list_index()
                if normalize_project_id(row.get("project_id")) == normalize_project_id(project_id)
                and row.get("capture_id")}
@@ -3150,12 +3659,11 @@ class PanoramaLifecycle:
         else:
             invalidations = _invalidations(operations, target_document)
         delta_payload = {
-            "status": "delta",
+            "status": "change_set",
             "project_id": project_id,
             "from_capture": base_capture_id,
             "to_capture": target_capture_id,
-            "from_revision": base_revision_value,
-            "to_revision": target_revision,
+            "revision": target_revision,
             "from_root": base_root,
             "to_root": fact_root(target_document),
             "document_hash": document_hash(target_document),
@@ -3218,8 +3726,6 @@ class PanoramaLifecycle:
             **delta_payload,
             "continuity": context_record is not None,
             "context_token": context_token if context_record is not None else None,
-            "delta_id": delta_id,
-            "delta_hash": delta_hash,
             "delivery": {
                 "mode": "inline",
                 "bytes": 0,
@@ -3227,12 +3733,11 @@ class PanoramaLifecycle:
                 "max_inline_bytes": DELTA_INLINE_MAX_BYTES,
             },
             "next_call": {"tool": "reaper_panorama_status",
-                          "delta_id": delta_id, "delta_hash": delta_hash,
                           "context_token": context_token},
         }
         if context_record is None:
-            result["note"] = ("delta is informational; pass a context_token to make it "
-                              "advanceable and usable for the mutation gate")
+            result["note"] = ("this change set is informational; pass a context_token to "
+                              "make it advanceable and usable for the mutation gate")
         # Measure the inline shape before advancing.  A large delta is paged
         # instead, so the caller always receives every operation.
         for _ in range(3):
@@ -3259,7 +3764,7 @@ class PanoramaLifecycle:
             result["context_token"] = "ct_" + "x" * 43
             result["next_call"] = {
                 "tool": "reaper_panorama_status", "optional": True,
-                "note": ("only needed to re-acknowledge the same delta "
+                "note": ("only needed to re-acknowledge the same change set "
                          "idempotently; the successor token is already in "
                          "advance.context_token"),
             }
@@ -3268,7 +3773,6 @@ class PanoramaLifecycle:
                 result["context_token"] = context_token
                 result["next_call"] = {
                     "tool": "reaper_panorama_status",
-                    "delta_id": delta_id, "delta_hash": delta_hash,
                     "context_token": context_token,
                 }
                 return self._open_delta_pages(
@@ -3394,7 +3898,9 @@ class PanoramaLifecycle:
                          "next_action": "capture again and acknowledge the new panorama"})
         capture_id = str(token.get("capture_id") or "")
         base_document = self._document(capture_id)
-        facts = base_document.get("structural_facts")
+        facts = token.get("structural_facts")
+        if not isinstance(facts, Mapping) or facts.get("available") is not True:
+            facts = base_document.get("structural_facts")
         if not isinstance(facts, Mapping) or facts.get("available") is not True:
             readback_complete = False
             readback_missing = list(readback_missing) + ["base_structural_facts_absent"]
@@ -3436,6 +3942,7 @@ class PanoramaLifecycle:
             "base": dict(payload["base"]),
             "target": dict(payload["target"]),
             "payload": payload,
+            "target_facts": digest_facts(after_digest),
             "created_at": time.time(),
             "acked": False,
             "successor_token": None,
@@ -3611,7 +4118,10 @@ class PanoramaLifecycle:
                 predecessor=context_token, delta_id=delta_id,
                 view_root=next_view_root(str(base.get("view_root")), str(delta_hash)),
                 delta_chain=chain,
-                audio_evidence=payload.get("audio_evidence"))
+                audio_evidence=payload.get("audio_evidence"),
+                structural_facts=(record.get("target_facts")
+                                  if isinstance(record.get("target_facts"), Mapping)
+                                  else None))
         else:
             target_capture_id = str(record["target_capture_id"])
             target_document = self._document(target_capture_id)
