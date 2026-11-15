@@ -63,7 +63,7 @@ def test_open_delivers_the_whole_view_in_one_result(tmp_path: Path) -> None:
     assert view["archive"]["exact"]
 
 
-def test_mcp_open_defaults_to_the_single_view(tmp_path: Path) -> None:
+def test_mcp_open_default_auto_is_size_independent(tmp_path: Path) -> None:
     from reaper_audio import mcp_server
     from panorama_flow import open_and_ack
 
@@ -71,16 +71,19 @@ def test_mcp_open_defaults_to_the_single_view(tmp_path: Path) -> None:
     archive = CaptureArchive(tmp_path / "archive")
     archive.append(record, files)
 
-    opened, ack, pages = open_and_ack(
-        mcp_server, record.project_id, str(archive.root))
+    opened = mcp_server.reaper_panorama_open(record.project_id, str(archive.root))
+    assert opened["status"] == "complete"
+    assert opened["delivery"]["requested_mode"] == "auto"
+    assert "view" in opened and opened["receipt"]
+    assert opened["context_token"].startswith("ct_")
 
-    assert opened["status"] == "page"
-    assert opened["page_id"] == opened["manifest"]["page_ids"][0]
-    assert opened["view_schema"] == "reaper-workbench.panorama-view/2"
-    assert "view" not in opened and "receipt" not in opened
+    paged, ack, pages = open_and_ack(
+        mcp_server, record.project_id, str(archive.root), mode="pages")
+    assert paged["status"] == "page"
+    assert paged["manifest"]["mode"] == "pages"
     assert ack["status"] == "complete"
     assert ack["receipt"] and ack["context_token"]
-    assert ack["page_count"] == len(pages) == opened["page_count"]
+    assert ack["page_count"] == len(pages) == paged["page_count"]
 
 
 def test_the_view_states_paged_delivery_without_cursor_vocabulary(tmp_path: Path) -> None:
@@ -229,7 +232,7 @@ def test_query_rejects_an_unknown_object(tmp_path: Path) -> None:
                         objects=["track:{NO-SUCH-TRACK}"])
 
 
-def test_query_over_budget_names_the_scope_to_narrow(tmp_path: Path) -> None:
+def test_query_over_budget_returns_the_complete_selection(tmp_path: Path) -> None:
     record, files = _record(tmp_path)
     archive = CaptureArchive(tmp_path / "archive")
     archive.append(record, files)
@@ -238,11 +241,12 @@ def test_query_over_budget_names_the_scope_to_narrow(tmp_path: Path) -> None:
     result = run_query(document, record, data=["relations", "analysis"],
                        max_response_bytes=200)
 
-    assert result["status"] == "query_too_large"
-    assert result["measured_bytes"] > result["max_response_bytes"]
-    assert result["family_bytes"]
-    assert result["narrow"]
-    assert "paged" in result["note"]
+    # No size refusal and no narrowing instruction: the caller can page it.
+    assert result["status"] == "query"
+    assert result["budget"]["fits"] is False
+    assert result["budget"]["measured_bytes"] > result["budget"]["max_response_bytes"]
+    assert result["budget"]["family_bytes"]
+    assert result["data"]
 
 
 def test_query_still_requires_the_delivered_receipt(tmp_path: Path) -> None:
@@ -340,23 +344,25 @@ def test_catalog_row_counts_name_what_they_count(tmp_path: Path) -> None:
     assert rows["series"][2] == "cells"
 
 
-def test_query_reports_the_point_limit_as_query_too_large(
+def test_query_does_not_apply_an_internal_point_or_byte_cap(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import reaper_audio.context.query as query_module
 
     record, _files = _record(tmp_path)
     document = build_panorama(record, max_bytes=10 ** 9, max_tokens=10 ** 9)
+    seen: dict[str, object] = {}
+    real = query_module.resolve_details
 
-    def refuse(*_args, **_kwargs):
-        raise ValidationError("too many points", details={"limit": 20_000,
-                                                          "requested_series": ["rms_400ms"]})
+    def observe(*args, **kwargs):
+        seen.update(kwargs)
+        return real(*args, **kwargs)
 
-    monkeypatch.setattr(query_module, "resolve_details", refuse)
+    monkeypatch.setattr(query_module, "resolve_details", observe)
     result = run_query(document, record, data=["series"], objects="all")
-    assert result["status"] == "query_too_large"
-    assert result["reason"] == "exact_detail_point_limit"
-    assert result["point_limit"] == 20_000
-    assert result["narrow"]
+
+    assert result["status"] == "query"
+    assert seen.get("max_bytes") is None
+    assert seen.get("max_points") is None
 
 
 def test_scalar_metrics_complete_and_exact_query_round_trip(tmp_path: Path) -> None:
@@ -538,5 +544,19 @@ def test_100_source_overbudget_issues_read_scope_and_refuses_oversized_query(
     oversized = PanoramaLifecycle(archive.root, state_root=tmp_path / "state").query(
         "", opened["revision"], data=["analysis"], objects="all",
         read_scope=scope["id"])
-    assert oversized["status"] == "query_too_large"
-    assert "data" not in oversized
+    assert oversized["status"] == "result_page"
+    assert oversized["result_kind"] == "query"
+    manifest = oversized["manifest"]
+    ids = manifest.get("page_ids") or [
+        f"rp_{index}_of_{manifest['page_count']}"
+        for index in range(1, manifest["page_count"] + 1)]
+    lifecycle = PanoramaLifecycle(archive.root, state_root=tmp_path / "state")
+    pages = [oversized] + [
+        lifecycle.view_page(oversized["handle"], oversized["revision"], page_id)
+        for page_id in ids[1:]]
+    ack = lifecycle.ack_pages(
+        oversized["handle"], oversized["revision"],
+        [page["page_hash"] for page in pages])
+    assert ack["status"] == "complete"
+    assert ack["result_kind"] == "query"
+    assert ack["context_token"] is None

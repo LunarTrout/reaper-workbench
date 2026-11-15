@@ -44,6 +44,7 @@ from .panorama_view import (DEFAULT_RESPONSE_BYTES, LEAN_OVERVIEW_BYTES, budget_
                             view_bytes)
 from .render_dependencies import compare_render_manifests
 from .relations import RelationBinding, RelationWindow, build_relation_set
+from .semantic_delta import build_semantic_delta
 
 # One logical document per capture, keyed by the archive files' identity.  A
 # a capture record can be hundreds of megabytes, so rebuilding a document for
@@ -93,17 +94,32 @@ MAX_PAGE_BYTES = 262_144
 # long as every single page stays inside the client's response cap.
 VIEW_PAGE_TARGET_BYTES = 30_000
 VIEW_PAGE_MAX_BYTES = 46_000
-# Page sizing uses the character count of this deterministic indented JSON
-# rendering. It is not a UTF-8 wire-byte count or the complete MCP transport
-# envelope; clients and hosts may apply additional framing or limits.
+# Delta delivery uses the same page machinery.  An inline delta is capped well
+# below the host result limit; a larger delta is delivered as a complete page
+# set and advances only after every page hash (or the manifest hash) is acked.
+DELTA_INLINE_MAX_BYTES = 38_000
+DELTA_PAGE_TARGET_BYTES = 24_000
+DELTA_PAGE_MAX_BYTES = 40_000
+# Exact query and audio-delta results use the same lossless page transport.
+# There is no result-specific query_too_large: a large exact selection or audio
+# delta is delivered in full pages and acknowledged by reconstruction.
+RESULT_PAGE_TARGET_BYTES = 28_000
+RESULT_PAGE_MAX_BYTES = 46_000
+# Page sizing uses the UTF-8 byte count of this deterministic indented JSON
+# rendering. It is the payload the server serves, not the complete MCP transport
+# envelope; clients and hosts may add framing. The reported size and the enforced
+# ceiling use the same measure, so a page is never declared smaller than it is.
 _PAGE_HEADER_ALLOWANCE = 3_200
+# A manifest that lists every page id/hash is exact but grows linearly with the
+# page count. Above this ceiling the manifest declares the deterministic page-id
+# pattern plus the ordered page-set hash instead of inlining thousands of ids.
+MANIFEST_INLINE_MAX_PAGES = 64
+MANIFEST_MAX_BYTES = 8_000
 
 
 def _delivered_bytes(value: Any) -> int:
-    """Character count of the server's indented JSON rendering of a result."""
-    return len(json.dumps(value, indent=2, ensure_ascii=False))
-MAX_DELTA_CHAIN = 20
-MAX_DELTA_OPS = 4_000
+    """UTF-8 byte length of the server's indented JSON rendering of a result."""
+    return len(json.dumps(value, indent=2, ensure_ascii=False).encode("utf-8"))
 HANDLE_TTL_SECONDS = 24 * 60 * 60
 RECEIPT_TTL_SECONDS = 24 * 60 * 60
 
@@ -404,6 +420,12 @@ def revisions_match(left: Mapping[str, Any] | None,
 
 
 def _diff_values(before: Any, after: Any, path: str = "") -> list[dict[str, Any]]:
+    """Legacy positional diff, retained for import compatibility only.
+
+    Capture-to-capture deltas now use ``semantic_delta.semantic_ops``, which
+    matches known rows by stable identifiers.  Do not use this function for a
+    model-facing delta: an array insertion would rename every later object.
+    """
     if before == after:
         return []
     if isinstance(before, Mapping) and isinstance(after, Mapping):
@@ -512,6 +534,61 @@ def _invalidations(operations: Sequence[Mapping[str, Any]],
 DELIVERY_STATUS_FIELDS = ("view_schema", "view_sha256", "view_bytes", "response_bytes",
                           "measured_bytes", "max_response_bytes", "fits")
 _PAGED_STATUS_FIELDS = ("page_count", "pages_received", "pages_missing", "complete")
+#: Inline page-id lists per delivery envelope.  Above this, the exact ordered
+#: set is committed by SHA-256 and the deterministic page-id pattern; the model
+#: still knows every page and can resume without a multi-kilobyte list.
+DELIVERY_INLINE_PAGES = 32
+
+
+def _advance_preview(target_revision: Mapping[str, Any],
+                     audio_evidence: Mapping[str, Any] | None,
+                     predecessor: str) -> dict[str, Any]:
+    """A fixed-length successor block used to measure an inline delta response.
+
+    The real token/view-root lengths are fixed by their generators, so the
+    measured shape is the served shape.  This prevents a delta payload that fits
+    from being advanced and then overflowing because its successor evidence was
+    not counted.
+    """
+    return {
+        "advanced": True,
+        "predecessor_token": predecessor,
+        "context_token": "ct_" + "x" * 43,
+        "revision": dict(target_revision),
+        "view_root": "0" * 64,
+        "audio_evidence": dict(audio_evidence or {}),
+        "guarantee": ("this exact delta was delivered with this response; the "
+                      "successor token is valid for the target revision"),
+    }
+
+
+def _page_progress(pages: Sequence[Mapping[str, Any]],
+                   received: Sequence[int]) -> dict[str, Any]:
+    ids = [str(page["page_id"]) for page in pages]
+    got = sorted(set(int(index) for index in received))
+    received_ids = [ids[index] for index in got if 0 <= index < len(ids)]
+    missing = [ids[index] for index in range(len(ids)) if index not in set(got)]
+    result: dict[str, Any] = {
+        "page_count": len(ids),
+        "pages_received_count": len(received_ids),
+        "pages_missing_count": len(missing),
+    }
+    if len(received_ids) <= DELIVERY_INLINE_PAGES:
+        result["pages_received"] = received_ids
+    else:
+        result["pages_received_inline"] = False
+        result["pages_received_sha256"] = sha256_bytes(canonical_bytes(received_ids))
+    if len(missing) <= DELIVERY_INLINE_PAGES:
+        result["pages_missing"] = missing
+    else:
+        result["pages_missing_inline"] = False
+        result["pages_missing_first"] = missing[:8]
+        result["pages_missing_sha256"] = sha256_bytes(canonical_bytes(missing))
+        result["resume"] = {
+            "rule": ("page ids are deterministic from manifest.page_id_pattern; "
+                     "fetch every id not yet received, in ascending order"),
+        }
+    return result
 
 
 def delivery_status(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -520,98 +597,204 @@ def delivery_status(state: Mapping[str, Any]) -> dict[str, Any]:
     Reads whatever the handle file happens to contain and returns only the
     allowlisted keys, so a legacy page handle cannot smuggle ``mode``,
     ``page_count``, page/ack or cursor fields through the public status.  A
-    handle created by the *current* paged contract (``mode == "view_pages"``)
-    legitimately reports its page progress, because resuming an interrupted
-    receipt needs it.
+    handle created by the *current* paged contract (``mode == "view_pages"`` or
+    ``mode == "delta_pages"``) legitimately reports its page progress, because
+    resuming an interrupted receipt needs it.
     """
     raw = state.get("delivery")
     raw = raw if isinstance(raw, Mapping) else {}
     out = {key: raw[key] for key in DELIVERY_STATUS_FIELDS if key in raw}
-    if str(state.get("mode")) == "view_pages":
-        pages = list(state.get("view_pages") or [])
+    mode = str(state.get("mode"))
+    if mode in {"view_pages", "delta_pages", "result_pages"}:
+        pages = (list(state["result_pages"]) if mode == "result_pages" else
+                 list(state["delta_pages"] if mode == "delta_pages" else state["view_pages"]))
         received = sorted(set(int(item) for item in state.get("received") or []))
-        out.update({
-            "page_count": len(pages),
-            "pages_received": [pages[i]["page_id"] for i in received],
-            "pages_missing": [pages[i]["page_id"] for i in range(len(pages))
-                              if i not in set(received)],
-            "complete": bool(state.get("complete") and state.get("receipt")),
-        })
+        progress = _page_progress(pages, received)
+        progress["complete"] = bool(state.get("complete") and
+                                    (state.get("receipt") or mode != "view_pages"))
+        progress["manifest_sha256"] = state.get("manifest_sha256")
+        out.update(progress)
+        if mode == "delta_pages":
+            out["delta_id"] = state.get("delta_id")
+            out["delta_hash"] = state.get("delta_hash")
+        if mode == "result_pages":
+            out["result_kind"] = state.get("result_kind")
+            out["payload_sha256"] = state.get("payload_sha256")
     return out
 
 
-def _largest_list(value: Any, prefix: tuple[str, ...] = ()) -> tuple[int, tuple[str, ...]] | None:
-    best: tuple[int, tuple[str, ...]] | None = None
+def _list_paths(value: Any, prefix: tuple[str | int, ...] = ()):
+    """Yield (path, list) for every non-empty list in a nested value."""
     if isinstance(value, Mapping):
         for name, item in value.items():
+            child = prefix + (str(name),)
             if isinstance(item, list) and item:
-                size = _delivered_bytes({name: item})
-                if best is None or size > best[0]:
-                    best = (size, prefix + (str(name),))
-            elif isinstance(item, Mapping):
-                found = _largest_list(item, prefix + (str(name),))
-                if found and (best is None or found[0] > best[0]):
-                    best = found
+                yield child, item
+            if isinstance(item, (Mapping, list)):
+                yield from _list_paths(item, child)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            if isinstance(item, (Mapping, list)):
+                yield from _list_paths(item, prefix + (index,))
+
+
+def _largest_list(value: Any,
+                  prefix: tuple[str | int, ...] = ()) -> tuple[int, tuple[str | int, ...]] | None:
+    best: tuple[int, tuple[str | int, ...]] | None = None
+    for path, items in _list_paths(value, prefix):
+        # Size the list in its own key frame; the comparison only needs a
+        # consistent ordering, and the real page fit is checked again below.
+        size = _delivered_bytes({str(path[-1]) if path else "items": items})
+        if best is None or size > best[0]:
+            best = (size, path)
     return best
 
 
-def _replace_at(value: Any, path: tuple[str, ...], chunk: Any) -> Any:
+def _read_at(value: Any, path: Sequence[str | int]) -> Any:
+    for step in path:
+        value = value[step]
+    return value
+
+
+def _replace_at(value: Any, path: Sequence[str | int], chunk: Any) -> Any:
     if not path:
         return chunk
+    step = path[0]
     if isinstance(value, Mapping):
         clone = dict(value)
-        clone[path[0]] = _replace_at(value[path[0]], path[1:], chunk)
+        clone[step] = _replace_at(value[step], path[1:], chunk)
         return clone
-    raise ValidationError("View part path is not a mapping",
+    if isinstance(value, list):
+        clone = list(value)
+        index = int(step)
+        clone[index] = _replace_at(value[index], path[1:], chunk)
+        return clone
+    raise ValidationError("View part path is not a mapping or list",
                           details={"path": list(path)})
 
 
-def _split_section(key: str, value: Any, ceiling: int) -> list[tuple[Any, list[str] | None]]:
-    """Split one oversized section into parts that each fit a page envelope.
+def _fits_section(key: str, part: Any, ceiling: int) -> bool:
+    return _delivered_bytes({"payload": {key: part}}) + _PAGE_HEADER_ALLOWANCE <= ceiling
 
-    The largest list anywhere in the section (top-level rows, a nested
-    ``rows.rows`` table, an item list) is split on element boundaries; every
-    other field is repeated in every part.  Merging concatenates exactly that
-    list, so the reassembled section is byte-for-byte the original.
+
+def _split_text_bytes(text: str, limit: int) -> list[str]:
+    """Split text at character boundaries into UTF-8 chunks of <= limit bytes."""
+    if limit <= 0:
+        raise ValidationError("fragment limit must be positive")
+    chunks: list[str] = []
+    start = 0
+    size = 0
+    for index, character in enumerate(text):
+        width = len(character.encode("utf-8"))
+        if size and size + width > limit:
+            chunks.append(text[start:index])
+            start = index
+            size = 0
+        size += width
+    chunks.append(text[start:])
+    return chunks
+
+
+def _fragment_parts(key: str, value: Any, ceiling: int) -> list[dict[str, Any]]:
+    """Losslessly split a section that has no splittable list.
+
+    The value is rendered as canonical JSON text and delivered in ordered
+    chunks.  ``_merge_view_pages`` concatenates the chunks, verifies the full
+    SHA-256 and parses the canonical text, so the reconstructed value is the
+    exact original JSON value (not a prefix, not a rounded copy).
     """
-    def fits(part: Any) -> bool:
-        return _delivered_bytes({"payload": {key: part}}) + _PAGE_HEADER_ALLOWANCE <= ceiling
+    raw = canonical_bytes(value)
+    digest = sha256_bytes(raw)
+    text = raw.decode("utf-8")
+    limit = max(256, (ceiling - _PAGE_HEADER_ALLOWANCE - 3_000) // 2)
+    while True:
+        chunks = _split_text_bytes(text, limit)
+        total = len(chunks)
+        parts = []
+        for index, chunk in enumerate(chunks):
+            fragment = {"__fragment__": {
+                "section": key, "part": index + 1, "total": total,
+                "chars": len(text), "sha256": digest, "encoding": "canonical-json/utf-8",
+                "data": chunk,
+            }}
+            parts.append({"mode": "fragment", "value": fragment, "path": None,
+                          "part": index + 1, "total": total, "sha256": digest})
+        if all(_fits_section(key, part["value"], ceiling) for part in parts):
+            return parts
+        if limit <= 256:
+            raise ValidationError(
+                "One view fragment cannot fit a single page",
+                details={"section": key, "section_bytes": len(raw),
+                         "page_max_bytes": ceiling,
+                         "next_action": "raise max_page_bytes; the view is never truncated"})
+        limit = max(256, limit // 2)
 
+
+def _split_section(key: str, value: Any, ceiling: int) -> list[dict[str, Any]]:
+    """Split one oversized section into losslessly reassemblable parts.
+
+    Preference order:
+
+    1. split the largest list at element boundaries.  The first part carries
+       the full section head once; later parts carry only the continuation
+       chunk and reference the head implicitly by part order.  This removes the
+       repeated schema/unit/method head without dropping it.
+    2. if no list can be split (a huge scalar or a dict/list whose one entry is
+       itself over budget), deliver canonical JSON text in ordered fragments.
+
+    No branch truncates or omits a value.  ``_merge_view_pages`` reconstructs
+    the exact original section.
+    """
     if isinstance(value, list):
-        path: tuple[str, ...] = ()
+        path: tuple[str | int, ...] = ()
         items = list(value)
     else:
         found = _largest_list(value)
         if found is None:
-            raise ValidationError(
-                "One view section does not fit a single page",
-                details={"section": key, "section_bytes": _delivered_bytes({key: value}),
-                         "page_max_bytes": ceiling,
-                         "next_action": "raise max_page_bytes; the view is never truncated"})
+            return _fragment_parts(key, value, ceiling)
         _size, path = found
-        items = value
-        for step in path:
-            items = items[step]
-        items = list(items)
-    parts: list[tuple[Any, list[str] | None]] = []
-    start = 0
-    while start < len(items):
-        end = start + 1
-        while end < len(items):
-            candidate = _replace_at(value, path, items[start:end + 1]) if path else items[start:end + 1]
-            if not fits(candidate):
-                break
-            end += 1
+        items = list(_read_at(value, path))
+
+    def part_at(start: int, end: int, first: bool) -> Any:
         chunk = items[start:end]
-        part = _replace_at(value, path, chunk) if path else chunk
-        if not fits(part):
-            raise ValidationError(
-                "One view entry does not fit a single page",
-                details={"section": key, "path": list(path), "index": start,
-                         "entry_bytes": _delivered_bytes({key: items[start]}),
-                         "page_max_bytes": ceiling})
-        parts.append((part, list(path) if path else None))
-        start = end
+        return _replace_at(value, path, chunk) if first else chunk
+
+    def fits(start: int, end: int, first: bool) -> bool:
+        return _fits_section(key, part_at(start, end, first), ceiling)
+
+    parts: list[dict[str, Any]] = []
+    start = 0
+    first = True
+    while start < len(items):
+        if not fits(start, start + 1, first):
+            # The head plus one entry (or one continuation entry) is over
+            # budget: fall back to exact text fragments for the whole section.
+            return _fragment_parts(key, value, ceiling)
+        end = start + 1
+        step = 1
+        while end < len(items):
+            candidate = min(len(items), end + step)
+            if fits(start, candidate, first):
+                end = candidate
+                step *= 2
+            else:
+                break
+        low, high = end, min(len(items), end + step)
+        while low < high:
+            midpoint = (low + high + 1) // 2
+            if fits(start, midpoint, first):
+                low = midpoint
+            else:
+                high = midpoint - 1
+        parts.append({"mode": "list" if first else "continuation",
+                      "value": part_at(start, low, first),
+                      "path": list(path), "part": len(parts) + 1, "total": 0})
+        start = low
+        first = False
+    total = len(parts)
+    for index, part in enumerate(parts):
+        part["part"] = index + 1
+        part["total"] = total
     return parts
 
 
@@ -621,10 +804,10 @@ def _pack_view_sections(view: Mapping[str, Any], *,
                         ) -> list[list[tuple[str, Any]]]:
     """Greedily pack the view into pages of whole sections or section parts.
 
-    A section that fits one page is never split.  Only a section larger than a
-    page is split, and then only at list-element boundaries with every head
-    field repeated; ``_merge_view_pages`` concatenates the parts back in page
-    order, so the merged view is byte-for-byte the built view.
+    A section that fits one page is never split.  An oversized section is split
+    by ``_split_section``: list parts keep the full head once, continuations
+    carry only their chunk, and unsplittable values become exact text
+    fragments.  ``_merge_view_pages`` reconstructs the built view exactly.
     """
     pages: list[list[tuple[str, Any]]] = []
     current: list[tuple[str, Any]] = []
@@ -632,22 +815,26 @@ def _pack_view_sections(view: Mapping[str, Any], *,
     size = 0
     for key, value in view.items():
         section_bytes = _delivered_bytes({key: value})
-        units: list[tuple[Any, list[str] | None]]
         if section_bytes + _PAGE_HEADER_ALLOWANCE <= max_page_bytes:
-            units = [(value, None)]
+            units = [{"mode": "whole", "value": value, "path": None,
+                      "part": 1, "total": 1}]
         else:
             units = _split_section(str(key), value, max_page_bytes)
         split = len(units) > 1
-        for index, (unit, path) in enumerate(units):
-            unit_bytes = _delivered_bytes({key: unit})
+        for unit in units:
+            part = unit["value"]
+            unit_bytes = _delivered_bytes({key: part})
             if current and (size + unit_bytes > payload_budget or key in current_keys):
                 pages.append(current)
                 current, current_keys, size = [], set(), 0
-            current.append((key, unit))
+            current.append((key, part))
             current_keys.add(str(key))
             size += unit_bytes
             if split:
-                meta = {str(key): {"path": path, "part": index + 1, "total": len(units)}}
+                meta = {str(key): {"mode": unit["mode"], "path": unit["path"],
+                                   "part": unit["part"], "total": unit["total"]}}
+                if unit.get("sha256"):
+                    meta[str(key)]["sha256"] = unit["sha256"]
                 for position, entry in enumerate(current):
                     if entry[0] == "__parts__":
                         current[position] = ("__parts__", {**entry[1], **meta})
@@ -660,35 +847,84 @@ def _pack_view_sections(view: Mapping[str, Any], *,
 
 
 def _merge_view_pages(pages: Sequence[Mapping[str, Any]]) -> OrderedDict[str, Any]:
-    """Reassemble the view from page payloads, concatenating split parts."""
+    """Reassemble the view from page payloads, concatenating split parts.
+
+    Validates part order and totals, and verifies the SHA-256 of every text
+    fragment before parsing it.  A missing, duplicated or out-of-order part is
+    an error, never a silently shorter view.
+    """
     merged: OrderedDict[str, Any] = OrderedDict()
+    state: dict[str, dict[str, Any]] = {}
+    fragments: dict[str, list[str]] = {}
+
     for page in pages:
-        parts = (page.get("payload") or {}).get("__parts__") or {}
-        for key, value in (page.get("payload") or {}).items():
+        payload = page.get("payload") or {}
+        meta = payload.get("__parts__") or {}
+        for key, value in payload.items():
             if key == "__parts__":
                 continue
-            if key not in merged:
-                merged[key] = value
+            info = meta.get(key) or {}
+            mode = str(info.get("mode") or ("whole" if not info else "list"))
+            split_mode = "list" if mode in {"list", "continuation"} else mode
+            part = int(info.get("part") or 1)
+            total = int(info.get("total") or 1)
+            current = state.setdefault(key, {"mode": split_mode, "total": total,
+                                            "parts": 0, "sha256": None})
+            if current["mode"] != split_mode or current["total"] != total:
+                raise ValidationError("Page fragments disagree about their section",
+                                      details={"section": key, "mode": mode,
+                                               "expected_mode": current["mode"],
+                                               "total": total,
+                                               "expected_total": current["total"]})
+            if part != current["parts"] + 1:
+                raise ValidationError(
+                    "Page fragments are missing or out of order",
+                    details={"section": key, "expected_part": current["parts"] + 1,
+                             "received_part": part, "total": total})
+            current["parts"] = part
+            if mode == "fragment":
+                fragment = (value or {}).get("__fragment__") or {}
+                if str(fragment.get("sha256") or "") != str(current["sha256"] or
+                                                             fragment.get("sha256")):
+                    if current["sha256"] not in (None, fragment.get("sha256")):
+                        raise ValidationError("Page fragment hash changed",
+                                              details={"section": key})
+                current["sha256"] = fragment.get("sha256")
+                fragments.setdefault(key, []).append(str(fragment.get("data") or ""))
                 continue
-            path = (parts.get(key) or {}).get("path") or []
-            target = merged[key]
-            for step in path[:-1]:
-                target = target[step]
-            if path:
-                target[path[-1]] = list(target.get(path[-1]) or []) + list(
-                    (value if not path[:-1] else value) if False else _read_at(value, path))
-            elif isinstance(merged[key], list) and isinstance(value, list):
-                merged[key] = list(merged[key]) + list(value)
-            else:
-                raise ValidationError("Page fragments cannot be merged",
-                                      details={"section": key})
+            if mode == "continuation":
+                if key not in merged:
+                    raise ValidationError("Continuation page has no head part",
+                                          details={"section": key, "part": part})
+                path = list(info.get("path") or [])
+                if not path:
+                    merged[key] = list(merged[key]) + list(value)
+                else:
+                    parent = _read_at(merged[key], path[:-1])
+                    parent[path[-1]] = list(parent[path[-1]]) + list(value)
+                continue
+            if key in merged:
+                raise ValidationError("Page repeats a section head",
+                                      details={"section": key, "part": part})
+            merged[key] = _deep_copy(value)
+
+    for key, chunks in fragments.items():
+        current = state[key]
+        if current["parts"] != current["total"]:
+            raise ValidationError("Page fragments are incomplete",
+                                  details={"section": key,
+                                           "received": current["parts"],
+                                           "total": current["total"]})
+        text = "".join(chunks)
+        if sha256_bytes(text.encode("utf-8")) != str(current["sha256"]):
+            raise ValidationError("Page fragments do not reconstruct the section",
+                                  details={"section": key})
+        try:
+            merged[key] = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValidationError("Page fragments are not valid JSON",
+                                  details={"section": key, "error": str(exc)}) from exc
     return merged
-
-
-def _read_at(value: Any, path: Sequence[str]) -> Any:
-    for step in path:
-        value = value[step]
-    return value
 
 
 class PanoramaLifecycle:
@@ -1250,16 +1486,31 @@ class PanoramaLifecycle:
             delivery = delivery_status(state)
             result["handle"] = {
                 "handle": handle,
-                "capture_id": state["capture_id"],
-                "revision": state["revision"],
-                "fact_root": state["fact_root"],
-                "document_hash": state["document_hash"],
-                "delivered": bool(state.get("complete") and state.get("receipt")),
+                "capture_id": state.get("capture_id"),
+                "revision": state.get("revision"),
+                "fact_root": state.get("fact_root"),
+                "document_hash": state.get("document_hash"),
+                "delivered": bool((state.get("complete") and state.get("receipt")) or
+                                  (str(state.get("mode")) in {"delta_pages", "result_pages"}
+                                   and state.get("complete"))),
                 "receipt": state.get("receipt"),
                 "context_token": state.get("context_token"),
                 "view_sha256": delivery.get("view_sha256") or state.get("view_sha256"),
                 "delivery": delivery,
             }
+            if str(state.get("mode")) in {"view_pages", "delta_pages", "result_pages"}:
+                result["handle"]["mode"] = state.get("mode")
+            if str(state.get("mode")) == "delta_pages":
+                result["handle"].update({
+                    "delta_id": state.get("delta_id"),
+                    "delta_hash": state.get("delta_hash"),
+                    "payload_sha256": state.get("payload_sha256"),
+                })
+            if str(state.get("mode")) == "result_pages":
+                result["handle"].update({
+                    "result_kind": state.get("result_kind"),
+                    "payload_sha256": state.get("payload_sha256"),
+                })
         return result
 
     def refresh(self, project_id: str, *, expected_revision: Mapping[str, Any] | None = None,
@@ -1295,7 +1546,9 @@ class PanoramaLifecycle:
     def single(self, project_id: str, *,
                expected_revision: Mapping[str, Any] | None = None,
                capture_id: str | None = None,
-               max_response_bytes: int | None = None) -> dict[str, Any]:
+               max_response_bytes: int | None = None,
+               allow_lean: bool = True,
+               allow_minimum: bool = True) -> dict[str, Any]:
         """Deliver the whole project view, its receipt and its token in one result.
 
         This is the normal path.  The server builds the compact view, measures
@@ -1316,7 +1569,7 @@ class PanoramaLifecycle:
             project_id, capture_id, expected_revision)
         record_path = f"captures/{capture}/record.json"
         view = build_view(document, record_path=record_path, max_response_bytes=budget)
-        if view_bytes(view) > LEAN_OVERVIEW_BYTES:
+        if allow_lean and view_bytes(view) > LEAN_OVERVIEW_BYTES:
             lean_view = build_view(document, record_path=record_path,
                                    max_response_bytes=budget, lean=True)
             if view_bytes(lean_view) < view_bytes(view):
@@ -1374,6 +1627,12 @@ class PanoramaLifecycle:
             # catalogue.  It is explicitly not the whole view and mints no
             # receipt, token or handle.  If even that does not fit, the honest
             # measured refusal remains the only answer.
+            if not allow_minimum:
+                scope = self._new_read_scope(
+                    project_id, capture, revision, document_sha,
+                    str(envelope["fact_root"]), budget)
+                return _over_budget(envelope, report, budget, measured_response,
+                                    read_scope=scope)
             minimum_view = build_minimum_view(
                 document, record_path=record_path, max_response_bytes=budget)
             minimum_envelope = _minimum_envelope(
@@ -1453,19 +1712,22 @@ class PanoramaLifecycle:
                   expected_revision: Mapping[str, Any] | None = None,
                   capture_id: str | None = None,
                   page_target_bytes: int | None = None,
-                  max_page_bytes: int | None = None) -> dict[str, Any]:
-        """Deliver the model view as pages and page 1's manifest.
+                  max_page_bytes: int | None = None,
+                  requested_mode: str = "pages",
+                  fallback: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Deliver the full model view as pages and page 1's manifest.
 
-        The view is built exactly as the single-response path builds it (no
-        lean fallback, no new rounding), then split on whole top-level sections.
-        Every page is a valid JSON object with its own header, stable
-        ``page_id``, payload hash and the overall ``view_sha256``.  Merging the
-        payloads in page order reproduces the view byte-for-byte under
-        ``view_canonical``.
+        The view is built exactly as the single-response path builds it with
+        ``lean=False`` (no lean fallback, no new rounding), then split on whole
+        top-level sections or lossless section parts.  Every page is a valid
+        JSON object with its own header, stable ``page_id``, payload hash and
+        the overall ``view_sha256``.  Merging the payloads in page order
+        reproduces the view byte-for-byte under ``view_canonical``.
 
         The page count is not capped: N grows until every page's *measured*
-        serialised envelope fits ``max_page_bytes``.  A section that cannot fit a
-        single page raises instead of being truncated or split silently.
+        UTF-8 serialised envelope fits ``max_page_bytes``.  A section that
+        cannot fit one page is split at list boundaries or delivered as exact
+        canonical-JSON fragments; it is never truncated or silently skipped.
         """
         target = int(page_target_bytes or VIEW_PAGE_TARGET_BYTES)
         ceiling = int(max_page_bytes or VIEW_PAGE_MAX_BYTES)
@@ -1482,7 +1744,10 @@ class PanoramaLifecycle:
         view = build_view(document, record_path=f"captures/{capture}/record.json",
                           lean=False)
         total_bytes = len(view_canonical(view))
-        budget = max(2_000, target - _PAGE_HEADER_ALLOWANCE)
+        # Reserve room for the manifest that page 1 must carry.  The exact
+        # check below still measures the complete envelope; this only avoids a
+        # long shrink loop for the common case.
+        budget = max(2_000, target - _PAGE_HEADER_ALLOWANCE - 2_048)
         pack_ceiling = ceiling
         for _ in range(16):
             packed = _pack_view_sections(view, payload_budget=budget,
@@ -1493,30 +1758,40 @@ class PanoramaLifecycle:
             envelopes = [self._view_page_envelope(state, index)
                          for index in range(len(state["view_pages"]))]
             sizes = [_delivered_bytes(envelope) for envelope in envelopes]
-            worst = max(sizes)
+            manifest = self._view_manifest(state, sizes, ceiling,
+                                           requested_mode=requested_mode,
+                                           fallback=fallback)
+            self._mark_received(state, 0)
+            first = self._view_page_envelope(state, 0, manifest=manifest)
+            first_size = _delivered_bytes(first)
+            worst = max([first_size] + sizes[1:])
             if worst <= ceiling:
-                self._mark_received(state, 0)
-                envelope = self._view_page_envelope(state, 0)
-                envelope["manifest"] = {
-                    "page_count": len(state["view_pages"]),
-                    "page_ids": [page["page_id"] for page in state["view_pages"]],
-                    "page_hashes": [page["page_hash"] for page in state["view_pages"]],
-                    "page_bytes": list(state["page_bytes"]),
-                    "response_bytes": sizes,
-                    "measurement": "delivered characters (json.dumps indent=2, ensure_ascii=False)",
-                    "max_page_bytes": ceiling,
-                    "view_bytes": total_bytes,
+                manifest["page_1_response_bytes"] = first_size
+                first = self._view_page_envelope(state, 0, manifest=manifest)
+                first_size = _delivered_bytes(first)
+                # The manifest grew by a few digits; re-measure once.
+                if first_size > ceiling:
+                    state["received"] = []
+                    self._save_handle(str(state["handle"]), state)
+                    pack_ceiling = max(4_000, pack_ceiling - (first_size - ceiling) - 256)
+                    budget = max(2_000, min(budget, pack_ceiling - _PAGE_HEADER_ALLOWANCE - 2048))
+                    continue
+                state["delivery"] = {
+                    "mode": "pages",
+                    "view_schema": view.get("schema_version"),
                     "view_sha256": state["view_sha256"],
-                    "schema": view.get("schema_version"),
-                    "complete": False,
-                    "next_call": {
-                        "tool": "reaper_panorama_page",
-                        "then": ("fetch every page_id in this order, then call "
-                                 "reaper_panorama_ack with every page_hash; only a "
-                                 "complete receipt allows analysis or edits"),
-                    },
+                    "view_bytes": total_bytes,
+                    "response_bytes": max([first_size] + sizes[1:]),
+                    "page_1_response_bytes": first_size,
+                    "max_page_bytes": ceiling,
+                    "fits": True,
+                    "page_count": len(state["view_pages"]),
                 }
-                return envelope
+                state["manifest"] = dict(manifest)
+                self._save_handle(str(state["handle"]), state)
+                return first
+            state["received"] = []
+            self._save_handle(str(state["handle"]), state)
             if budget <= 2_000:
                 raise ValidationError(
                     "A panorama page cannot fit the response cap",
@@ -1526,8 +1801,803 @@ class PanoramaLifecycle:
                                              "accepts a larger result; the view is never "
                                              "truncated")})
             pack_ceiling = max(4_000, pack_ceiling - (worst - ceiling) - 256)
-            budget = max(2_000, min(budget, pack_ceiling - _PAGE_HEADER_ALLOWANCE))
+            budget = max(2_000, min(budget, pack_ceiling - _PAGE_HEADER_ALLOWANCE - 2048))
         raise ValidationError("The panorama could not be packed into pages")
+
+    def open_auto(self, project_id: str, *,
+                  expected_revision: Mapping[str, Any] | None = None,
+                  capture_id: str | None = None,
+                  max_response_bytes: int | None = None,
+                  page_target_bytes: int | None = None,
+                  max_page_bytes: int | None = None,
+                  requested_mode: str = "auto") -> dict[str, Any]:
+        """The default model path: one full response when it fits, pages otherwise.
+
+        The fast path uses the *full* view (``lean=False``) and no minimum core.
+        If its measured single response exceeds the declared budget, the same
+        capture is delivered as a complete page set; the caller never has to
+        guess a mode or narrow the question to see the project.  An explicit
+        ``mode="single"`` request goes through the same fallback, so a size
+        limit can never turn a full-panorama request into a refusal.
+        """
+        budget = int(max_response_bytes or DEFAULT_RESPONSE_BYTES)
+        single = self.single(project_id, expected_revision=expected_revision,
+                             capture_id=capture_id, max_response_bytes=budget,
+                             allow_lean=False, allow_minimum=False)
+        if str(single.get("status")) == "complete":
+            delivery = dict(single.get("delivery") or {})
+            delivery["requested_mode"] = requested_mode
+            delivery["fallback"] = None
+            single["delivery"] = delivery
+            return single
+        over = single.get("over_limit") or {}
+        fallback = {
+            "from": "single",
+            "to": "pages",
+            "reason": (single.get("delivery", {}).get("reason")
+                       or "measured_single_over_budget"),
+            "measured_bytes": over.get("measured_bytes"),
+            "max_response_bytes": budget,
+            "note": ("the complete view is delivered below as pages; no fact was "
+                     "dropped or narrowed"),
+        }
+        result = self.open_view(project_id, expected_revision=expected_revision,
+                                capture_id=capture_id,
+                                page_target_bytes=page_target_bytes,
+                                max_page_bytes=max_page_bytes,
+                                requested_mode=requested_mode, fallback=fallback)
+        result["mode"] = "pages"
+        result["fallback"] = dict(fallback)
+        return result
+
+    def _view_manifest(self, state: Mapping[str, Any], sizes: Sequence[int],
+                       ceiling: int, *, requested_mode: str,
+                       fallback: Mapping[str, Any] | None) -> dict[str, Any]:
+        pages = list(state["view_pages"])
+        count = len(pages)
+        section_page = dict(state.get("view_section_page") or {})
+        where = {name: section_page[name] for name in
+                 ("entities", "tracks", "analysis", "relations", "archive")
+                 if name in section_page}
+        manifest: dict[str, Any] = {
+            "mode": "pages",
+            "requested_mode": requested_mode,
+            "page_count": count,
+            "page_id_pattern": "pg_{index}_of_{page_count}",
+            "manifest_sha256": state["manifest_sha256"],
+            "page_bytes": list(state["page_bytes"]),
+            "response_bytes": list(sizes),
+            "measurement": ("UTF-8 bytes of json.dumps(indent=2, ensure_ascii=False); "
+                            "page 1 excludes its own manifest, see "
+                            "page_1_response_bytes"),
+            "max_page_bytes": ceiling,
+            "view_bytes": state["view_bytes"],
+            "view_sha256": state["view_sha256"],
+            "schema": state["view_schema"],
+            "where": where,
+            "units": ("section-local: analysis.metric_units, units, audio_contract, "
+                      "archive.catalog"),
+            "complete": False,
+            "next_call": {
+                "tool": "reaper_panorama_page",
+                "then": ("fetch every declared page in order, then call "
+                         "reaper_panorama_ack with every page_hash in order (or with "
+                         "this manifest_sha256 alone); only a complete receipt allows "
+                         "analysis or edits"),
+            },
+        }
+        if fallback:
+            manifest["fallback"] = dict(fallback)
+        inline = count <= MANIFEST_INLINE_MAX_PAGES
+        if inline:
+            manifest["page_ids_inline"] = True
+            manifest["page_hashes_inline"] = True
+            manifest["page_ids"] = [page["page_id"] for page in pages]
+            manifest["page_hashes"] = [page["page_hash"] for page in pages]
+            if _delivered_bytes(manifest) > MANIFEST_MAX_BYTES:
+                inline = False
+        if not inline:
+            # Exact, compact declaration: the page ids are deterministic from
+            # the declared pattern and count; every hash is committed by the
+            # ordered page-set hash; the full list stays available in the
+            # handle and in the manifest artifact.
+            for key in ("page_ids", "page_hashes"):
+                manifest.pop(key, None)
+            manifest["page_ids_inline"] = False
+            manifest["page_hashes_inline"] = False
+            manifest["page_bytes_inline"] = False
+            manifest["page_bytes_summary"] = {
+                "min": min(state["page_bytes"]) if state["page_bytes"] else None,
+                "max": max(state["page_bytes"]) if state["page_bytes"] else None,
+                "sum": sum(state["page_bytes"]),
+            }
+            manifest["response_bytes_summary"] = {
+                "min": min(sizes) if sizes else None,
+                "max": max(sizes) if sizes else None,
+                "sum": sum(sizes),
+            }
+            manifest["page_bytes"] = {
+                "inline": False, "count": count,
+                "sha256": sha256_bytes(canonical_bytes(list(state["page_bytes"]))),
+            }
+            manifest["response_bytes"] = {
+                "inline": False, "count": len(sizes),
+                "sha256": sha256_bytes(canonical_bytes(list(sizes))),
+            }
+            manifest["ack"] = {
+                "page_manifest_sha256": state["manifest_sha256"],
+                "page_hashes": "pass page_manifest_sha256 instead of the full hash list",
+            }
+        return manifest
+
+    # -- paged delivery of a delta -------------------------------------------
+
+    def _new_delta_pages_state(self, *, delta_id: str, delta_hash: str,
+                               payload: Mapping[str, Any], kind: str,
+                               project_id: str, capture_id: str,
+                               revision: Mapping[str, Any],
+                               base_context_token: str | None,
+                               base_capture_id: str | None,
+                               target_capture_id: str | None,
+                               packed: Sequence[Sequence[tuple[str, Any]]]) -> dict[str, Any]:
+        handle = "dlh_" + secrets.token_urlsafe(18)
+        count = len(packed)
+        pages: list[dict[str, Any]] = []
+        for index, sections in enumerate(packed):
+            page_id = f"dp_{index + 1}_of_{count}"
+            body = OrderedDict(sections)
+            encoded = view_canonical(body)
+            pages.append({
+                "page_id": page_id,
+                "page_index": index,
+                "sections": [key for key, _value in sections],
+                "payload": {key: value for key, value in sections},
+                "page_hash": sha256_bytes(encoded),
+                "page_bytes": len(encoded),
+            })
+        page_set = [{"page_id": page["page_id"], "page_hash": page["page_hash"]}
+                    for page in pages]
+        state = {
+            "schema_version": LIFECYCLE_SCHEMA,
+            "handle": handle,
+            "mode": "delta_pages",
+            "delta_id": delta_id,
+            "delta_hash": delta_hash,
+            "delta_kind": kind,
+            "project_id": project_id,
+            "capture_id": capture_id,
+            "revision": dict(revision),
+            "base_context_token": base_context_token,
+            "base_capture_id": base_capture_id,
+            "target_capture_id": target_capture_id,
+            "payload": dict(payload),
+            "payload_sha256": sha256_bytes(canonical_bytes(payload)),
+            "payload_bytes": len(canonical_bytes(payload)),
+            "page_count": count,
+            "manifest_sha256": sha256_bytes(canonical_bytes(page_set)),
+            "delta_pages": pages,
+            "page_hashes": [page["page_hash"] for page in pages],
+            "page_bytes": [page["page_bytes"] for page in pages],
+            "received": [],
+            "complete": False,
+            "created_at": time.time(),
+            "expires_at": time.time() + HANDLE_TTL_SECONDS,
+        }
+        self._save_handle(handle, state)
+        return state
+
+    def _delta_manifest(self, state: Mapping[str, Any], sizes: Sequence[int],
+                        ceiling: int) -> dict[str, Any]:
+        pages = list(state["delta_pages"])
+        count = len(pages)
+        manifest: dict[str, Any] = {
+            "mode": "delta_pages",
+            "kind": state["delta_kind"],
+            "delta_id": state["delta_id"],
+            "delta_hash": state["delta_hash"],
+            "payload_sha256": state["payload_sha256"],
+            "payload_bytes": state["payload_bytes"],
+            "page_count": count,
+            "page_id_pattern": "dp_{index}_of_{page_count}",
+            "manifest_sha256": state["manifest_sha256"],
+            "page_bytes": list(state["page_bytes"]),
+            "response_bytes": list(sizes),
+            "measurement": ("UTF-8 bytes of json.dumps(indent=2, ensure_ascii=False); "
+                            "page 1 excludes its own manifest"),
+            "max_page_bytes": ceiling,
+            "complete": False,
+            "next_call": {
+                "tool": "reaper_panorama_page",
+                "then": ("fetch every declared delta page in order, then call "
+                         "reaper_panorama_ack with every page_hash in order (or with "
+                         "this manifest_sha256 alone); only a complete acknowledgement "
+                         "advances the context token"),
+            },
+        }
+        inline = count <= MANIFEST_INLINE_MAX_PAGES
+        if inline:
+            manifest["page_ids"] = [page["page_id"] for page in pages]
+            manifest["page_hashes"] = [page["page_hash"] for page in pages]
+            manifest["page_ids_inline"] = True
+            manifest["page_hashes_inline"] = True
+            if _delivered_bytes(manifest) > MANIFEST_MAX_BYTES:
+                inline = False
+        if not inline:
+            for key in ("page_ids", "page_hashes"):
+                manifest.pop(key, None)
+            manifest["page_ids_inline"] = False
+            manifest["page_hashes_inline"] = False
+            manifest["page_bytes_inline"] = False
+            manifest["page_bytes_summary"] = {
+                "min": min(state["page_bytes"]) if state["page_bytes"] else None,
+                "max": max(state["page_bytes"]) if state["page_bytes"] else None,
+                "sum": sum(state["page_bytes"]),
+            }
+            manifest["page_bytes"] = {
+                "inline": False, "count": count,
+                "sha256": sha256_bytes(canonical_bytes(list(state["page_bytes"]))),
+            }
+            manifest["ack"] = {
+                "page_manifest_sha256": state["manifest_sha256"],
+                "page_hashes": "pass page_manifest_sha256 instead of the full hash list",
+            }
+        return manifest
+
+    def _delta_page_envelope(self, state: Mapping[str, Any], index: int,
+                             manifest: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        pages = list(state["delta_pages"])
+        if index < 0 or index >= len(pages):
+            raise ValidationError("Page index is outside the delta",
+                                  details={"page_index": index, "page_count": len(pages)})
+        page = pages[index]
+        received = sorted(set(int(item) for item in state.get("received") or []))
+        progress = _page_progress(pages, received)
+        complete = bool(state.get("complete"))
+        envelope: dict[str, Any] = {
+            "schema_version": LIFECYCLE_SCHEMA,
+            "status": "delta_page",
+            "kind": state["delta_kind"],
+            "delta_id": state["delta_id"],
+            "delta_hash": state["delta_hash"],
+            "payload_sha256": state["payload_sha256"],
+            "payload_bytes": state["payload_bytes"],
+            "project_id": state["project_id"],
+            "capture_id": state["capture_id"],
+            "revision": state["revision"],
+            "handle": state["handle"],
+            "page_id": page["page_id"],
+            "page_index": index,
+            "page_count": len(pages),
+            "page_hash": page["page_hash"],
+            "page_bytes": page["page_bytes"],
+            "sections": list(page["sections"]),
+            "payload": page["payload"],
+            "delivery": {
+                **progress,
+                "complete": complete,
+                "advance_on_ack": bool(state.get("base_context_token")),
+            },
+        }
+        if index + 1 < len(pages):
+            envelope["next"] = {
+                "tool": "reaper_panorama_page", "handle": state["handle"],
+                "revision": state["revision"], "page_id": pages[index + 1]["page_id"],
+            }
+        else:
+            envelope["next"] = {
+                "tool": "reaper_panorama_ack", "handle": state["handle"],
+                "revision": state["revision"],
+                "page_hashes": "every page_hash in page order",
+                "page_manifest_sha256": state["manifest_sha256"],
+            }
+        if manifest is not None:
+            envelope["manifest"] = dict(manifest)
+        elif index == 0 and isinstance(state.get("manifest"), Mapping):
+            envelope["manifest"] = dict(state["manifest"])
+        return envelope
+
+    def _open_delta_pages(self, *, delta_id: str, delta_hash: str,
+                          payload: Mapping[str, Any], kind: str,
+                          project_id: str, capture_id: str,
+                          revision: Mapping[str, Any],
+                          base_context_token: str | None,
+                          base_capture_id: str | None,
+                          target_capture_id: str | None,
+                          target: int = DELTA_PAGE_TARGET_BYTES,
+                          ceiling: int = DELTA_PAGE_MAX_BYTES) -> dict[str, Any]:
+        """Deliver a delta losslessly as pages, with no automatic advance."""
+        target = min(int(target), int(ceiling))
+        budget = max(2_000, target - _PAGE_HEADER_ALLOWANCE - 2_048)
+        pack_ceiling = ceiling
+        for _ in range(16):
+            packed = _pack_view_sections(payload, payload_budget=budget,
+                                         max_page_bytes=pack_ceiling)
+            state = self._new_delta_pages_state(
+                delta_id=delta_id, delta_hash=delta_hash, payload=payload, kind=kind,
+                project_id=project_id, capture_id=capture_id, revision=revision,
+                base_context_token=base_context_token,
+                base_capture_id=base_capture_id, target_capture_id=target_capture_id,
+                packed=packed)
+            envelopes = [self._delta_page_envelope(state, index)
+                         for index in range(len(state["delta_pages"]))]
+            sizes = [_delivered_bytes(envelope) for envelope in envelopes]
+            manifest = self._delta_manifest(state, sizes, ceiling)
+            self._mark_received(state, 0)
+            first = self._delta_page_envelope(state, 0, manifest=manifest)
+            first_size = _delivered_bytes(first)
+            worst = max([first_size] + sizes[1:])
+            if worst <= ceiling:
+                manifest["page_1_response_bytes"] = first_size
+                first = self._delta_page_envelope(state, 0, manifest=manifest)
+                first_size = _delivered_bytes(first)
+                if first_size > ceiling:
+                    state["received"] = []
+                    self._save_handle(str(state["handle"]), state)
+                    pack_ceiling = max(4_000, pack_ceiling - (first_size - ceiling) - 256)
+                    budget = max(2_000, min(budget, pack_ceiling - _PAGE_HEADER_ALLOWANCE - 2048))
+                    continue
+                state["delivery"] = {
+                    "mode": "delta_pages", "response_bytes": max([first_size] + sizes[1:]),
+                    "page_1_response_bytes": first_size, "max_page_bytes": ceiling,
+                    "fits": True, "page_count": len(state["delta_pages"]),
+                    "advance_on_ack": bool(base_context_token),
+                }
+                state["manifest"] = dict(manifest)
+                self._save_handle(str(state["handle"]), state)
+                return first
+            state["received"] = []
+            self._save_handle(str(state["handle"]), state)
+            if budget <= 2_000:
+                raise ValidationError(
+                    "A delta page cannot fit the response cap",
+                    details={"page_bytes": sizes, "max_page_bytes": ceiling,
+                             "next_action": ("raise the page ceiling if the host really "
+                                             "accepts a larger result; the delta is never "
+                                             "truncated")})
+            pack_ceiling = max(4_000, pack_ceiling - (worst - ceiling) - 256)
+            budget = max(2_000, min(budget, pack_ceiling - _PAGE_HEADER_ALLOWANCE - 2048))
+        raise ValidationError("The delta could not be packed into pages")
+
+    def _ack_delta_pages(self, state: dict[str, Any], handle: str,
+                         page_hashes: Sequence[str],
+                         page_manifest_sha256: str | None) -> dict[str, Any]:
+        pages = list(state["delta_pages"])
+        expected = [page["page_hash"] for page in pages]
+        supplied = [str(item) for item in page_hashes]
+        received = set(int(item) for item in state.get("received") or [])
+        progress = _page_progress(pages, sorted(received))
+        if progress["pages_missing_count"]:
+            response: dict[str, Any] = {
+                "schema_version": LIFECYCLE_SCHEMA,
+                "status": "incomplete", "complete": False,
+                "kind": state["delta_kind"], "delta_id": state["delta_id"],
+                "delta_hash": state["delta_hash"],
+                "page_count": len(pages),
+                **progress,
+            }
+            if "pages_missing" in progress:
+                response["missing_pages"] = progress["pages_missing"]
+            else:
+                response["missing_pages_inline"] = False
+                response["missing_pages_first"] = progress["pages_missing_first"]
+            response["next_call"] = {
+                "tool": "reaper_panorama_page", "handle": handle,
+                "revision": state["revision"],
+                "page_id": (progress.get("pages_missing") or
+                            progress.get("pages_missing_first") or [None])[0],
+            }
+            return response
+        manifest_hash = state.get("manifest_sha256")
+        if page_manifest_sha256 is not None:
+            if str(page_manifest_sha256) != str(manifest_hash):
+                raise StaleContext("Delta manifest hash does not match the served delta",
+                                   details={"expected": manifest_hash,
+                                            "received": page_manifest_sha256})
+            if supplied and supplied != expected:
+                raise StaleContext("Delta page hashes do not match the served delta",
+                                   details={"expected_count": len(expected),
+                                            "received_count": len(supplied)})
+            verified_by = "manifest_sha256"
+        elif supplied == expected:
+            verified_by = "page_hashes"
+        else:
+            raise StaleContext("Delta page hashes do not match the served delta",
+                               details={"expected_count": len(expected),
+                                        "received_count": len(supplied),
+                                        "next_action": ("pass the manifest hash or every "
+                                                        "page_hash in order")})
+        merged = _merge_view_pages(pages)
+        merged_payload = dict(merged)
+        reconstructed = sha256_bytes(canonical_bytes(merged_payload))
+        if reconstructed != str(state["payload_sha256"]):
+            raise StaleContext(
+                "Delta pages do not reconstruct the served payload",
+                details={"expected_sha256": state["payload_sha256"],
+                         "reconstructed_sha256": reconstructed})
+        if _delta_hash(merged_payload) != str(state["delta_hash"]):
+            raise StaleContext(
+                "Delta pages do not reconstruct the served delta hash",
+                details={"expected_delta_hash": state["delta_hash"]})
+        base_token = state.get("base_context_token")
+        if not base_token:
+            return {
+                "schema_version": LIFECYCLE_SCHEMA, "status": "complete",
+                "complete": True, "kind": state["delta_kind"],
+                "delta_id": state["delta_id"], "delta_hash": state["delta_hash"],
+                "payload_sha256": state["payload_sha256"],
+                "reconstructed": True, "verified_by": verified_by,
+                "page_count": len(pages), "manifest_sha256": manifest_hash,
+                "advance": None,
+                "note": ("informational delta: no context token was supplied, so the "
+                         "complete page set was verified but no token is advanced"),
+            }
+        advanced = self.delta_ack(str(state["delta_id"]), str(state["delta_hash"]),
+                                  str(base_token))
+        state["complete"] = True
+        state["completed_at"] = time.time()
+        self._save_handle(handle, state)
+        return {
+            "schema_version": LIFECYCLE_SCHEMA, "status": "complete",
+            "complete": True, "kind": state["delta_kind"],
+            "delta_id": state["delta_id"], "delta_hash": state["delta_hash"],
+            "payload_sha256": state["payload_sha256"],
+            "reconstructed": True, "verified_by": verified_by,
+            "page_count": len(pages), "manifest_sha256": manifest_hash,
+            "idempotent": bool(advanced.get("idempotent")),
+            "advance": {
+                "advanced": True,
+                "predecessor_token": base_token,
+                "context_token": advanced.get("context_token"),
+                "revision": advanced.get("revision"),
+                "view_root": advanced.get("view_root"),
+                "audio_evidence": advanced.get("audio_evidence"),
+                "guarantee": ("this exact complete delta (delta_hash, payload_sha256) "
+                              "was delivered and acknowledged; the successor token is "
+                              "valid for the target revision"),
+            },
+            "context_token": advanced.get("context_token"),
+            "revision": advanced.get("revision"),
+            "view_root": advanced.get("view_root"),
+            "audio_evidence": advanced.get("audio_evidence"),
+        }
+
+    # -- lossless pages for exact queries and audio deltas --------------------
+
+    def open_result_pages(self, payload: Mapping[str, Any], *,
+                          result_kind: str,
+                          project_id: str,
+                          capture_id: str,
+                          revision: Mapping[str, Any],
+                          fact_root_value: str,
+                          document_hash_value: str,
+                          source_handle: str | None = None,
+                          page_target_bytes: int | None = None,
+                          max_page_bytes: int | None = None) -> dict[str, Any]:
+        """Deliver an exact query or audio-delta payload as complete pages.
+
+        This is the same lossless page format as the panorama: a page is a set
+        of whole top-level sections or exact fragments, page 1 carries the
+        manifest, and merging every payload in order reproduces the original
+        payload byte-for-byte under canonical JSON.  The acknowledgement for
+        this route proves reconstruction only.  It mints no receipt and no
+        context token, and it never changes the capture context.
+        """
+        if not isinstance(payload, Mapping):
+            raise ValidationError("a paged result must be a JSON object")
+        target = int(page_target_bytes or RESULT_PAGE_TARGET_BYTES)
+        ceiling = int(max_page_bytes or RESULT_PAGE_MAX_BYTES)
+        if target <= 0 or ceiling <= 0:
+            raise ValidationError("result page sizes must be positive",
+                                  details={"target": target, "max_page_bytes": ceiling})
+        if ceiling < 4_000:
+            raise ValidationError("max_page_bytes is too small for a result page header",
+                                  details={"max_page_bytes": ceiling})
+        target = min(target, ceiling)
+        total_bytes = len(canonical_bytes(payload))
+        budget = max(2_000, target - _PAGE_HEADER_ALLOWANCE - 2_048)
+        pack_ceiling = ceiling
+        for _ in range(16):
+            packed = _pack_view_sections(payload, payload_budget=budget,
+                                         max_page_bytes=pack_ceiling)
+            state = self._new_result_pages_state(
+                result_kind=result_kind, payload=payload,
+                project_id=project_id, capture_id=capture_id, revision=revision,
+                fact_root_value=fact_root_value, document_hash_value=document_hash_value,
+                source_handle=source_handle, packed=packed,
+                total_bytes=total_bytes, target=target, max_page_bytes=ceiling)
+            envelopes = [self._result_page_envelope(state, index)
+                         for index in range(len(state["result_pages"]))]
+            sizes = [_delivered_bytes(envelope) for envelope in envelopes]
+            manifest = self._result_manifest(state, sizes, ceiling)
+            self._mark_received(state, 0)
+            first = self._result_page_envelope(state, 0, manifest=manifest)
+            first_size = _delivered_bytes(first)
+            worst = max([first_size] + sizes[1:])
+            if worst <= ceiling:
+                manifest["page_1_response_bytes"] = first_size
+                first = self._result_page_envelope(state, 0, manifest=manifest)
+                first_size = _delivered_bytes(first)
+                if first_size > ceiling:
+                    state["received"] = []
+                    self._save_handle(str(state["handle"]), state)
+                    pack_ceiling = max(4_000, pack_ceiling - (first_size - ceiling) - 256)
+                    budget = max(2_000, min(budget, pack_ceiling - _PAGE_HEADER_ALLOWANCE - 2048))
+                    continue
+                state["delivery"] = {
+                    "mode": "result_pages",
+                    "result_kind": result_kind,
+                    "payload_sha256": state["payload_sha256"],
+                    "payload_bytes": total_bytes,
+                    "response_bytes": max([first_size] + sizes[1:]),
+                    "page_1_response_bytes": first_size,
+                    "max_page_bytes": ceiling,
+                    "fits": True,
+                    "page_count": len(state["result_pages"]),
+                    "mutation_unlocked": False,
+                }
+                state["manifest"] = dict(manifest)
+                self._save_handle(str(state["handle"]), state)
+                return first
+            state["received"] = []
+            self._save_handle(str(state["handle"]), state)
+            if budget <= 2_000:
+                raise ValidationError(
+                    "A result page cannot fit the response cap",
+                    details={"page_bytes": sizes, "max_page_bytes": ceiling,
+                             "pages": len(sizes),
+                             "next_action": ("raise max_page_bytes if the host really "
+                                             "accepts a larger result; the result is never "
+                                             "truncated")})
+            pack_ceiling = max(4_000, pack_ceiling - (worst - ceiling) - 256)
+            budget = max(2_000, min(budget, pack_ceiling - _PAGE_HEADER_ALLOWANCE - 2048))
+        raise ValidationError("The result could not be packed into pages")
+
+    def _new_result_pages_state(self, *, result_kind: str,
+                                payload: Mapping[str, Any],
+                                project_id: str, capture_id: str,
+                                revision: Mapping[str, Any],
+                                fact_root_value: str, document_hash_value: str,
+                                source_handle: str | None,
+                                packed: Sequence[Sequence[tuple[str, Any]]],
+                                total_bytes: int, target: int,
+                                max_page_bytes: int) -> dict[str, Any]:
+        handle = "rsh_" + secrets.token_urlsafe(18)
+        count = len(packed)
+        pages: list[dict[str, Any]] = []
+        for index, sections in enumerate(packed):
+            page_id = f"rp_{index + 1}_of_{count}"
+            body = OrderedDict(sections)
+            encoded = view_canonical(body)
+            pages.append({
+                "page_id": page_id,
+                "page_index": index,
+                "sections": [key for key, _value in sections],
+                "payload": {key: value for key, value in sections},
+                "page_hash": sha256_bytes(encoded),
+                "page_bytes": len(encoded),
+            })
+        page_set = [{"page_id": page["page_id"], "page_hash": page["page_hash"]}
+                    for page in pages]
+        state = {
+            "schema_version": LIFECYCLE_SCHEMA,
+            "handle": handle,
+            "mode": "result_pages",
+            "result_kind": result_kind,
+            "project_id": project_id,
+            "capture_id": capture_id,
+            "revision": dict(revision),
+            "fact_root": fact_root_value,
+            "document_hash": document_hash_value,
+            "source_handle": source_handle,
+            "payload": dict(payload),
+            "payload_sha256": sha256_bytes(canonical_bytes(payload)),
+            "payload_bytes": total_bytes,
+            "page_target_bytes": int(target),
+            "max_page_bytes": int(max_page_bytes),
+            "page_count": count,
+            "manifest_sha256": sha256_bytes(canonical_bytes(page_set)),
+            "result_pages": pages,
+            "page_hashes": [page["page_hash"] for page in pages],
+            "page_bytes": [page["page_bytes"] for page in pages],
+            "received": [],
+            "complete": False,
+            "context_token": None,
+            "created_at": time.time(),
+            "expires_at": time.time() + HANDLE_TTL_SECONDS,
+        }
+        self._save_handle(handle, state)
+        return state
+
+    def _result_manifest(self, state: Mapping[str, Any], sizes: Sequence[int],
+                         ceiling: int) -> dict[str, Any]:
+        pages = list(state["result_pages"])
+        count = len(pages)
+        manifest: dict[str, Any] = {
+            "mode": "result_pages",
+            "result_kind": state.get("result_kind"),
+            "payload_sha256": state["payload_sha256"],
+            "payload_bytes": state["payload_bytes"],
+            "page_count": count,
+            "page_id_pattern": "rp_{index}_of_{page_count}",
+            "manifest_sha256": state["manifest_sha256"],
+            "page_bytes": list(state["page_bytes"]),
+            "response_bytes": list(sizes),
+            "measurement": ("UTF-8 bytes of json.dumps(indent=2, ensure_ascii=False); "
+                            "page 1 excludes its own manifest"),
+            "max_page_bytes": ceiling,
+            "complete": False,
+            "acknowledgement": ("fetch every declared page, then call reaper_panorama_ack "
+                                "with every page_hash in order or with manifest_sha256; "
+                                "this proves exact reconstruction only and mints no edit token"),
+            "next_call": {
+                "tool": "reaper_panorama_page",
+                "then": ("fetch every declared page in order, then call reaper_panorama_ack; "
+                         "the result acknowledgement does not mint a receipt or context token"),
+            },
+        }
+        inline = count <= MANIFEST_INLINE_MAX_PAGES
+        if inline:
+            manifest["page_ids"] = [page["page_id"] for page in pages]
+            manifest["page_hashes"] = [page["page_hash"] for page in pages]
+            manifest["page_ids_inline"] = True
+            manifest["page_hashes_inline"] = True
+            if _delivered_bytes(manifest) > MANIFEST_MAX_BYTES:
+                inline = False
+        if not inline:
+            for key in ("page_ids", "page_hashes"):
+                manifest.pop(key, None)
+            manifest["page_ids_inline"] = False
+            manifest["page_hashes_inline"] = False
+            manifest["page_bytes_inline"] = False
+            manifest["page_bytes_summary"] = {
+                "min": min(state["page_bytes"]) if state["page_bytes"] else None,
+                "max": max(state["page_bytes"]) if state["page_bytes"] else None,
+                "sum": sum(state["page_bytes"]),
+            }
+            manifest["response_bytes_summary"] = {
+                "min": min(sizes) if sizes else None,
+                "max": max(sizes) if sizes else None,
+                "sum": sum(sizes),
+            }
+            manifest["ack"] = {
+                "page_manifest_sha256": state["manifest_sha256"],
+                "page_hashes": "pass page_manifest_sha256 instead of the full hash list",
+            }
+        return manifest
+
+    def _result_page_envelope(self, state: Mapping[str, Any], index: int,
+                              manifest: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        pages = list(state["result_pages"])
+        if index < 0 or index >= len(pages):
+            raise ValidationError("Page index is outside the result",
+                                  details={"page_index": index, "page_count": len(pages)})
+        page = pages[index]
+        received = sorted(set(int(item) for item in state.get("received") or []))
+        progress = _page_progress(pages, received)
+        envelope: dict[str, Any] = {
+            "schema_version": LIFECYCLE_SCHEMA,
+            "status": "result_page",
+            "result_kind": state["result_kind"],
+            "project_id": state["project_id"],
+            "capture_id": state["capture_id"],
+            "revision": state["revision"],
+            "fact_root": state["fact_root"],
+            "document_hash": state["document_hash"],
+            "handle": state["handle"],
+            "page_id": page["page_id"],
+            "page_index": index,
+            "page_count": len(pages),
+            "page_hash": page["page_hash"],
+            "page_bytes": page["page_bytes"],
+            "payload_sha256": state["payload_sha256"],
+            "payload_bytes": state["payload_bytes"],
+            "sections": list(page["sections"]),
+            "payload": page["payload"],
+            "delivery": {
+                **progress,
+                "complete": bool(state.get("complete")),
+                "advance_on_ack": False,
+                "mutation_unlocked": False,
+            },
+        }
+        if index + 1 < len(pages):
+            envelope["next"] = {
+                "tool": "reaper_panorama_page", "handle": state["handle"],
+                "revision": state["revision"], "page_id": pages[index + 1]["page_id"],
+            }
+        else:
+            envelope["next"] = {
+                "tool": "reaper_panorama_ack", "handle": state["handle"],
+                "revision": state["revision"],
+                "page_hashes": "every page_hash in page order",
+                "page_manifest_sha256": state["manifest_sha256"],
+            }
+        if manifest is not None:
+            envelope["manifest"] = dict(manifest)
+        elif index == 0 and isinstance(state.get("manifest"), Mapping):
+            envelope["manifest"] = dict(state["manifest"])
+        return envelope
+
+    def _ack_result_pages(self, state: dict[str, Any], handle: str,
+                          page_hashes: Sequence[str],
+                          page_manifest_sha256: str | None) -> dict[str, Any]:
+        pages = list(state["result_pages"])
+        expected = [page["page_hash"] for page in pages]
+        supplied = [str(item) for item in page_hashes]
+        received = set(int(item) for item in state.get("received") or [])
+        progress = _page_progress(pages, sorted(received))
+        if progress["pages_missing_count"]:
+            response: dict[str, Any] = {
+                "schema_version": LIFECYCLE_SCHEMA,
+                "status": "incomplete", "complete": False,
+                "result_kind": state["result_kind"],
+                "handle": handle, "page_count": len(pages),
+                **progress,
+            }
+            if "pages_missing" in progress:
+                response["missing_pages"] = progress["pages_missing"]
+            else:
+                response["missing_pages_inline"] = False
+                response["missing_pages_first"] = progress["pages_missing_first"]
+            response["next_call"] = {
+                "tool": "reaper_panorama_page", "handle": handle,
+                "revision": state["revision"],
+                "page_id": (progress.get("pages_missing") or
+                            progress.get("pages_missing_first") or [None])[0],
+            }
+            return response
+        manifest_hash = state.get("manifest_sha256")
+        if page_manifest_sha256 is not None:
+            if str(page_manifest_sha256) != str(manifest_hash):
+                raise StaleContext(
+                    "Result manifest hash does not match the served result",
+                    details={"expected": manifest_hash, "received": page_manifest_sha256})
+            if supplied and supplied != expected:
+                raise StaleContext(
+                    "Result page hashes do not match the served result",
+                    details={"expected_count": len(expected), "received_count": len(supplied)})
+            verified_by = "manifest_sha256"
+        elif supplied == expected:
+            verified_by = "page_hashes"
+        else:
+            raise StaleContext(
+                "Result page hashes do not match the served result",
+                details={"expected_count": len(expected), "received_count": len(supplied),
+                         "next_action": "pass the manifest hash or every page_hash in order"})
+        merged = _merge_view_pages(pages)
+        reconstructed = sha256_bytes(canonical_bytes(merged))
+        if reconstructed != str(state["payload_sha256"]):
+            raise StaleContext(
+                "Result pages do not reconstruct the served payload",
+                details={"expected_sha256": state["payload_sha256"],
+                         "reconstructed_sha256": reconstructed})
+        idempotent = bool(state.get("complete"))
+        state["complete"] = True
+        state["completed_at"] = time.time()
+        self._save_handle(handle, state)
+        return {
+            "schema_version": LIFECYCLE_SCHEMA,
+            "status": "complete",
+            "complete": True,
+            "result_kind": state["result_kind"],
+            "project_id": state.get("project_id"),
+            "capture_id": state.get("capture_id"),
+            "revision": state.get("revision"),
+            "fact_root": state.get("fact_root"),
+            "document_hash": state.get("document_hash"),
+            "payload_sha256": state["payload_sha256"],
+            "page_count": len(pages),
+            "manifest_sha256": manifest_hash,
+            "verified_by": verified_by,
+            "reconstructed": True,
+            "idempotent": idempotent,
+            "context_token": None,
+            "mutation_unlocked": False,
+            "capture_context_unchanged": True,
+            "receipt_guarantee": ("these exact result pages were delivered and reconstruct "
+                                  "the query/audio-delta payload; no receipt or edit token "
+                                  "is created by this acknowledgement"),
+        }
 
     def _new_view_pages_state(self, project_id: str, capture_id: str,
                               revision: Mapping[str, Any],
@@ -1554,7 +2624,11 @@ class PanoramaLifecycle:
                 "page_bytes": len(payload_bytes),
             })
             for key, _value in sections:
-                section_page[str(key)] = page_id
+                # A split section's continuation page must not replace the
+                # head page in the navigation map.
+                section_page.setdefault(str(key), page_id)
+        page_set = [{"page_id": page["page_id"], "page_hash": page["page_hash"]}
+                    for page in pages]
         state = {
             "schema_version": LIFECYCLE_SCHEMA,
             "handle": handle,
@@ -1570,6 +2644,7 @@ class PanoramaLifecycle:
             "page_target_bytes": int(target),
             "max_page_bytes": int(max_page_bytes),
             "page_count": page_count,
+            "manifest_sha256": sha256_bytes(canonical_bytes(page_set)),
             "view_pages": pages,
             "view_section_page": section_page,
             "page_hashes": [page["page_hash"] for page in pages],
@@ -1585,7 +2660,8 @@ class PanoramaLifecycle:
         return state
 
     def _view_page_envelope(self, state: Mapping[str, Any],
-                            index: int) -> dict[str, Any]:
+                            index: int,
+                            manifest: Mapping[str, Any] | None = None) -> dict[str, Any]:
         pages = list(state["view_pages"])
         if index < 0 or index >= len(pages):
             raise ValidationError("page index is outside the view",
@@ -1593,8 +2669,7 @@ class PanoramaLifecycle:
                                            "page_count": len(pages)})
         page = pages[index]
         received = sorted(set(int(item) for item in state.get("received") or []))
-        missing = [pages[i]["page_id"] for i in range(len(pages))
-                   if i not in set(received)]
+        progress = _page_progress(pages, received)
         section_page = dict(state.get("view_section_page") or {})
         where = {name: section_page[name] for name in
                  ("entities", "tracks", "analysis", "relations", "archive")
@@ -1622,8 +2697,7 @@ class PanoramaLifecycle:
                       "archive.catalog"),
             "payload": page["payload"],
             "delivery": {
-                "pages_received": len(received),
-                "pages_missing": missing,
+                **progress,
                 "complete": complete,
                 "receipt": state.get("receipt"),
             },
@@ -1643,56 +2717,112 @@ class PanoramaLifecycle:
                 "handle": state["handle"],
                 "revision": state["revision"],
                 "page_hashes": "every page_hash in page order",
+                "page_manifest_sha256": state.get("manifest_sha256"),
             }
+        if manifest is not None:
+            envelope["manifest"] = dict(manifest)
+        elif index == 0 and isinstance(state.get("manifest"), Mapping):
+            envelope["manifest"] = dict(state["manifest"])
         return envelope
 
     def view_page(self, handle: str, revision: Mapping[str, Any],
                   page_id: str) -> dict[str, Any]:
         state = self._load_handle(handle)
-        if str(state.get("mode")) != "view_pages":
-            raise ValidationError("This handle is not a paged panorama view",
+        mode = str(state.get("mode"))
+        if mode not in {"view_pages", "delta_pages", "result_pages"}:
+            raise ValidationError("This handle is not a paged view, delta or result",
                                   details={"handle": handle})
         if not revisions_match(revision, state["revision"]):
             raise StaleContext("Page request is for another revision",
                                details={"requested": _normalise_revision(revision),
                                         "current": state["revision"]})
-        ids = [page["page_id"] for page in state["view_pages"]]
+        if mode == "result_pages":
+            pages = list(state["result_pages"])
+        else:
+            pages = (list(state["delta_pages"]) if mode == "delta_pages"
+                     else list(state["view_pages"]))
+        ids = [page["page_id"] for page in pages]
         if page_id not in ids:
-            raise ValidationError("Unknown page_id for this panorama",
+            raise ValidationError("Unknown page_id for this result",
                                   details={"page_id": page_id, "page_ids": ids})
         index = ids.index(page_id)
         self._mark_received(state, index)
-        return self._view_page_envelope(state, index)
+        if mode == "delta_pages":
+            response = self._delta_page_envelope(state, index)
+        elif mode == "result_pages":
+            response = self._result_page_envelope(state, index)
+        else:
+            response = self._view_page_envelope(state, index)
+        ceiling = int(state.get("max_page_bytes") or VIEW_PAGE_MAX_BYTES)
+        if index == 0 and "manifest" in response and _delivered_bytes(response) > ceiling:
+            manifest = response.pop("manifest")
+            response["manifest_ref"] = {
+                "sha256": manifest.get("manifest_sha256"),
+                "page_count": manifest.get("page_count"),
+                "reason": "the manifest does not fit this page envelope; fetch page ids "
+                          "from the deterministic page_id_pattern or the original open",
+            }
+        return response
 
     def ack_pages(self, handle: str, revision: Mapping[str, Any],
-                  page_hashes: Sequence[str]) -> dict[str, Any]:
+                  page_hashes: Sequence[str],
+                  page_manifest_sha256: str | None = None) -> dict[str, Any]:
         state = self._load_handle(handle)
-        if str(state.get("mode")) != "view_pages":
-            raise ValidationError("This handle is not a paged panorama view",
+        mode = str(state.get("mode"))
+        if mode not in {"view_pages", "delta_pages", "result_pages"}:
+            raise ValidationError("This handle is not a paged view, delta or result",
                                   details={"handle": handle})
         if not revisions_match(revision, state["revision"]):
             raise StaleContext("Acknowledgement is for another revision",
                                details={"requested": _normalise_revision(revision),
                                         "current": state["revision"]})
+        if mode == "delta_pages":
+            return self._ack_delta_pages(state, handle, list(page_hashes),
+                                         page_manifest_sha256)
+        if mode == "result_pages":
+            return self._ack_result_pages(state, handle, list(page_hashes),
+                                          page_manifest_sha256)
         pages = list(state["view_pages"])
         expected = [page["page_hash"] for page in pages]
         supplied = [str(item) for item in page_hashes]
         received = set(int(item) for item in state.get("received") or [])
-        missing = [pages[i]["page_id"] for i in range(len(pages)) if i not in received]
-        if missing:
-            return {
+        progress = _page_progress(pages, sorted(received))
+        if progress["pages_missing_count"]:
+            response: dict[str, Any] = {
                 "schema_version": LIFECYCLE_SCHEMA,
                 "status": "incomplete",
                 "complete": False,
-                "missing_pages": missing,
-                "pages_received": [pages[i]["page_id"] for i in sorted(received)],
                 "page_count": len(pages),
                 "view_sha256": state["view_sha256"],
-                "next_call": {"tool": "reaper_panorama_page", "handle": handle,
-                              "revision": state["revision"],
-                              "page_id": missing[0]},
+                **progress,
             }
-        if supplied != expected:
+            if "pages_missing" in progress:
+                response["missing_pages"] = progress["pages_missing"]
+            else:
+                response["missing_pages_inline"] = False
+                response["missing_pages_first"] = progress["pages_missing_first"]
+            response["next_call"] = {
+                "tool": "reaper_panorama_page", "handle": handle,
+                "revision": state["revision"],
+                "page_id": (progress.get("pages_missing") or
+                            progress.get("pages_missing_first") or [None])[0],
+            }
+            return response
+        manifest_hash = state.get("manifest_sha256")
+        if page_manifest_sha256 is not None:
+            if str(page_manifest_sha256) != str(manifest_hash):
+                raise StaleContext(
+                    "Page manifest hash does not match the served panorama",
+                    details={"expected_manifest_sha256": manifest_hash,
+                             "received_manifest_sha256": page_manifest_sha256,
+                             "next_action": "refetch the manifest and pass it unchanged"})
+            if supplied and supplied != expected:
+                raise StaleContext(
+                    "Page hashes do not match the served panorama",
+                    details={"expected_count": len(expected),
+                             "received_count": len(supplied),
+                             "next_action": "pass the manifest hash or every page_hash in order"})
+        elif supplied != expected:
             raise StaleContext(
                 "Page hashes do not match the served panorama",
                 details={"expected_count": len(expected), "received_count": len(supplied),
@@ -1705,8 +2835,11 @@ class PanoramaLifecycle:
                 "Pages do not reconstruct the delivered view",
                 details={"expected_sha256": state["view_sha256"],
                          "reconstructed_sha256": reconstructed})
+        verified_by = ("manifest_sha256" if page_manifest_sha256 is not None
+                       else "page_hashes")
         if state.get("complete") and state.get("receipt"):
-            return self._ack_view_response(state, idempotent=True)
+            return self._ack_view_response(state, idempotent=True,
+                                           verified_by=verified_by)
         receipt = "pr_" + secrets.token_urlsafe(24)
         state["complete"] = True
         state["receipt"] = receipt
@@ -1741,12 +2874,17 @@ class PanoramaLifecycle:
             "complete": True,
             "created_at": time.time(),
         }))
-        return self._ack_view_response(state, idempotent=False)
+        return self._ack_view_response(state, idempotent=False,
+                                       verified_by=verified_by)
 
     def _ack_view_response(self, state: Mapping[str, Any], *,
-                           idempotent: bool) -> dict[str, Any]:
+                           idempotent: bool, verified_by: str = "page_hashes") -> dict[str, Any]:
         pages = list(state["view_pages"])
-        return {
+        raw_manifest = state.get("manifest")
+        manifest: Mapping[str, Any] = (raw_manifest
+                                       if isinstance(raw_manifest, Mapping) else {})
+        inline = bool(manifest.get("page_ids_inline", True))
+        response: dict[str, Any] = {
             "schema_version": LIFECYCLE_SCHEMA,
             "status": "complete",
             "complete": True,
@@ -1761,13 +2899,22 @@ class PanoramaLifecycle:
             "view_sha256": state["view_sha256"],
             "view_bytes": state["view_bytes"],
             "page_count": len(pages),
-            "page_ids": [page["page_id"] for page in pages],
+            "manifest_sha256": state.get("manifest_sha256"),
+            "verified_by": verified_by,
             "reconstructed": True,
             "idempotent": idempotent,
             "receipt_guarantee": ("these exact pages (view_sha256, page hashes) were "
                                   "delivered and acknowledged; not a claim that they "
                                   "were read or understood"),
         }
+        if inline:
+            response["page_ids"] = [page["page_id"] for page in pages]
+        else:
+            response["page_ids_inline"] = False
+            response["page_id_pattern"] = "pg_{index}_of_{page_count}"
+            response["page_ids_sha256"] = sha256_bytes(canonical_bytes(
+                [page["page_id"] for page in pages]))
+        return response
 
     def query(self, handle: str, revision: Mapping[str, Any], *,
                   data: Any = None,
@@ -1786,8 +2933,10 @@ class PanoramaLifecycle:
         The normal path uses a complete handle plus its full-view receipt.  A
         ``read_scope`` issued by an over-budget refusal is accepted for this
         read-only query only; it has no receipt, cannot complete a panorama and
-        cannot authorize a mutation.  The fragment is returned whole or as
-        ``query_too_large`` with its measured size; it is never paged.
+        cannot authorize a mutation.  The fragment is returned inline when it
+        fits and otherwise as the same exact payload in complete result pages.
+        Result-page acknowledgement proves reconstruction only and mints no
+        receipt, context token or mutation permission.
         """
         if read_scope:
             state = self._load_handle(read_scope)
@@ -1839,7 +2988,24 @@ class PanoramaLifecycle:
             "read_scope": read_scope,
             "read_only": bool(read_scope),
         })
-        return result
+        if _delivered_bytes(result) <= budget:
+            return result
+        # The exact selection is larger than one measured response.  Do not
+        # refuse and do not narrow: deliver the same payload as complete pages.
+        payload = {key: value for key, value in result.items()
+                   if key not in {"handle", "context_token", "read_scope", "read_only"}}
+        return self.open_result_pages(
+            payload, result_kind="query",
+            project_id=str(state["project_id"]),
+            capture_id=str(state["capture_id"]),
+            revision=state["revision"],
+            fact_root_value=str(state["fact_root"]),
+            document_hash_value=str(state["document_hash"]),
+            source_handle=handle,
+            page_target_bytes=max(2_000, min(RESULT_PAGE_TARGET_BYTES,
+                                              max(4_000, budget))),
+            max_page_bytes=max(4_000, min(RESULT_PAGE_MAX_BYTES, budget)),
+        )
 
     def changes_since(self, project_id: str, *,
                       base_capture_id: str | None = None,
@@ -1913,19 +3079,16 @@ class PanoramaLifecycle:
                                  "the acknowledged revision; capture again")}
             return {"status": "not_modified", "project_id": project_id,
                     "revision": base_revision_value, "fact_root": base_root}
-        rows = [row for row in self.archive.list_index()
-                if normalize_project_id(row.get("project_id")) == normalize_project_id(project_id) and row.get("capture_id")]
-        rows.sort(key=lambda row: str(row["capture_id"]))
-        ids = [str(row["capture_id"]) for row in rows]
+        ids = {str(row["capture_id"]) for row in self.archive.list_index()
+               if normalize_project_id(row.get("project_id")) == normalize_project_id(project_id)
+               and row.get("capture_id")}
         if base_capture_id not in ids or target_capture_id not in ids:
             return {"status": "stale_base", "reason": "unknown_base",
                     "project_id": project_id, "to_capture": target_capture_id}
-        if ids.index(target_capture_id) - ids.index(base_capture_id) > MAX_DELTA_CHAIN:
-            return {"status": "refresh_required", "reason": "chain_too_long",
-                    "project_id": project_id, "from_capture": base_capture_id,
-                    "to_capture": target_capture_id,
-                    "next_call": {"tool": "reaper_panorama_refresh",
-                                  "project_id": project_id}}
+        # A direct capture-to-capture delta needs no chain traversal: both exact
+        # records are present in this archive.  An arbitrarily long gap is still a
+        # truthful delta, delivered inline or as complete pages; there is no
+        # arbitrary 20-capture horizon that forces a full refresh.
         target_document = self._document(target_capture_id)
         target_binding = self._binding(target_capture_id, target_document)
         target_revision = self._revision(target_binding, target_document, target_capture_id)
@@ -1944,15 +3107,15 @@ class PanoramaLifecycle:
                     "note": ("the captures were taken in different REAPER instances or "
                              "project generations; continuity cannot be inferred from the "
                              "path or change counter")}
-        base_view = stable_fact_view(base_document)
-        target_view = stable_fact_view(target_document)
-        operations = _diff_values(base_view, target_view)
-        if len(operations) > MAX_DELTA_OPS:
-            return {"status": "refresh_required", "reason": "delta_too_large",
-                    "project_id": project_id, "from_capture": base_capture_id,
-                    "to_capture": target_capture_id,
-                    "next_call": {"tool": "reaper_panorama_refresh",
-                                  "project_id": project_id}}
+        semantic = build_semantic_delta(
+            base_document, target_document,
+            base_capture_id=base_capture_id, target_capture_id=target_capture_id)
+        operations = semantic["ops"]
+        unchanged = {
+            name: {"count": row["after_count"], "hash": row["after_sha256"]}
+            for name, row in semantic["domains"].items()
+            if row["status"] == "unchanged"
+        }
         render_comparison = compare_render_manifests(
             base_document.get("render_manifest") or {},
             target_document.get("render_manifest") or {})
@@ -1997,10 +3160,15 @@ class PanoramaLifecycle:
             "to_root": fact_root(target_document),
             "document_hash": document_hash(target_document),
             "ops": operations,
-            "unchanged": _domain_counts({
-                key: value for key, value in target_view.items()
-                if key in base_view and base_view[key] == value
-            }),
+            "unchanged": unchanged,
+            "semantic": {
+                key: semantic[key] for key in
+                ("schema_version", "kind", "capture_ids", "journal", "identity", "provenance",
+                 "shared", "object_summary", "measurements", "structural", "domains",
+                 "coverage")
+            },
+            "metric_table": semantic["metric_table"],
+            "comparability": semantic["comparability"],
             "invalidations": invalidations,
             "render": {
                 "scope": render_comparison.get("scope"),
@@ -2016,19 +3184,24 @@ class PanoramaLifecycle:
                                   else "unknown")),
             },
             "attribution": "capture",
-            "compare": {"project": "same", "verdict": "comparable"},
+            "compare": {
+                "project": "same",
+                "structural": semantic["comparability"]["structural"]["state"],
+                "measurements": semantic["comparability"]["measurements"]["state"],
+                "unknown_reasons": semantic["comparability"]["measurements"]["unknown_reasons"],
+                "note": ("factual before/after only; no better/worse verdict. Structural "
+                         "and captured-audio changes are reported separately."),
+            },
         }
-        if context_record is None:
-            return {**delta_payload, "continuity": False,
-                    "note": ("delta is informational; pass a context_token to make it "
-                             "advanceable and usable for the mutation gate")}
         delta_hash = sha256_bytes(canonical_bytes(delta_payload))
         delta_id = "dl_" + secrets.token_urlsafe(24)
         _atomic_write(self.deltas_dir / f"{delta_id}.json", canonical_bytes({
             "schema_version": LIFECYCLE_SCHEMA,
+            "record_kind": "capture_delta",
             "delta_id": delta_id,
             "delta_hash": delta_hash,
-            "base_context_token": context_token,
+            "payload": delta_payload,
+            "base_context_token": context_token if context_record is not None else None,
             "project_id": project_id,
             "base_capture_id": base_capture_id,
             "base_revision": base_revision_value,
@@ -2041,21 +3214,69 @@ class PanoramaLifecycle:
             "acked": False,
             "successor_token": None,
         }))
-        result = {
+        result: dict[str, Any] = {
             **delta_payload,
-            "continuity": True,
-            "context_token": context_token,
+            "continuity": context_record is not None,
+            "context_token": context_token if context_record is not None else None,
             "delta_id": delta_id,
             "delta_hash": delta_hash,
+            "delivery": {
+                "mode": "inline",
+                "bytes": 0,
+                "measurement": "UTF-8 bytes of json.dumps(indent=2, ensure_ascii=False)",
+                "max_inline_bytes": DELTA_INLINE_MAX_BYTES,
+            },
             "next_call": {"tool": "reaper_panorama_status",
                           "delta_id": delta_id, "delta_hash": delta_hash,
                           "context_token": context_token},
         }
+        if context_record is None:
+            result["note"] = ("delta is informational; pass a context_token to make it "
+                              "advanceable and usable for the mutation gate")
+        # Measure the inline shape before advancing.  A large delta is paged
+        # instead, so the caller always receives every operation.
+        for _ in range(3):
+            size = _delivered_bytes(result)
+            if result["delivery"]["bytes"] == size:
+                break
+            result["delivery"]["bytes"] = size
+        if result["delivery"]["bytes"] > DELTA_INLINE_MAX_BYTES:
+            return self._open_delta_pages(
+                delta_id=delta_id, delta_hash=delta_hash, payload=delta_payload,
+                kind="capture_delta", project_id=project_id,
+                capture_id=target_capture_id, revision=target_revision,
+                base_context_token=(context_token if context_record is not None else None),
+                base_capture_id=base_capture_id, target_capture_id=target_capture_id)
         # The delta and its successor token are delivered in the same response:
         # the server already knows it served this exact delta hash on this base,
         # so no separate acknowledgement round trip is required to continue.
         # The guarantee is delivery of that exact delta, not that it was read.
-        if context_token:
+        if context_token and context_record is not None:
+            preview_audio = self._capture_audio_evidence(
+                target_capture_id, target_revision)
+            result["advance"] = _advance_preview(
+                target_revision, preview_audio, context_token)
+            result["context_token"] = "ct_" + "x" * 43
+            result["next_call"] = {
+                "tool": "reaper_panorama_status", "optional": True,
+                "note": ("only needed to re-acknowledge the same delta "
+                         "idempotently; the successor token is already in "
+                         "advance.context_token"),
+            }
+            if _delivered_bytes(result) > DELTA_INLINE_MAX_BYTES:
+                result.pop("advance", None)
+                result["context_token"] = context_token
+                result["next_call"] = {
+                    "tool": "reaper_panorama_status",
+                    "delta_id": delta_id, "delta_hash": delta_hash,
+                    "context_token": context_token,
+                }
+                return self._open_delta_pages(
+                    delta_id=delta_id, delta_hash=delta_hash, payload=delta_payload,
+                    kind="capture_delta", project_id=project_id,
+                    capture_id=target_capture_id, revision=target_revision,
+                    base_context_token=context_token,
+                    base_capture_id=base_capture_id, target_capture_id=target_capture_id)
             try:
                 advanced = self.delta_ack(delta_id, delta_hash, context_token)
             except (StaleContext, ValidationError) as exc:
@@ -2081,6 +3302,8 @@ class PanoramaLifecycle:
                              "idempotently; the successor token is already in "
                              "advance.context_token"),
                 }
+        result["delivery"]["bytes"] = _delivered_bytes(result)
+        result["delivery"]["fits"] = result["delivery"]["bytes"] <= DELTA_INLINE_MAX_BYTES
         return result
 
     def _load_change(self, delta_id: str) -> dict[str, Any]:
@@ -2205,6 +3428,7 @@ class PanoramaLifecycle:
         delta_id = "chg_" + secrets.token_urlsafe(24)
         record = {
             "schema_version": DELTA_SCHEMA,
+            "record_kind": "mutation_delta",
             "delta_id": delta_id,
             "delta_hash": payload_hash,
             "kind": kind,
@@ -2224,7 +3448,24 @@ class PanoramaLifecycle:
             "continuity": True,
             "context_token": resolved_token,
             "acknowledgeable": bool(payload.get("acknowledgeable")),
+            "delivery": {
+                "mode": "inline",
+                "bytes": 0,
+                "measurement": "UTF-8 bytes of json.dumps(indent=2, ensure_ascii=False)",
+                "max_inline_bytes": DELTA_INLINE_MAX_BYTES,
+            },
         }
+        for _ in range(3):
+            size = _delivered_bytes(response)
+            if response["delivery"]["bytes"] == size:
+                break
+            response["delivery"]["bytes"] = size
+        if response["delivery"]["bytes"] > DELTA_INLINE_MAX_BYTES:
+            return self._open_delta_pages(
+                delta_id=delta_id, delta_hash=payload_hash, payload=payload,
+                kind=kind, project_id=project_id, capture_id=capture_id,
+                revision=target["revision"], base_context_token=resolved_token,
+                base_capture_id=capture_id, target_capture_id=None)
         if payload.get("acknowledgeable"):
             response["next_call"] = {
                 "tool": "reaper_panorama_status",
@@ -2234,6 +3475,19 @@ class PanoramaLifecycle:
                 "then": ("Structural edits may continue against the advanced token. "
                          "Project-audio interpretation requires a fresh capture."),
             }
+            preview_audio = payload.get("audio_evidence") or {}
+            response["advance"] = _advance_preview(
+                target["revision"], preview_audio, resolved_token)
+            response["context_token"] = "ct_" + "x" * 43
+            if _delivered_bytes(response) > DELTA_INLINE_MAX_BYTES:
+                response.pop("advance", None)
+                response["context_token"] = resolved_token
+                response.pop("next_call", None)
+                return self._open_delta_pages(
+                    delta_id=delta_id, delta_hash=payload_hash, payload=payload,
+                    kind=kind, project_id=project_id, capture_id=capture_id,
+                    revision=target["revision"], base_context_token=resolved_token,
+                    base_capture_id=capture_id, target_capture_id=None)
             # Deliver the successor with the delta itself: the delta was served in
             # this response, so a second round trip would only re-transmit the
             # same hash.  The guarantee is delivery, not comprehension.
@@ -2263,6 +3517,8 @@ class PanoramaLifecycle:
                 "then": ("The readback was partial; no context advancement is possible. "
                          "Capture again and acknowledge the new panorama."),
             }
+        response["delivery"]["bytes"] = _delivered_bytes(response)
+        response["delivery"]["fits"] = response["delivery"]["bytes"] <= DELTA_INLINE_MAX_BYTES
         return response
 
     def delta_ack(self, delta_id: str, delta_hash: str,
@@ -2292,7 +3548,8 @@ class PanoramaLifecycle:
         if isinstance(payload, Mapping) and _delta_hash(payload) != str(record.get("delta_hash")):
             raise StaleContext("Delta payload no longer matches its stored hash",
                                details={"delta_id": delta_id})
-        is_change = isinstance(record.get("payload"), Mapping)
+        is_change = (str(record.get("record_kind") or "") != "capture_delta" and
+                     isinstance(record.get("payload"), Mapping))
         base_token = (str((record.get("base") or {}).get("context_token"))
                       if is_change else str(record.get("base_context_token")))
         if base_token != str(context_token):

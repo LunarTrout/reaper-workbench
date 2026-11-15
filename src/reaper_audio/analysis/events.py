@@ -71,6 +71,57 @@ def _event_spectrum(stereo: np.ndarray, fs: int, t0: float, dur: float) -> dict:
             "bands_db": [round(10 * np.log10(v / tot + 1e-20), 1) for v in e]}
 
 
+def _event_spectra(stereo: np.ndarray, fs: int, times: list[float],
+                   dur: float = 0.04, chunk: int = 512) -> list[dict]:
+    """The same per-event spectrum as :func:`_event_spectrum`, in bounded batches.
+
+    The event enrichment loop used to call one small FFT per onset; a dense
+    master can have thousands.  Batching rows changes no value: each row is the
+    same window, Hann taper, rfft and band sums.  Chunking bounds the temporary
+    matrix so eight analysis workers cannot multiply the peak memory.
+    """
+    length = max(128, int(dur * fs))
+    results: list[dict] = [{} for _ in times]
+    full: list[tuple[int, int]] = []
+    for index, t0 in enumerate(times):
+        a = int(t0 * fs)
+        b = min(len(stereo), a + length)
+        if b - a >= length:
+            full.append((index, a))
+        else:
+            results[index] = _event_spectrum(stereo, fs, t0, dur)
+    if not full:
+        return results
+    window = np.hanning(length)
+    frequencies = np.fft.rfftfreq(length, 1.0 / fs)
+    low_mask = (frequencies >= 20) & (frequencies < 200)
+    mid_mask = (frequencies >= 200) & (frequencies < 2000)
+    high_mask = (frequencies >= 2000) & (frequencies < 16000)
+    for start in range(0, len(full), chunk):
+        batch = full[start:start + chunk]
+        indices = np.asarray([index for index, _ in batch], dtype=np.int64)
+        starts = np.asarray([offset for _, offset in batch], dtype=np.int64)
+        rows = starts[:, None] + np.arange(length, dtype=np.int64)[None, :]
+        segments = stereo[rows]
+        spectra = np.fft.rfft(segments * window[None, :, None], axis=1)
+        power = np.mean(np.abs(spectra) ** 2, axis=2)
+        low = power[:, low_mask].sum(axis=1)
+        mid = power[:, mid_mask].sum(axis=1)
+        high = power[:, high_mask].sum(axis=1)
+        total = low + mid + high + 1e-20
+        centroid = (power * frequencies).sum(axis=1) / (
+            power.sum(axis=1) + 1e-20)
+        for row, index in enumerate(indices):
+            bands = [float(low[row]), float(mid[row]), float(high[row])]
+            results[int(index)] = {
+                "band": ["low", "mid", "high"][int(np.argmax(bands))],
+                "centroid_hz": round(float(centroid[row]), 0),
+                "bands_db": [round(10 * np.log10(value / total[row] + 1e-20), 1)
+                             for value in bands],
+            }
+    return results
+
+
 def _band_energy(stereo: np.ndarray, fs: int, t0: float, dur: float):
     a = int(t0 * fs)
     b = min(len(stereo), a + max(64, int(dur * fs)))
@@ -86,6 +137,39 @@ def _band_energy(stereo: np.ndarray, fs: int, t0: float, dur: float):
          float(spec[(f >= 200) & (f < 2000)].sum()),
          float(spec[(f >= 2000) & (f < 16000)].sum())]
     return ["low", "mid", "high"][int(np.argmax(e))]
+
+
+def _min_tree(values: np.ndarray) -> tuple[np.ndarray, int]:
+    """Segment tree of minima for exact first-at-or-below queries."""
+    count = len(values)
+    size = 1
+    while size < count:
+        size <<= 1
+    tree = np.full(2 * size, np.inf, dtype=np.float64)
+    tree[size:size + count] = values
+    for node in range(size - 1, 0, -1):
+        tree[node] = min(tree[node * 2], tree[node * 2 + 1])
+    return tree, size
+
+
+def _first_at_or_below(tree: np.ndarray, size: int, count: int,
+                       start: int, threshold: float) -> int:
+    """First index >= start whose value is <= threshold, or count."""
+    if start >= count:
+        return count
+
+    def descend(node: int, low: int, high: int) -> int:
+        if high <= start or tree[node] > threshold:
+            return count
+        if high - low == 1:
+            return low if low < count else count
+        middle = (low + high) // 2
+        found = descend(node * 2, low, middle)
+        if found < count:
+            return found
+        return descend(node * 2 + 1, middle, high)
+
+    return descend(1, 0, size)
 
 
 def detect_events(stereo: np.ndarray, fs: int = 44100, hop_s: float = HOP_S,
@@ -107,22 +191,34 @@ def detect_events(stereo: np.ndarray, fs: int = 44100, hop_s: float = HOP_S,
         return {"hop_ms": hop_s * 1000, "events": [], "count": 0}
 
     db = 20 * np.log10(peaks + 1e-12)
+    duration_tree, duration_size = _min_tree(db)
     events = []
 
     # --- онсеты: рост уровня после спада
+    # The original scan visits every 2 ms hop.  Its comparisons are pure array
+    # facts; compute the candidate mask once, then apply the sequential
+    # refractory rule only to the candidates in the same order.
+    rise = np.empty_like(db)
+    rise[0] = -np.inf
+    rise[1:] = db[1:] - db[:-1]
+    d1 = np.concatenate(([np.inf], db[:-1]))
+    d2 = np.concatenate(([np.inf, np.inf], db[:-2]))
+    d3 = np.concatenate(([np.inf, np.inf, np.inf], db[:-3]))
+    prev_dip = np.minimum(np.minimum(d1, d2), d3)
+    onset_mask = ((db >= floor_db) & (rise >= onset_db) &
+                  (db > prev_dip + onset_db))
     last_t = -1e9
-    for i in range(1, len(db)):
-        if db[i] < floor_db:
+    for i in np.flatnonzero(onset_mask):
+        candidate_t = float(times[i])
+        if (candidate_t - last_t) < refractory_s:
             continue
-        rise = db[i] - db[i - 1]
-        prev_dip = db[max(0, i - 3):i].min()
-        if rise >= onset_db and db[i] > prev_dip + onset_db and (times[i] - last_t) >= refractory_s:
-            last_t = float(times[i])
-            events.append({"t": round(float(times[i]), 3), "kind": "onset",
-                           "level_db": round(float(db[i]), 1)})
+        last_t = candidate_t
+        events.append({"t": round(candidate_t, 3), "kind": "onset",
+                       "level_db": round(float(db[i]), 1)})
 
     # --- пики и длительность каждого события
-    for ev in events:
+    spectra = _event_spectra(x, fs, [ev["t"] for ev in events], 0.04)
+    for ev, spec in zip(events, spectra):
         i0 = int(ev["t"] / hop_s)
         i1 = min(len(db), i0 + int(0.15 / hop_s))
         win = db[i0:i1]
@@ -131,16 +227,14 @@ def detect_events(stereo: np.ndarray, fs: int = 44100, hop_s: float = HOP_S,
         pk_i = i0 + int(np.argmax(win))
         pk_db = float(db[pk_i])
         # длительность: пока не упадёт на 15 дБ ниже пика
-        j = pk_i
-        while j < len(db) and db[j] > pk_db - 15:
-            j += 1
+        j = _first_at_or_below(duration_tree, duration_size, len(db),
+                               pk_i, pk_db - 15)
         dur = (j - pk_i) * hop_s
         # крест внутри события
         seg_p = peaks[i0:i1]
         seg_r = rmss[i0:i1]
         crest = 20 * np.log10((seg_p.max() + 1e-12) / (seg_r.mean() + 1e-12))
         capped = j >= len(db)
-        spec = _event_spectrum(x, fs, ev["t"], 0.04)
         ev.update({"peak_db": round(pk_db, 1),
                    "dur_ms": round(min(dur, 0.15) * 1000, 0),
                    "dur_capped": bool(capped),
@@ -152,16 +246,18 @@ def detect_events(stereo: np.ndarray, fs: int = 44100, hop_s: float = HOP_S,
     # --- скачки громкости (внезапно громко)
     w = max(1, int(spike_window_s / hop_s))
     event_times = sorted(ev["t"] for ev in events)
-    for i in range(w, len(db)):
-        jump = db[i] - db[i - w]
-        if jump >= spike_db and db[i] > -40:
+    if len(db) > w:
+        jump = db[w:] - db[:-w]
+        spike_mask = (jump >= spike_db) & (db[w:] > -40)
+        for offset in np.flatnonzero(spike_mask):
+            i = int(offset) + w
             candidate_t = float(times[i])
             if _has_near_event(event_times, candidate_t):
                 continue
             rounded_t = round(candidate_t, 3)
             events.append({"t": rounded_t, "kind": "spike",
                            "level_db": round(float(db[i]), 1),
-                           "jump_db": round(float(jump), 1)})
+                           "jump_db": round(float(jump[offset]), 1)})
             event_times.insert(bisect_left(event_times, rounded_t), rounded_t)
 
     # --- перегруз

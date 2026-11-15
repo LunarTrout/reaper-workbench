@@ -15,10 +15,10 @@ Two retrieval paths, both exact:
   filtered from the canonical panorama document, which is itself bound to the
   capture/revision/integrity of the sealed record.
 
-If the selected fragment does not fit the response budget the call returns
-``query_too_large`` with the measured size per family and the semantic scope
-that has to be narrowed.  It never truncates, never paginates and never
-silently returns less than it selected.
+The call always returns the exact selected rows.  If the result does not fit
+one measured response, the lifecycle converts the same payload into complete
+lossless result pages; it never truncates, never silently returns less, and
+never asks the caller to narrow a selection merely because of transport size.
 """
 
 from __future__ import annotations
@@ -453,7 +453,9 @@ def run_query(document: Mapping[str, Any], record: Any, *,
                       "re-measured and not truncated"),
             "hash_bound": ("series, MIDI and envelope rows are re-hashed against the sealed "
                            "detail manifest before they are returned"),
-            "no_pages": "a single coherent fragment, never a numbered chunk or cursor",
+            "result_pages": ("the exact selection is returned inline when it fits; "
+                              "otherwise the lifecycle delivers the same payload as complete "
+                              "result pages with exact reconstruction, never a truncation"),
         },
     }
     family_bytes: dict[str, int] = {}
@@ -465,51 +467,8 @@ def run_query(document: Mapping[str, Any], record: Any, *,
                 for request in requests:
                     if request["kind"] == "analysis_series":
                         request["resolution_s"] = float(resolution_s)
-            try:
-                detail_payload = resolve_details(record, document, requests,
-                                                 max_bytes=max_response_bytes)
-            except ValidationError as error:
-                # A point-count refusal is still a size refusal: report it as
-                # query_too_large with the same narrowing guidance, never as a
-                # generic validation error the model cannot act on.
-                if "limit" not in (error.details or {}):
-                    raise
-                return {
-                    **{key: result[key] for key in
-                       ("schema_version", "capture_id", "project_id", "revision",
-                        "document_sha256", "selection", "time_basis")},
-                    "status": "query_too_large",
-                    "reason": "exact_detail_point_limit",
-                    "point_limit": error.details.get("limit"),
-                    "requested_series": error.details.get("requested_series"),
-                    "max_response_bytes": int(max_response_bytes),
-                    "narrow": [
-                        "pass interval {start_s,end_s} to one section of the song",
-                        "pass objects [stable ids] to fewer sources",
-                        "pass a coarser resolution_s or fewer series names",
-                    ],
-                    "note": ("the rows exist in full in the archive; this is a per-request "
-                             "point limit, not a missing measurement"),
-                }
-            if detail_payload.get("status") == "detail_too_large":
-                return {
-                    **{key: result[key] for key in
-                       ("schema_version", "capture_id", "project_id", "revision",
-                        "document_sha256", "selection", "time_basis")},
-                    "status": "query_too_large",
-                    "reason": "exact_detail_over_budget",
-                    "measured_bytes": detail_payload.get("bytes"),
-                    "max_response_bytes": detail_payload.get("max_bytes"),
-                    "family_bytes": {"exact_detail": detail_payload.get("bytes")},
-                    "requests": detail_payload.get("requests"),
-                    "narrow": [
-                        "pass interval {start_s,end_s} to one section of the song",
-                        "pass objects [stable ids] to fewer sources",
-                        "pass series [names] or a coarser resolution_s",
-                    ],
-                    "note": ("the rows exist in full in the archive; this is a size limit "
-                             "of one response, not a missing measurement"),
-                }
+            detail_payload = resolve_details(record, document, requests,
+                                             max_bytes=None, max_points=None)
             result["data"]["exact_detail"] = detail_payload
             family_bytes["exact_detail"] = section_bytes(detail_payload)
         else:
@@ -558,29 +517,6 @@ def run_query(document: Mapping[str, Any], record: Any, *,
         "fits": measured <= int(max_response_bytes),
         "family_bytes": family_bytes,
     }
-    if measured > int(max_response_bytes):
-        return {
-            "schema_version": QUERY_SCHEMA,
-            "status": "query_too_large",
-            "reason": "selection_over_budget",
-            "capture_id": result["capture_id"],
-            "project_id": result["project_id"],
-            "revision": result["revision"],
-            "document_sha256": result["document_sha256"],
-            "selection": result["selection"],
-            "measured_bytes": measured,
-            "max_response_bytes": int(max_response_bytes),
-            "family_bytes": family_bytes,
-            "narrow": [
-                "drop the families you do not need from data",
-                "pass objects [stable ids] instead of all",
-                "pass interval {start_s,end_s} for a section",
-                "request one series or a coarser resolution_s",
-            ],
-            "note": ("the selection is over the size of one response. Nothing was "
-                     "truncated and nothing was paged; narrow the semantic scope and the "
-                     "whole fragment arrives in one result."),
-        }
     return result
 
 

@@ -27,6 +27,29 @@ def test_quarter_decay_and_coherence_match_separate_helpers() -> None:
     assert actual_coherence == expected_coherence
 
 
+def test_hit_peak_mask_matches_the_original_linear_scan() -> None:
+    rng = np.random.default_rng(37)
+    for size in (2, 3, 17, 257, 4096):
+        envelope = rng.normal(0.0, 0.2, size)
+        threshold = float(np.median(envelope))
+        expected = [i for i in range(1, envelope.size - 1)
+                    if envelope[i] > threshold
+                    and envelope[i] >= envelope[i - 1]
+                    and envelope[i] > envelope[i + 1]]
+        assert temporal._hit_peaks(envelope, threshold) == expected, size
+
+
+def test_batched_event_spectra_match_the_single_event_spectrum() -> None:
+    rng = np.random.default_rng(43)
+    sample_rate = 8_000
+    stereo = rng.normal(0.0, 0.1, (sample_rate, 2))
+    times = [0.0, 0.1, 0.35, 0.7, 0.96]
+    batched = events._event_spectra(stereo, sample_rate, times, 0.04, chunk=2)
+    for t0, actual in zip(times, batched):
+        expected = events._event_spectrum(stereo, sample_rate, t0, 0.04)
+        assert actual == expected, t0
+
+
 def test_vectorized_envelope_matches_legacy_loop() -> None:
     rng = np.random.default_rng(11)
     samples = rng.normal(0, 0.2, (48_000, 2))
@@ -106,6 +129,102 @@ def test_linear_slope_matches_polyfit() -> None:
     values = rng.normal(0, 2, 4)
     expected = float(np.polyfit(times, values, 1)[0])
     assert abs(temporal._linear_slope(times, values) - expected) < 1e-12
+
+
+def test_first_at_or_below_matches_the_linear_duration_scan() -> None:
+    rng = np.random.default_rng(31)
+    for size in (1, 2, 17, 257, 4096):
+        values = rng.normal(0.0, 6.0, size)
+        tree, tree_size = events._min_tree(values)
+        for start in (0, 1, size // 3, size - 1, size):
+            for threshold in (-20.0, -5.0, 0.0, 5.0, 20.0):
+                expected = size
+                for index in range(start, size):
+                    if values[index] <= threshold:
+                        expected = index
+                        break
+                assert events._first_at_or_below(
+                    tree, tree_size, size, start, threshold) == expected, (
+                        size, start, threshold)
+
+
+def test_batched_temporal_cells_match_analyze_cell() -> None:
+    sample_rate = 48_000
+    rng = np.random.default_rng(41)
+    time = np.arange(sample_rate * 2, dtype=np.float64) / sample_rate
+    samples = np.column_stack((
+        0.18 * np.sin(2 * np.pi * 220 * time) + 0.03 * rng.normal(size=time.size),
+        0.16 * np.sin(2 * np.pi * 221 * time) + 0.03 * rng.normal(size=time.size),
+    ))
+    batched = temporal.analyze(samples, fs=sample_rate, hop_s=0.1, nfft=4096)
+    nfft = 4096
+    hop = int(round(0.1 * sample_rate))
+    left, right = samples[:, 0], samples[:, 1]
+    matrix = temporal._bands_matrix(nfft, sample_rate)
+    erb_matrix, erb_present = temporal._erb_matrix(nfft, sample_rate)
+    expected = []
+    previous = None
+    for start in range(0, max(0, len(left) - hop // 2), hop):
+        cell = temporal.analyze_cell(
+            left[start:start + nfft], right[start:start + nfft], sample_rate,
+            prev_rms_db=previous, M=matrix, nfft=nfft,
+            erb_matrix=erb_matrix, erb_present=erb_present)
+        previous = cell["rms_db"]
+        expected.append(cell)
+    assert batched["times"] == [
+        round(start / sample_rate, 3)
+        for start in range(0, max(0, len(left) - hop // 2), hop)
+    ]
+    assert len(batched["cells"]) == len(expected)
+    for index, (actual, reference) in enumerate(zip(batched["cells"], expected)):
+        for key, value in reference.items():
+            assert actual[key] == value, (index, key, actual[key], value)
+        assert set(actual) - set(reference) <= {"momentary_lufs", "short_term_lufs"}
+
+
+def test_batched_pitch_uses_the_centered_quiet_window_threshold() -> None:
+    sample_rate = 48_000
+    period = 80
+    samples = np.full(sample_rate, -0.99e-6, dtype=np.float64)
+    samples[::period] = 0.99e-6
+    stereo = np.column_stack((samples, samples))
+    nfft = 4096
+    hop = int(round(0.1 * sample_rate))
+
+    # The fixture must cross the pitch-validity threshold only after centering.
+    active = temporal._active(samples[:nfft])
+    raw_peak = float(np.max(np.abs(active)))
+    centered_peak = float(np.max(np.abs(active - active.mean())))
+    assert raw_peak < 1e-6 <= centered_peak, (raw_peak, centered_peak)
+
+    batched = temporal.analyze(stereo, fs=sample_rate, hop_s=0.1, nfft=nfft)
+    matrix = temporal._bands_matrix(nfft, sample_rate)
+    erb_matrix, erb_present = temporal._erb_matrix(nfft, sample_rate)
+    expected = []
+    previous = None
+    for start in range(0, max(0, len(samples) - hop // 2), hop):
+        cell = temporal.analyze_cell(
+            samples[start:start + nfft], samples[start:start + nfft],
+            sample_rate, prev_rms_db=previous, M=matrix, nfft=nfft,
+            erb_matrix=erb_matrix, erb_present=erb_present)
+        previous = cell["rms_db"]
+        expected.append(cell)
+    for index, (actual, reference) in enumerate(zip(batched["cells"], expected)):
+        for key, value in reference.items():
+            assert actual[key] == value, (index, key, actual[key], value)
+
+    # Old batch code treated this active window as invalid and used _f0_hps;
+    # the fixture is only a regression test if that fallback differs.
+    window = temporal._hann_window(nfft)
+    channels = np.column_stack((samples[:nfft], samples[:nfft]))
+    spectrum = np.mean(np.abs(np.fft.rfft(
+        channels * window[:, None], axis=0)) ** 2, axis=1)
+    spectrum *= 2.0 / (np.sum(window ** 2) * nfft)
+    frequencies = np.fft.rfftfreq(nfft, 1.0 / sample_rate)
+    fallback_f0 = round(float(temporal._f0_hps(spectrum, frequencies)), 1)
+    reference_f0 = expected[0]["f0_hz"]
+    assert reference_f0 == 600.0
+    assert fallback_f0 != reference_f0, (fallback_f0, reference_f0)
 
 
 def _direct_short_term(samples: np.ndarray, sample_rate: int) -> np.ndarray:

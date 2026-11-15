@@ -248,13 +248,29 @@ def test_archived_overbudget_read_scope_query_and_read_only(tmp_path: Path) -> N
     with pytest.raises(ValidationError):
         lifecycle.require_receipt(scope["id"], record.project_id, opened["revision"])
 
-    # The exact query itself remains bounded and refuses; no partial data.
+    # The exact query is larger than one response: it is delivered complete as
+    # result pages, not refused and not narrowed.
     oversized = lifecycle.query(
         "", opened["revision"], data=["series"],
         objects=[analysis["analysis_id"]], series=["band_level"],
         read_scope=scope["id"])
-    assert oversized["status"] == "query_too_large"
-    assert "data" not in oversized
+    assert oversized["status"] == "result_page"
+    assert oversized["result_kind"] == "query"
+    manifest = oversized["manifest"]
+    ids = manifest.get("page_ids") or [
+        f"rp_{index}_of_{manifest['page_count']}"
+        for index in range(1, manifest["page_count"] + 1)]
+    pages = [oversized] + [
+        lifecycle.view_page(oversized["handle"], oversized["revision"], page_id)
+        for page_id in ids[1:]]
+    ack = lifecycle.ack_pages(
+        oversized["handle"], oversized["revision"],
+        [page["page_hash"] for page in pages])
+    assert ack["status"] == "complete"
+    assert ack["result_kind"] == "query"
+    assert ack["context_token"] is None
+    assert ack["mutation_unlocked"] is False
+    assert "receipt" not in ack
 
 
 def test_full_open_after_refusal_issues_normal_receipt_and_token(tmp_path: Path) -> None:
@@ -408,16 +424,18 @@ def test_tool_docs_describe_the_paged_receipt_route() -> None:
 
     docstring = mcp_server.reaper_panorama_query.__doc__ or ""
     assert "panorama_receipt" in docstring
-    assert "never pages" in docstring
+    assert "result_page" in docstring
     paths = [
         Path(__file__).resolve().parents[1] / "README.md",
         Path(__file__).resolve().parents[1] / "README.ru.md",
         Path(__file__).resolve().parents[1] / "docs/MCP-README-LLM.md",
-        Path(__file__).resolve().parents[1] / "docs/MCP-README-LLM.ru.md",
     ]
     for path in paths:
         text = path.read_text(encoding="utf-8")
         assert "reaper_panorama_ack" in text, path
         assert 'handle=""' not in text, path
-        assert "query_too_large" in text, path
+    llm = (Path(__file__).resolve().parents[1] / "docs/MCP-README-LLM.md").read_text(
+        encoding="utf-8")
+    assert "query_too_large" not in llm
+    assert "result_page" in llm
 

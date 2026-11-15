@@ -333,6 +333,20 @@ def _modulation(x, fs: int) -> dict:
     return {"rate_hz": round(rate, 2), "depth": round(depth, 3)}
 
 
+def _hit_peaks(envelope: np.ndarray, threshold: float) -> list[int]:
+    """Local maxima of a smoothed envelope, in the original scan's order.
+
+    The comparison is the exact rule used by the per-sample scan: strictly above
+    the threshold, at least the previous sample, strictly above the next one.
+    """
+    if envelope.size <= 2:
+        return []
+    middle = envelope[1:-1]
+    mask = ((middle > threshold) & (middle >= envelope[:-2]) &
+            (middle > envelope[2:]))
+    return (np.flatnonzero(mask) + 1).tolist()
+
+
 def analyze_cell(seg_l: np.ndarray, seg_r: np.ndarray, fs: int = 44100,
                  prev_rms_db: float | None = None, M: np.ndarray | None = None,
                  nfft: int | None = None,
@@ -402,8 +416,7 @@ def analyze_cell(seg_l: np.ndarray, seg_r: np.ndarray, fs: int = 44100,
         k = max(3, int(0.003 * fs))
         e1 = np.convolve(energy, np.ones(k) / k, mode="same")
         thr = 0.5 * e1.max()
-        idx = [i for i in range(1, e1.size - 1)
-               if e1[i] > thr and e1[i] >= e1[i - 1] and e1[i] > e1[i + 1]]
+        idx = _hit_peaks(e1, thr)
         merged = []
         for i in idx:
             if not merged or i - merged[-1] > 0.008 * fs:
@@ -448,6 +461,298 @@ def analyze_cell(seg_l: np.ndarray, seg_r: np.ndarray, fs: int = 44100,
     cell["erb"] = _erb_bands(spec, freqs, erb_matrix, erb_present)
     cell["wall"] = _wall(cell)
     return cell
+
+
+def _cell_batch_size(nfft: int) -> int:
+    """Bound the temporary batch by bytes, not by an unbounded cell count."""
+    per_cell = max(1, int(nfft)) * 2 * 8 * 8
+    return max(1, min(256, (64 * 1024 * 1024) // per_cell))
+
+
+def _analyze_cells_batch(left: np.ndarray, right: np.ndarray,
+                         starts: list[int], fs: int,
+                         prev_rms_db: float | None,
+                         M: np.ndarray, nfft: int,
+                         erb_matrix: np.ndarray,
+                         erb_present: np.ndarray) -> tuple[list[dict], float | None]:
+    """Compute independent 100-ms cells with one bounded FFT batch.
+
+    This mirrors :func:`analyze_cell` value-for-value.  The batch only changes
+    when the independent cell FFTs are issued; every published value is still
+    rounded by the same cell contract.  Cells are independent except for the
+    reported ``flux_db``, which uses the previous cell's already-rounded
+    ``rms_db`` and is therefore applied after the batch reductions.
+    """
+    count = len(starts)
+    seg_l = np.zeros((count, nfft), dtype=np.float64)
+    seg_r = np.zeros((count, nfft), dtype=np.float64)
+    for index, start in enumerate(starts):
+        take = min(nfft, len(left) - int(start))
+        seg_l[index, :take] = left[int(start):int(start) + take]
+        seg_r[index, :take] = right[int(start):int(start) + take]
+    channels = np.stack((seg_l, seg_r), axis=2)
+    window = _hann_window(nfft)
+    spectra = np.fft.rfft(channels * window[None, :, None], axis=1)
+    spec = np.mean(np.abs(spectra) ** 2, axis=2)
+    spec *= 2.0 / (np.sum(window ** 2) * nfft)
+    freqs = np.fft.rfftfreq(nfft, 1.0 / fs)
+
+    power = spec @ M.T
+    bands = [[round(float(10 * np.log10(value + 1e-20)), 1) for value in row]
+             for row in power]
+
+    rms = np.asarray([float(np.sqrt(np.mean(channels[index] ** 2)))
+                      for index in range(count)], dtype=np.float64)
+    rms_db_raw = 20 * np.log10(rms + 1e-12)
+    rms_db_rounded = [round(float(value), 1) for value in rms_db_raw]
+    peak = np.max(np.abs(channels), axis=(1, 2))
+    crest_db = 20 * np.log10((peak + 1e-12) / (rms + 1e-12))
+    zcr = np.mean(np.abs(np.diff(np.sign(channels), axis=1)) > 0, axis=(1, 2))
+    env = np.sqrt(np.mean(channels ** 2, axis=2))
+
+    psum = spec.sum(axis=1) + 1e-20
+    centroid = (spec @ freqs) / psum
+    delta = freqs[None, :] - centroid[:, None]
+    spread = np.sqrt((delta * delta * spec).sum(axis=1) / psum)
+    flatness = (np.exp(np.mean(np.log(spec + 1e-20), axis=1)) /
+                (np.mean(spec, axis=1) + 1e-20))
+    cumulative = np.cumsum(spec, axis=1)
+    rolloff_index = np.argmax(
+        cumulative >= (0.85 * cumulative[:, -1])[:, None], axis=1)
+    rolloff = freqs[rolloff_index]
+    low_mask = (freqs >= 20) & (freqs < 200)
+    mid_mask = (freqs >= 200) & (freqs < 2000)
+    high_mask = (freqs >= 2000) & (freqs < 16000)
+    low_db = [round(float(10 * np.log10(float(value) + 1e-20)), 1)
+              for value in spec[:, low_mask].sum(axis=1)]
+    mid_db = [round(float(10 * np.log10(float(value) + 1e-20)), 1)
+              for value in spec[:, mid_mask].sum(axis=1)]
+    high_db = [round(float(10 * np.log10(float(value) + 1e-20)), 1)
+               for value in spec[:, high_mask].sum(axis=1)]
+    erb_values = spec @ erb_matrix.T
+    erb = [[round(float(10 * np.log10(float(value) + 1e-20)), 1)
+            if present else -200.0
+            for value, present in zip(row, erb_present)]
+           for row in erb_values]
+
+    active_len = min(2048, nfft)
+    if nfft > active_len:
+        magnitudes = np.abs(channels)
+        prefix = np.concatenate(
+            (np.zeros((count, 1, 2), dtype=np.float64),
+             np.cumsum(magnitudes, axis=1, dtype=np.float64)), axis=1)
+        window_sums = (prefix[:, active_len:, :] - prefix[:, :-active_len, :])
+        active_start = np.argmax(window_sums, axis=1)
+        active = np.empty((count, 2, active_len), dtype=np.float64)
+        for index in range(count):
+            for channel_index in range(2):
+                begin = int(active_start[index, channel_index])
+                active[index, channel_index] = channels[
+                    index, begin:begin + active_len, channel_index]
+    else:
+        active = np.transpose(channels, (0, 2, 1))
+    centered = active - active.mean(axis=2, keepdims=True)
+    active_peak = np.max(np.abs(centered), axis=2)
+    pitch_n = 1 << int(np.ceil(np.log2(2 * active_len)))
+    pitch_spec = np.fft.rfft(centered, n=pitch_n, axis=2)
+    autocorr = np.fft.irfft(
+        pitch_spec * np.conj(pitch_spec), n=pitch_n, axis=2)[:, :, :active_len]
+    ac_zero = autocorr[:, :, 0]
+    valid_pitch = (active_peak >= 1e-6) & (ac_zero > 0)
+    normalized = np.zeros_like(autocorr)
+    np.divide(autocorr, ac_zero[:, :, None], out=normalized,
+              where=(ac_zero[:, :, None] != 0))
+    lo = max(1, int(fs / 1200))
+    hi = min(active_len - 2, int(fs / 40))
+    if hi > lo:
+        lag = lo + np.argmax(normalized[:, :, lo:hi], axis=2)
+        row_index = np.arange(count)[:, None]
+        channel_index = np.arange(2)[None, :]
+        r_value = normalized[row_index, channel_index, lag]
+        lag_float = lag.astype(np.float64)
+        for index in range(count):
+            for channel_index in range(2):
+                if not valid_pitch[index, channel_index]:
+                    continue
+                current = int(lag[index, channel_index])
+                if 0 < current < active_len - 1:
+                    a = normalized[index, channel_index, current - 1]
+                    b = normalized[index, channel_index, current]
+                    c = normalized[index, channel_index, current + 1]
+                    denom = a - 2 * b + c
+                    if abs(denom) > 1e-12:
+                        lag_float[index, channel_index] = (
+                            current + 0.5 * (a - c) / denom)
+        f0 = np.where(valid_pitch, fs / lag_float, 0.0)
+        hnr = np.where(
+            valid_pitch,
+            10 * np.log10(np.maximum(r_value, 1e-6) /
+                          np.maximum(1 - r_value, 1e-6)),
+            0.0)
+    else:
+        f0 = np.zeros((count, 2), dtype=np.float64)
+        hnr = np.zeros((count, 2), dtype=np.float64)
+    hnr = np.clip(hnr, -20.0, 40.0)
+    f0 = np.where(hnr[:, 1] > hnr[:, 0], f0[:, 1], f0[:, 0])
+    hnr = np.where(hnr[:, 1] > hnr[:, 0], hnr[:, 1], hnr[:, 0])
+    for index in range(count):
+        if hnr[index] < 0.0 or f0[index] <= 0:
+            alternative = _f0_hps(spec[index], freqs)
+            if alternative > 0:
+                f0[index] = alternative
+
+    chroma = [_chroma(freqs, spec[index]) for index in range(count)]
+    harmonics = []
+    inharmonicity = []
+    for index in range(count):
+        levels, inharm = _harmonics(spec[index], freqs, f0[index])
+        harmonics.append(levels)
+        inharmonicity.append(inharm)
+    formants = [_peaks(spec[index], freqs) if rms_db_raw[index] > -55 else []
+                for index in range(count)]
+
+    quarter_n = nfft // 4
+    quarter_window = _hann_window(quarter_n)
+    quarter_freqs = np.fft.rfftfreq(quarter_n, 1.0 / fs)
+    parts = channels.reshape(count, 4, quarter_n, 2)
+    quarter_spec = np.fft.rfft(
+        parts * quarter_window[None, None, :, None], axis=2)
+    quarter_power = np.mean(np.abs(quarter_spec) ** 2, axis=3)
+    edges = ((20, 200), (200, 2000), (2000, 16000))
+    decay_bands: list[list[float]] = [[] for _ in range(count)]
+    coherence: list[list[float]] = [[] for _ in range(count)]
+    quarter_times = np.arange(4) * (quarter_n / fs)
+    for edge_low, edge_high in edges:
+        mask = ((quarter_freqs >= edge_low) &
+                (quarter_freqs < edge_high))
+        edge_energy = quarter_power[:, :, mask].sum(axis=2) + 1e-20
+        left_spec = quarter_spec[:, :, mask, 0]
+        right_spec = quarter_spec[:, :, mask, 1]
+        cross = (left_spec * np.conj(right_spec)).sum(axis=(1, 2))
+        left_energy = (np.abs(left_spec) ** 2).sum(axis=(1, 2))
+        right_energy = (np.abs(right_spec) ** 2).sum(axis=(1, 2))
+        db = 10 * np.log10(edge_energy)
+        t_mean = float(quarter_times.mean())
+        v_mean = db.mean(axis=1, keepdims=True)
+        denom = float(np.sum((quarter_times - t_mean) ** 2))
+        slope = ((quarter_times - t_mean) *
+                 (db - v_mean)).sum(axis=1) / denom if denom > 0 else np.zeros(count)
+        coh_denom = left_energy * right_energy
+        coh = np.zeros(count, dtype=np.float64)
+        np.divide(np.abs(cross) ** 2, coh_denom, out=coh,
+                  where=coh_denom > 0)
+        for index in range(count):
+            decay_bands[index].append(round(float(slope[index]), 0))
+            coherence[index].append(round(float(coh[index]), 3))
+
+    left_centered = seg_l - seg_l.mean(axis=1, keepdims=True)
+    right_centered = seg_r - seg_r.mean(axis=1, keepdims=True)
+    corr_denom = (np.linalg.norm(left_centered, axis=1) *
+                  np.linalg.norm(right_centered, axis=1) + 1e-12)
+    corr = (left_centered * right_centered).sum(axis=1) / corr_denom
+    side = (seg_l - seg_r) / 2.0
+    width = np.sqrt(np.mean(side ** 2, axis=1)) / (rms + 1e-12)
+    left_rms = np.sqrt(np.mean(seg_l ** 2, axis=1))
+    right_rms = np.sqrt(np.mean(seg_r ** 2, axis=1))
+    pan = (right_rms - left_rms) / (right_rms + left_rms + 1e-12)
+
+    attack = []
+    decay = []
+    for index in range(count):
+        energy = env[index]
+        if energy.size and energy.max() > 1e-6:
+            ipk = int(np.argmax(energy))
+            threshold10, threshold90 = 0.1 * energy[ipk], 0.9 * energy[ipk]
+            index10 = int(np.argmax(energy >= threshold10))
+            index90 = int(np.argmax(energy >= threshold90))
+            attack_s = round(float(max(0, index90 - index10)) / fs, 4)
+            tail = (float(np.sqrt(np.mean(energy[ipk:] ** 2)))
+                    if ipk < energy.size else 0.0)
+            decay_db = round(float(20 * np.log10(
+                (peak[index] + 1e-12) / (tail + 1e-12))), 1)
+        else:
+            attack_s, decay_db = 0.0, 0.0
+        attack.append(attack_s)
+        decay.append(decay_db)
+
+    kernel = np.ones(max(3, int(0.003 * fs))) / max(3, int(0.003 * fs))
+    hits = []
+    for index in range(count):
+        hit_count = 0
+        energy = env[index]
+        if energy.size > 128 and energy.max() > 1e-5:
+            smoothed = np.convolve(energy, kernel, mode="same")
+            threshold = 0.5 * smoothed.max()
+            indexes = _hit_peaks(smoothed, threshold)
+            merged = []
+            for value in indexes:
+                if not merged or value - merged[-1] > 0.008 * fs:
+                    merged.append(value)
+            if len(merged) >= 3:
+                gaps = np.diff(merged)
+                if gaps.mean() > 0 and gaps.std() / gaps.mean() < 0.5:
+                    rate = fs / gaps.mean()
+                    if 6 <= rate <= 40:
+                        hit_count = len(merged)
+        hits.append(hit_count)
+
+    flux = [0.0] * count
+    previous = prev_rms_db
+    for index in range(count):
+        if previous is not None:
+            flux[index] = round(float(rms_db_raw[index] - previous), 1)
+        previous = rms_db_rounded[index]
+
+    wall = []
+    flatness_rounded = [round(float(value), 4) for value in flatness]
+    for index in range(count):
+        total = (10 ** (low_db[index] / 10.0) +
+                 10 ** (mid_db[index] / 10.0) +
+                 10 ** (high_db[index] / 10.0))
+        if total <= 0:
+            wall.append(0.0)
+            continue
+        share = 10 ** (mid_db[index] / 10.0) / total
+        rough = min(1.0, flatness_rounded[index] * 3)
+        wall.append(round(float(min(1.0, 0.6 * share + 0.4 * rough)), 3))
+
+    cells = []
+    for index in range(count):
+        cell = {
+            "rms_db": rms_db_rounded[index],
+            "peak": round(float(peak[index]), 4),
+            "crest_db": round(float(crest_db[index]), 1),
+            "attack_s": attack[index],
+            "decay_db": decay[index],
+            "flux_db": flux[index],
+            "zcr": round(float(zcr[index]), 3),
+            "bands": bands[index],
+            "centroid_hz": round(float(centroid[index]), 1),
+            "spread_hz": round(float(spread[index]), 1),
+            "flatness": flatness_rounded[index],
+            "rolloff_hz": round(float(rolloff[index]), 1),
+            "f0_hz": round(float(f0[index]), 1),
+            "note": (PITCH_NAMES[int(np.argmax(chroma[index]))]
+                     if f0[index] > 0 else ""),
+            "hnr_db": round(float(hnr[index]), 1),
+            "chroma": chroma[index],
+            "harm": harmonics[index],
+            "inharm": inharmonicity[index],
+            "formants": formants[index],
+            "decay_bands": decay_bands[index],
+            "coherence": coherence[index],
+            "corr": round(float(corr[index]), 3),
+            "width": round(float(width[index]), 3),
+            "pan": round(float(pan[index]), 3),
+            "low_db": low_db[index],
+            "mid_db": mid_db[index],
+            "high_db": high_db[index],
+            "hits": hits[index],
+        }
+        cell["erb"] = erb[index]
+        cell["wall"] = wall[index]
+        cells.append(cell)
+    return cells, (rms_db_rounded[-1] if count else prev_rms_db)
 
 
 def technique(stereo: np.ndarray, fs: int = 44100, cell_s: float = 0.1) -> dict:
@@ -509,20 +814,29 @@ def analyze(stereo: np.ndarray, fs: int = 44100, hop_s: float = 0.1,
     erb_matrix, erb_present = _erb_matrix(nfft, fs)
 
     cells = []
-    times = []
+    starts = list(range(0, max(0, len(left) - hop // 2), hop))
     prev = None
-    for start in range(0, max(0, len(left) - hop // 2), hop):
-        cell = analyze_cell(left[start:start + nfft], right[start:start + nfft], fs,
-                            prev_rms_db=prev, M=M, nfft=nfft,
-                            erb_matrix=erb_matrix, erb_present=erb_present)
+    if nfft % 4 == 0 and nfft >= 256:
+        batch_size = _cell_batch_size(nfft)
+        for offset in range(0, len(starts), batch_size):
+            chunk, prev = _analyze_cells_batch(
+                left, right, starts[offset:offset + batch_size], fs, prev,
+                M, nfft, erb_matrix, erb_present)
+            cells.extend(chunk)
+    else:
+        for start in starts:
+            cell = analyze_cell(left[start:start + nfft], right[start:start + nfft],
+                                fs, prev_rms_db=prev, M=M, nfft=nfft,
+                                erb_matrix=erb_matrix, erb_present=erb_present)
+            prev = cell["rms_db"]
+            cells.append(cell)
+    times = [round(start / fs, 3) for start in starts]
+    for cell in cells:
         if not has_stereo:
             cell["coherence"] = None
             cell["corr"] = None
             cell["width"] = None
             cell["pan"] = None
-        prev = cell["rms_db"]
-        cells.append(cell)
-        times.append(round(start / fs, 3))
 
     # производные по ленте: темп онсетов и «тремоло»
     flux = np.array([c["flux_db"] for c in cells])

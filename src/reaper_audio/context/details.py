@@ -564,7 +564,8 @@ def _resolve_envelope(record: Any, entry: Mapping[str, Any], request: Mapping[st
 
 
 def _resolve_series(record: Any, entry: Mapping[str, Any], request: Mapping[str, Any],
-                    start: float | None, end: float | None) -> dict[str, Any]:
+                    start: float | None, end: float | None,
+                    max_points: int | None = MAX_DETAIL_POINTS) -> dict[str, Any]:
     source_guid = str(entry.get("owner_id") or "").split(":", 1)[-1]
     report = _analysis_of(record, source_guid)
     if report is None:
@@ -608,10 +609,10 @@ def _resolve_series(record: Any, entry: Mapping[str, Any], request: Mapping[str,
                 details={"ref": name, "expected": available[name].get("content_sha256"),
                          "actual": actual})
         total_points += len(selected_times)
-        if total_points > MAX_DETAIL_POINTS:
+        if max_points is not None and total_points > max_points:
             raise ValidationError(
                 "detail request exceeds the point budget; pass resolution_s or a narrower interval",
-                details={"limit": MAX_DETAIL_POINTS, "requested_series": names,
+                details={"limit": max_points, "requested_series": names,
                          "next_action": "retry with resolution_s or a smaller [start_s,end_s)"})
         item: dict[str, Any] = {
             "name": name, "units": meta.get("units"),
@@ -701,7 +702,8 @@ def _match_entry(entries: Sequence[Mapping[str, Any]], kind: str,
 
 
 def resolve_details(record: Any, document: Mapping[str, Any],
-                    requests: Sequence[Any], *, max_bytes: int = DEFAULT_DETAIL_BYTES) -> dict[str, Any]:
+                    requests: Sequence[Any], *, max_bytes: int | None = DEFAULT_DETAIL_BYTES,
+                    max_points: int | None = MAX_DETAIL_POINTS) -> dict[str, Any]:
     """Return exact stored rows for a batch of typed detail requests.
 
     Every request is checked against the panorama's detail manifest and the
@@ -735,7 +737,8 @@ def resolve_details(record: Any, document: Mapping[str, Any],
                                              request["start_s"], request["end_s"]))
         else:
             results.append(_resolve_series(record, entry, request,
-                                           request["start_s"], request["end_s"]))
+                                           request["start_s"], request["end_s"],
+                                           max_points=max_points))
     payload = {
         "schema_version": DETAILS_SCHEMA,
         "status": "detail",
@@ -755,7 +758,7 @@ def resolve_details(record: Any, document: Mapping[str, Any],
         },
     }
     encoded = canonical(payload)
-    if len(encoded) > max_bytes:
+    if max_bytes is not None and len(encoded) > max_bytes:
         return {
             "schema_version": DETAILS_SCHEMA,
             "status": "detail_too_large",

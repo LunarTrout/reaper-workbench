@@ -19,6 +19,7 @@ from reaper_audio.context.full_capture import CaptureArchive
 from reaper_audio.context.lifecycle import (
     VIEW_PAGE_MAX_BYTES,
     PanoramaLifecycle,
+    _merge_view_pages,
     _pack_view_sections,
 )
 from reaper_audio.context.panorama import _hash, build_panorama
@@ -223,14 +224,20 @@ def test_receipt_gate_refuses_before_ack_and_opens_after(tmp_path: Path) -> None
     assert checked["fact_root"] == ack["fact_root"]
 
 
-def test_unsplittable_section_fails_loudly() -> None:
-    view = {"schema_version": "x", "huge": "te" * 20_000}
-    with pytest.raises(ValidationError) as excinfo:
-        _pack_view_sections(view, payload_budget=6_000, max_page_bytes=6_000)
-    details = excinfo.value.details
-    assert details["section"] == "huge"
-    assert details["section_bytes"] > 4_000
-    assert details["page_max_bytes"] == 6_000
+def test_oversized_scalar_is_fragmented_losslessly() -> None:
+    view = {"schema_version": "x", "huge": "тест" * 20_000}
+    packed = _pack_view_sections(view, payload_budget=6_000, max_page_bytes=6_000)
+    assert len(packed) > 1
+    pages = [{"payload": dict(page)} for page in packed]
+    assert max(len(__import__("json").dumps(page, indent=2,
+                                            ensure_ascii=False).encode("utf-8"))
+               for page in pages) <= 6_000
+    merged = dict(_merge_view_pages(pages))
+    assert merged == view
+    assert merged["huge"] == view["huge"]
+    for page in pages:
+        for key, value in dict(page).get("__parts__", {}).items():
+            assert value["mode"] == "fragment"
 
 
 def test_oversized_columnar_section_splits_on_rows(tmp_path: Path) -> None:

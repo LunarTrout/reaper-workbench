@@ -5,6 +5,26 @@ from __future__ import annotations
 import numpy as np
 
 
+def _quantile_linear(values: np.ndarray, quantiles: list[float]) -> np.ndarray:
+    """NumPy's default linear quantile without sorting the whole array.
+
+    ``np.quantile`` sorts ``values`` for every call.  A local tempo window calls
+    it thousands of times on the same interval vector, so ``np.partition`` can
+    replace the full sort with the order statistics the linear interpolation
+    needs.  The arithmetic is the same; the result is float64-equivalent, not
+    claimed bit-identical for extreme magnitudes and quantiles.
+    """
+    if values.size == 0:
+        return np.asarray([], dtype=np.float64)
+    positions = np.asarray(quantiles, dtype=np.float64) * (values.size - 1)
+    lower = np.floor(positions).astype(np.int64)
+    upper = np.ceil(positions).astype(np.int64)
+    partitioned = np.partition(values, np.unique(np.concatenate((lower, upper))))
+    lo = partitioned[lower]
+    hi = partitioned[upper]
+    return lo + (positions - lower) * (hi - lo)
+
+
 def estimate_tempo_curve(
     onset_times_s: list[float] | np.ndarray,
     cell_times_s: list[float] | np.ndarray,
@@ -63,7 +83,7 @@ def estimate_tempo_curve(
                            "reason": "insufficient event intervals"})
             continue
 
-        anchors = np.quantile(intervals, [0.25, 0.5, 0.75])
+        anchors = _quantile_linear(intervals, [0.25, 0.5, 0.75])
         periods = sorted({float(anchor * factor)
                           for anchor in anchors for factor in candidate_factors
                           if min_period <= anchor * factor <= max_period})

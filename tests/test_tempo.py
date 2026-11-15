@@ -4,7 +4,62 @@ import numpy as np
 
 from reaper_audio.analysis.metrics import measure_audio
 from reaper_audio.models import AudioBuffer
-from reaper_audio.analysis.tempo import estimate_tempo_curve
+from reaper_audio.analysis.tempo import _quantile_linear, estimate_tempo_curve
+
+
+def _assert_quantile_parity(values: np.ndarray, quantiles: list[float]) -> None:
+    actual = _quantile_linear(values, quantiles)
+    expected = np.quantile(values, quantiles)
+    # Float64 equivalence, not a bit-identical claim: the partition path does
+    # the same linear interpolation but may round a different number of times.
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_partition_quantiles_match_numpy_for_odd_and_even_lengths() -> None:
+    rng = np.random.default_rng(41)
+    for size in list(range(1, 20)) + [32, 33, 64, 127, 128, 255, 1024]:
+        values = rng.normal(0.0, 1.0, size)
+        _assert_quantile_parity(values, [0.0, 0.25, 0.5, 0.75, 1.0])
+        _assert_quantile_parity(values, [0.1, 0.9])
+
+
+def test_partition_quantiles_match_numpy_for_sorted_and_duplicate_values() -> None:
+    rng = np.random.default_rng(43)
+    for values in (
+        np.sort(rng.normal(0.0, 1.0, 257)),
+        np.asarray([-3.5, -3.5, 0.0, 0.0, 0.0, 2.25, 9.0]),
+        np.full(17, 0.25),
+        np.asarray([1e-6, 2e-6, 0.5, 1.0, 2.0]),
+    ):
+        _assert_quantile_parity(values, [0.0, 0.25, 0.5, 0.75, 1.0])
+
+
+def test_partition_quantiles_handle_extreme_quantiles_and_endpoints() -> None:
+    rng = np.random.default_rng(47)
+    values = rng.uniform(0.001, 2.0, 129)
+    actual = _quantile_linear(values, [0.0, 1e-12, 0.5, 1.0 - 1e-12, 1.0])
+    expected = np.quantile(values, [0.0, 1e-12, 0.5, 1.0 - 1e-12, 1.0])
+    assert actual[0] == expected[0] == values.min()
+    assert actual[-1] == expected[-1] == values.max()
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-15)
+
+
+def test_partition_quantiles_stay_within_float64_tolerance() -> None:
+    rng = np.random.default_rng(53)
+    values = rng.normal(0.0, 1e9, 128)
+    quantiles = [1e-12, 0.25, 0.5, 0.75, 1.0 - 1e-12]
+    actual = _quantile_linear(values, quantiles)
+    expected = np.quantile(values, quantiles)
+    residue = float(np.max(np.abs(actual - expected)))
+    # The residue may be exactly zero for a given draw; the contract is the
+    # tolerance, not a claim that every draw is bit-identical.
+    assert residue <= 1e-6  # relative ~1e-15 at this magnitude
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-6)
+
+
+def test_partition_quantiles_of_an_empty_array_are_empty() -> None:
+    result = _quantile_linear(np.asarray([], dtype=np.float64), [0.25, 0.5])
+    assert result.size == 0
 
 
 def test_local_tempo_curve_reports_bpm_and_metrical_alternatives_per_cell() -> None:

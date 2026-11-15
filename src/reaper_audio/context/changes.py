@@ -29,7 +29,6 @@ from .render_dependencies import (build_render_manifest, compare_render_manifest
 __all__ = [
     "DELTA_SCHEMA",
     "FACTS_SCHEMA",
-    "MAX_DELTA_OBJECTS",
     "build_structural_delta",
     "delta_hash",
     "digest_facts",
@@ -38,9 +37,6 @@ __all__ = [
 
 DELTA_SCHEMA = "reaper-workbench.structural-delta/1"
 FACTS_SCHEMA = "reaper-workbench.digest-facts/1"
-MAX_DELTA_OBJECTS = 2_000
-MAX_EVIDENCE_IDS = 2_000
-MAX_OPERATION_FACTS = 256
 
 _TRACK_FIELDS = (
     "volume", "pan", "mute", "solo", "channel_count", "pan_mode", "pan_law",
@@ -95,17 +91,15 @@ def next_view_root(previous_view_root: str, payload_hash: str) -> str:
 
 
 def _value(value: Any) -> Any:
-    """Bound one reported value so a plugin blob cannot dominate a delta."""
-    if isinstance(value, str):
-        return value if len(value) <= 512 else value[:512] + "…"
-    if isinstance(value, (list, tuple)):
-        if len(value) > 64:
-            return {"truncated": True, "count": len(value)}
-        return [_value(item) for item in value]
+    """Return an exact JSON-normalised copy; never truncate a reported fact.
+
+    A delta may be large (a plugin state chunk, thousands of relation rows).  It
+    is delivered whole or as verified pages; it is never shortened here.
+    """
     if isinstance(value, Mapping):
-        if len(value) > 64:
-            return {"truncated": True, "keys": len(value)}
         return {str(key): _value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_value(item) for item in value]
     return value
 
 
@@ -414,8 +408,6 @@ def _object_delta(before: Mapping[str, Any],
                 "automation_item_counts": [left.get("automation_item_count"),
                                            right.get("automation_item_count")],
             })
-        if len(envelope_changes) >= MAX_DELTA_OBJECTS:
-            break
     changed.extend(envelope_changes)
 
     domains: list[dict[str, Any]] = []
@@ -432,7 +424,7 @@ def _object_delta(before: Mapping[str, Any],
                         "before": before_settings.get(key),
                         "after": after_settings.get(key)}
                        for key in sorted(set(before_settings) | set(after_settings))
-                       if before_settings.get(key) != after_settings.get(key)][:128],
+                       if before_settings.get(key) != after_settings.get(key)],
         })
     before_state = _mapping(before.get("fx_state"))
     after_state = _mapping(after.get("fx_state"))
@@ -450,17 +442,16 @@ def _object_delta(before: Mapping[str, Any],
             })
     if chunk_changes:
         domains.append({"domain": "fx_state", "change": "modified",
-                        "tracks": chunk_changes[:MAX_DELTA_OBJECTS]})
+                        "tracks": chunk_changes})
     return {
         "added": added,
-        "changed": changed[:MAX_DELTA_OBJECTS],
+        "changed": changed,
         "deleted": deleted,
         "domains": domains,
         "counts": {"added": len(added), "changed": len(changed),
                    "deleted": len(deleted), "domains": len(domains),
                    "envelopes": len(envelope_changes)},
-        "truncated": (len(changed) > MAX_DELTA_OBJECTS or
-                      len(envelope_changes) >= MAX_DELTA_OBJECTS),
+        "truncated": False,
     }
 
 
@@ -502,13 +493,12 @@ def _evidence_ids(document: Mapping[str, Any],
         endpoints = {str(row.get("from_id") or ""), str(row.get("to_id") or "")}
         if endpoints & invalid and row.get("relation_id"):
             relation_ids.append(str(row["relation_id"]))
-    capped = len(relation_ids) > MAX_EVIDENCE_IDS
     return {
         "audio_ids": sorted(set(audio_ids)),
         "analysis_ids": sorted(set(analysis_ids)),
-        "relation_ids": sorted(set(relation_ids))[:MAX_EVIDENCE_IDS],
+        "relation_ids": sorted(set(relation_ids)),
         "relation_count": len(set(relation_ids)),
-        "relation_ids_complete": not capped,
+        "relation_ids_complete": True,
     }
 
 
@@ -565,7 +555,7 @@ def build_structural_delta(*, kind: str, project_id: str, base: Mapping[str, Any
     if scope not in {"known", "unknown"}:
         raise ValueError("scope must be known or unknown")
     facts = []
-    for fact in list(operation_facts or [])[:MAX_OPERATION_FACTS]:
+    for fact in list(operation_facts or []):
         if isinstance(fact, Mapping):
             facts.append({
                 "operation_index": fact.get("operation_index"),
@@ -662,6 +652,25 @@ def build_structural_delta(*, kind: str, project_id: str, base: Mapping[str, Any
                  "describes this revision. Capture again before interpreting project audio."),
     }]
     identity = _mapping(base.get("revision"))
+    before_digest = _mapping(_mapping(before_facts).get("digest"))
+    after_digest_facts = _mapping(_mapping(after_facts).get("digest"))
+    structural_identity_match = all(
+        str(_mapping(base.get("revision")).get(field) or "") ==
+        str(_mapping(target.get("revision")).get(field) or "")
+        for field in ("project_id", "path", "instance_id", "epoch"))
+    before_digest_version = before_digest.get("version")
+    after_digest_version = after_digest_facts.get("version")
+    digest_evidence = (before_digest_version is not None and
+                       after_digest_version is not None)
+    digest_match = (digest_evidence and before_digest_version == after_digest_version)
+    if not structural_identity_match:
+        structural_state = "unknown"
+    elif not digest_evidence:
+        structural_state = "unknown"
+    elif not digest_match:
+        structural_state = "incomparable"
+    else:
+        structural_state = "comparable"
     payload: dict[str, Any] = {
         "schema_version": DELTA_SCHEMA,
         "kind": kind,
@@ -681,6 +690,75 @@ def build_structural_delta(*, kind: str, project_id: str, base: Mapping[str, Any
             "missing": sorted({str(item) for item in readback_missing}),
             "digest_evidence": dict(target_digest_evidence or {}),
             "manifest_error": manifest_error,
+        },
+        "comparability": {
+            "structural": {
+                "state": structural_state,
+                "criteria": {
+                    "identity": ("match" if structural_identity_match else "mismatch"),
+                    "digest_version": {
+                        "base": before_digest_version,
+                        "target": after_digest_version,
+                        "state": ("match" if digest_match else
+                                  "mismatch" if digest_evidence else "unknown"),
+                    },
+                },
+                "note": ("structural before/after facts are exact; they are not "
+                         "quality judgments"),
+            },
+            "captured_audio": {
+                "state": audio_evidence["state"],
+                "note": ("captured-audio freshness is reported separately from the "
+                         "current project structure; a stale capture never rewrites "
+                         "the structural delta"),
+            },
+        },
+        "journal": {
+            "schema_version": "reaper-workbench.structural-mutation-journal/1",
+            "kind": "structural_mutation",
+            "operation": kind,
+            "project_id": project_id,
+            "base": {
+                "context_token": base.get("context_token"),
+                "capture_id": base.get("capture_id"),
+                "revision": dict(_mapping(base.get("revision"))),
+                "fact_root": base.get("fact_root"),
+                "view_root": base.get("view_root"),
+                "document_hash": base.get("document_hash"),
+            },
+            "target": {
+                "revision": dict(_mapping(target.get("revision"))),
+                "digest_version": after_digest_facts.get("version"),
+            },
+            "structural": {
+                "state": structural_state,
+                "objects": objects,
+            },
+            "captured_audio": {
+                "state": audio_evidence["state"],
+                "invalidated_sources": list(audio_evidence["invalidated_sources"]),
+                "fresh_sources": list(audio_evidence["fresh_sources"]),
+                "invalidated_audio_ids": list(audio_evidence["invalidated_audio_ids"]),
+                "invalidated_analysis_ids": list(audio_evidence["invalidated_analysis_ids"]),
+                "invalidated_relation_ids": list(audio_evidence["invalidated_relation_ids"]),
+            },
+            "entries": [
+                {
+                    "operation_index": index,
+                    "source": "structural_mutation",
+                    "kind": fact.get("kind"),
+                    "target_guid": fact.get("target_guid"),
+                    "before_ref": f"operation_facts[{index}].before",
+                    "after_ref": f"operation_facts[{index}].after",
+                    "changes_state": fact.get("changes_state"),
+                }
+                for index, fact in enumerate(facts)
+            ],
+            "invalidations_ref": "invalidations",
+            "note": ("one journal contract: project/revision/capture/fact-root/source/"
+                     "object refs bind every operation, its measured consequence and its "
+                     "invalidation; structural state and captured-audio freshness are "
+                     "distinct and no quality verdict is produced"),
         },
         "acknowledgeable": (bool(readback_complete) and not objects["truncated"] and
                             bool(audio_evidence["relation_ids_complete"])),
