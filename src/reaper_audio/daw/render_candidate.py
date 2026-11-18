@@ -31,8 +31,7 @@ import soundfile as sf
 
 from ..analysis.artifacts import AudioArtifactWorkspace
 from ..context.revision import digest_evidence
-from ..errors import (ArtifactCleanupError, BridgeUnavailable,
-                      RenderBudgetExceeded, RenderCandidateMismatch,
+from ..errors import (ArtifactCleanupError, RenderBudgetExceeded, RenderCandidateMismatch,
                       RenderProvenanceIncomplete, RenderUnsupported,
                       StaleContext, ValidationError)
 from ..models import Section

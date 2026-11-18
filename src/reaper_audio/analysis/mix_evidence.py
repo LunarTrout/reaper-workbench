@@ -7,7 +7,7 @@ a plugin or a parameter value.
 """
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Mapping
 
 
 def _value(source: Mapping, name: str) -> float | None:

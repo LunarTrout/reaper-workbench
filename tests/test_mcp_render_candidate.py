@@ -130,7 +130,7 @@ def test_render_candidate_tool_schema_is_transport_visible() -> None:
     assert properties["tail_ms"]["default"] == 0
     assert properties["channels"]["default"] == "stereo"
     # 29 project tools plus the lifecycle call and the checkpoint save.
-    assert len(tools) == 31
+    assert len(tools) == 36
     assert {"reaper_bridge_reload"} <= {tool.name for tool in tools}
 
 

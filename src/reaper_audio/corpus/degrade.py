@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
-from scipy.signal import butter, sosfilt, sosfiltfilt
+from scipy.signal import butter, sosfiltfilt
 
 
 def _as_stereo(x: np.ndarray) -> np.ndarray:

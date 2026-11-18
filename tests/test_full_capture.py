@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+
+def _coarse_digest(fields=None):
+    """A schema-valid coarse digest: the payload is empty but the envelope is
+    complete, which is what the render-dependency code validates."""
+    from reaper_audio.context.revision import DIGEST_REQUIRED_FIELDS, DIGEST_VERSION
+    return {"digest_version": DIGEST_VERSION, "change_count": 0,
+            "coverage": {name: False for name in DIGEST_REQUIRED_FIELDS},
+            "missing": sorted(DIGEST_REQUIRED_FIELDS),
+            "fields": dict(fields or {})}
+
 import hashlib
 import json
 from pathlib import Path
@@ -45,7 +55,7 @@ def _record(tmp_path: Path, capture_id: str = "cap_test") -> tuple[FullCaptureRe
         "selection": {"track_guids": [], "time_start_s": 0, "time_end_s": 0},
         "transport": {"play_state": 0, "cursor_s": 0, "play_position_s": 0},
         "coverage": {name: True for name in REQUIRED_MAP_KEYS - {"coverage"}},
-        "digest": {"coverage": dict(coverage), "fields": {}},
+        "digest": _coarse_digest(),
     }
     audio = []
     files = {}

@@ -42,7 +42,6 @@ def discover(root: str | Path) -> dict[str, list[Path]]:
 
 
 def _read(path: Path) -> tuple[np.ndarray, int]:
-    info = sf.info(str(path))
     x, sr = sf.read(str(path), dtype="float64", always_2d=True)
     return x, int(sr)
 

@@ -200,8 +200,7 @@ def _flatten(value: Any) -> list[float]:
 
 def _series_delta(before_report: Mapping[str, Any], after_report: Mapping[str, Any],
                   name: str, *, interval: Mapping[str, Any] | None,
-                  window: Mapping[str, Any] | None,
-                  max_cells: int | None = None) -> dict[str, Any]:
+                  window: Mapping[str, Any] | None) -> dict[str, Any]:
     before_times, before_values, unit = _series_payload(before_report, name)
     after_times, after_values, after_unit = _series_payload(after_report, name)
     if unit != after_unit:
@@ -408,8 +407,7 @@ def build_audio_delta(base: Mapping[str, Any], target: Mapping[str, Any], *,
         for name in names:
             try:
                 row = _series_delta(base_sources[guid], target_sources[guid], name,
-                                    interval=interval, window=base_window,
-                                    max_cells=max_changed_cells)
+                                    interval=interval, window=base_window)
             except ValidationError as exc:
                 row = {"series": name, "status": "unavailable",
                        "reason": getattr(exc, "message", str(exc))}

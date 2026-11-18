@@ -6,7 +6,6 @@ instrument or prescribe an editing or mixing action.
 from __future__ import annotations
 
 import numpy as np
-from scipy.signal import resample_poly
 
 from .transients import detect_transients
 
@@ -900,11 +899,9 @@ def picture(tp: dict, band_rows: int = 14, width: int = 100) -> str:
 
     step = max(1, nb // band_rows)
     lines = []
-    step_s = max(1, int(round(times[-1] / max(1, n - 1)))) if n > 1 else 1
     header = "".join(str(int(t)) if abs(t - round(t)) < 0.051 else " " for t in times)
     lines.append("время,с  " + header)
     for r in range(0, nb, step):
-        grp = bands
         label = "%5.0fГц" % tp["fc"][r]
         row = "".join(
             _shade(max(bands[i][j] for j in range(r, min(r + step, nb)))) for i in range(n)

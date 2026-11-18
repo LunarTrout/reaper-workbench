@@ -164,10 +164,12 @@ def _tracks() -> list[dict[str, Any]]:
 
 
 def _digest(tracks: list[dict[str, Any]]) -> dict[str, Any]:
+    from reaper_audio.context.revision import DIGEST_REQUIRED_FIELDS, DIGEST_VERSION
     return {
-        "coverage": {name: True for name in (
-            "tracks", "items", "automation", "fx_state", "sends",
-            "project_settings", "tempo", "markers")},
+        "digest_version": DIGEST_VERSION,
+        "change_count": 1,
+        "missing": [],
+        "coverage": {name: True for name in DIGEST_REQUIRED_FIELDS},
         "fields": {"tracks": [
             {"guid": track["guid"], "folder_depth": track["folder_depth"],
              "sends": [], "hardware_outputs": []}

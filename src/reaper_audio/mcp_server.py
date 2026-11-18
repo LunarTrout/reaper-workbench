@@ -14,7 +14,7 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass, replace
 from functools import wraps
 from math import isfinite
@@ -34,6 +34,15 @@ from .analysis.mix_evidence import build_mix_evidence
 from .analysis.metrics import measure_audio
 from .daw.session import EditOperation, EditPlan, ProjectRevision, ProjectSession
 from .daw.full_capture import FullCaptureService
+from .daw.measure import MeasureService
+from .context.decision_gates import evaluate
+from .context.mode import load_mode, mode_brief, set_locked, set_mode
+from .context.structural_token import mint as mint_structural_token
+from .context.structural_token import require as require_structural_token
+from .context.mutation_journal import diff_digests
+from .context.evidence import EvidenceStore
+from .context.coverage import length_coverage, passport_from_units
+from .context.freshness_service import current_fingerprints, freshness_report
 from .context.full_capture import CaptureArchive, FullCaptureRecord, _thaw
 from .context.analysis_store import (analysis_input_fingerprint,
                                      analysis_locations, fingerprint_digest,
@@ -47,12 +56,11 @@ from .context.lifecycle import (PanoramaLifecycle, _delivered_bytes,
 from .context.panorama import (DEFAULT_MAX_BYTES, DEFAULT_MAX_TOKENS,
                                PANORAMA_SCHEMA_VERSION, build_panorama, load_panorama,
                                panorama_path_for_record)
-from .context.panorama_view import DEFAULT_RESPONSE_BYTES, build_view
+from .context.panorama_view import DEFAULT_RESPONSE_BYTES
 from .context.revision import digest_evidence
 from .context.identity import identity_from_mapping
-from .errors import (BridgeUnavailable, PanoramaBindingError,
-                     PanoramaCapacityError, ReaperAudioError, StaleContext,
-                     ValidationError)
+from .errors import (BridgeUnavailable, PanoramaCapacityError, ReaperAudioError,
+                     StaleContext, ValidationError)
 from .models import AudioBuffer, MeasurementReport, MetricValue, Section
 from .reaper.api_catalog import get_api_catalog
 from .daw.checkpoint import checkpoint_root, save_checkpoint
@@ -150,7 +158,8 @@ TOOL_SURFACE: dict[str, dict[str, Any]] = {
         "purpose": "open, verify, checkpoint or release the REAPER connection",
         "use_when": "at the start of a session, before a risky operation, or on a broken bridge",
         "context": "none (bootstrap); returns the project identity and revision",
-        "tools": ["reaper_session", "reaper_checkpoint_save", "reaper_bridge_reload"],
+        "tools": ["reaper_session", "reaper_checkpoint_save", "reaper_bridge_reload",
+                  "reaper_mode", "reaper_structural_token"],
         "not_for": "reading or changing project content",
     },
     "project": {
@@ -183,6 +192,18 @@ TOOL_SURFACE: dict[str, dict[str, Any]] = {
         "tools": ["reaper_analyze", "reaper_mix_evidence", "reaper_edit_map",
                   "reaper_render_candidate", "reaper_release"],
         "not_for": "choosing a genre recipe or a quality score; a scoped result is not whole-project coverage",
+    },
+    "measure": {
+        "purpose": ("measure only the requested sources over a caller-declared interval, "
+                    "read per-source freshness, and inspect coverage from stored evidence"),
+        "use_when": ("after an edit you want to hear again without a full capture, when you "
+                     "need to know which sources a capture still describes, or before a "
+                     "global claim"),
+        "context": ("project_id + archive_root; start_s/end_s are the caller's interval; "
+                    "stage is via_master or master"),
+        "tools": ["reaper_measure", "reaper_freshness", "reaper_coverage"],
+        "not_for": ("choosing how long to measure, inferring musical sections, or replacing "
+                    "a whole-project capture when a global verdict is required"),
     },
     "edit": {
         "purpose": "preview, apply or undo a revision-bound mutation",
@@ -267,6 +288,45 @@ def _panorama_lifecycle(archive_root: str | None = None,
         _PANORAMA_LIFECYCLES[root] = lifecycle
     _LAST_PANORAMA_ROOT = root
     return lifecycle
+
+
+def _access_note(access: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Advisory mode reports what was missing instead of blocking."""
+    if not access or not access.get("unverified"):
+        return {}
+    return {"unverified": True, "access": access}
+
+
+def _require_structural_access(*, session: ProjectSession, project_id: str,
+                               expected: ProjectRevision,
+                               archive_root: str | None,
+                               structural_token: str | None = None,
+                               panorama_receipt: str | None = None) -> dict[str, Any]:
+    """Authorise a mutation by a cheap structural token, or a legacy receipt.
+
+    The token proves the caller saw this exact project map (project, instance,
+    epoch, revision, map digest) and costs one digest read — no capture, no
+    audio.  A panorama receipt is still accepted for older workflows.
+    """
+    if structural_token:
+        payload = require_structural_token(session, project_id, structural_token)
+        return {"accepted": "structural_token", "fingerprint": payload}
+    state = load_mode()
+    if state.mode == "off":
+        # Mode off keeps only identity/revision checks, which the caller ran
+        # before reaching this point.
+        return {"accepted": "mode_off"}
+    if state.mode == "advisory":
+        try:
+            return _require_panorama_receipt(panorama_receipt, project_id,
+                                             expected.to_dict(), archive_root)
+        except Exception as error:  # noqa: BLE001 - advisory reports, never blocks
+            return {"accepted": "advisory", "unverified": True,
+                    "missing": [("panorama_receipt_or_structural_token"
+                                 if panorama_receipt is None else "valid_token")],
+                    "detail": str(error)[:400]}
+    return _require_panorama_receipt(panorama_receipt, project_id,
+                                     expected.to_dict(), archive_root)
 
 
 def _require_panorama_receipt(receipt: str | None, project_id: str,
@@ -477,15 +537,26 @@ server = MCPServer(
     instructions=(
         "REAPER Workbench. Find the task with reaper_capabilities(mode=\"tools\") — "
         "the surface is grouped by session, project, capture, panorama, analysis, edit, "
-        "discovery and research, not one tool per ReaScript function. Establish the "
+        "discovery and research, not one tool per ReaScript function. " "The work mode, the stale-share threshold and the lock are set by the user at "
+        "session start. Change them only at the user's explicit request — never on your "
+        "own, not to optimise, and not to get past a gate; if the mode blocks the work, "
+        "ask instead of switching. reaper_mode reads them and, on that request, changes "
+        "them; every response repeats the current mode. Strict means the checks block, "
+        "advisory means they are reported and the action proceeds marked unverified, off "
+        "means only project/instance/revision identity is checked. An edit requires a "
+        "current structural token, not a full panorama; a full panorama is needed only "
+        "for audio claims and global verdicts. ""Establish the "
         "project, its identity and exact revision with reaper_session and reaper_project, "
         "then reaper_panorama_status. Start the full project context with "
         "reaper_panorama_open() and no mode argument: the default is size-independent "
         "auto. It returns the complete full view with its receipt and context token "
         "in one measured result when that fits the declared budget; otherwise it returns "
         "page 1 plus a manifest of every page. Pages are the complete path, not a legacy "
-        "fallback: a whole-project claim or edit requires fetching every declared page "
-        "and acknowledging all of them. Do not choose a subset of pages, and do not ask "
+        "fallback: a whole-project claim needs every declared page acknowledged. A "
+        "structural edit does not: it needs a current structural token from "
+        "reaper_structural_token (project, instance, epoch, revision and the project-map "
+        "digest), which costs one cheap read, no capture and no audio. Do not choose a "
+        "subset of pages, and do not ask "
         "the model to guess single vs pages; an explicit mode=\"single\" over budget also "
         "falls back to pages. If manifest.page_ids is present, fetch every id in order; if "
         "it is omitted for a very large set, enumerate the declared page_id_pattern for "
@@ -503,10 +574,10 @@ server = MCPServer(
         "Before a conclusion or edit depends on fine timing, frequency, transient, or relation evidence, fetch the exact "
         "relevant source(s) and interval with reaper_panorama_query; narrow the interval if the result is over budget. "
         "Never treat a missing or summarized value as proof that the event or feature is absent. A URI alone does not "
-        "mean an audio-capable client delivered sound to the model. Only that complete receipt unlocks analysis, exact "
-        "queries and edits. A stale revision needs a new open. "
+        "mean an audio-capable client delivered sound to the model. A complete receipt unlocks analysis and exact "
+        "queries; an edit needs a structural token, and a stale revision needs either a fresh token or a new open. "
         "Create a capture with reaper_capture_snapshot only when no capture matches the "
-        "revision. Do not interpret project audio or edit from a partial panorama. If "
+        "revision. Do not interpret project audio from a partial panorama. If "
         "reaper_capture_snapshot returns panorama_capacity_exceeded with details.capture_id "
         "and says the canonical record remains archived, only one-shot delivery failed: do "
         "not capture again. Open that exact capture with reaper_panorama_open using the same "
@@ -713,7 +784,10 @@ def _guard(function):
     @wraps(function)
     def wrapped(*args, **kwargs):
         try:
-            return _jsonable(function(*args, **kwargs))
+            result = _jsonable(function(*args, **kwargs))
+            if isinstance(result, dict):
+                result.setdefault("mode", mode_brief())
+            return result
         except Exception as exc:  # MCP clients need a typed tool result, not a traceback.
             return _error_payload(exc)
     return wrapped
@@ -2996,7 +3070,11 @@ def reaper_edit(mode: str,
                 plan_id: str | None = None,
                 bridge_session_id: str | None = None,
                 panorama_receipt: str | None = None,
-                archive_root: str | None = None) -> dict[str, Any]:
+                archive_root: str | None = None,
+                decision_class: str | None = None,
+                basis: list[dict[str, Any]] | None = None,
+                target_sources: list[str] | None = None,
+                structural_token: str | None = None) -> dict[str, Any]:
     """Preview, apply, or undo one revision-bound batch of project edits.
 
     preview: supply operations and reason; nothing changes. apply: use the
@@ -3013,9 +3091,26 @@ def reaper_edit(mode: str,
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)
     _current_context(session, expected)
+    decision_gate = None
+    state = load_mode()
+    if decision_class is not None and state.mode != "off":
+        gate = _edit_decision_gate(
+            session=session, project_id=project_id, expected=expected,
+            operations=operations or [], decision_class=decision_class,
+            basis=basis, target_sources=target_sources,
+            archive_root=archive_root)
+        gate["mode"] = state.mode
+        decision_gate = gate
+        if not gate["ok"] and state.mode == "strict":
+            return {"mode": mode, "changed": False, "blocked": True,
+                    "decision_gate": gate, "project_id": project_id,
+                    "revision": expected.to_dict()}
+    access: dict[str, Any] | None = None
     if mode != "preview":
-        _require_panorama_receipt(panorama_receipt, project_id, expected.to_dict(),
-                                  archive_root)
+        access = _require_structural_access(session=session, project_id=project_id,
+                                   expected=expected, archive_root=archive_root,
+                                   structural_token=structural_token,
+                                   panorama_receipt=panorama_receipt)
     if mode == "preview":
         if not isinstance(operations, list) or not operations:
             raise ValidationError("preview requires a non-empty operations list")
@@ -3044,6 +3139,7 @@ def reaper_edit(mode: str,
                     _edit_plans.pop(expired_id, None)
         return {"mode": "preview", "changed": False,
                 "plan": plan.to_dict(),
+                "decision_gate": decision_gate,
                 "next_call": {"tool": "reaper_edit", "mode": "apply",
                               "plan_id": plan.plan_id,
                               "project_id": project_id,
@@ -3101,7 +3197,7 @@ def reaper_edit(mode: str,
             cached["applied_context_token"] = token
         cached["applied_archive_root"] = archive_root
         if not delta.get("delta_id") or not delta.get("acknowledgeable"):
-            return {"mode": "apply", "plan_id": plan_id,
+            return {"mode": "apply", "plan_id": plan_id, **_access_note(access),
                     "status": str(delta.get("status") or "unavailable"),
                     "reason": delta.get("reason"),
                     "next_call": delta.get("next_call")}
@@ -3109,6 +3205,7 @@ def reaper_edit(mode: str,
                                     context_token=token, project_id=project_id,
                                     revision=applied.to_dict())
         return {"mode": "apply", "plan_id": plan_id,
+                **_access_note(access),
                 "update": update,
                 "next_call": {
                     "tool": None,
@@ -3144,7 +3241,7 @@ def reaper_edit(mode: str,
     token = (str(advance["context_token"])
              if isinstance(advance, Mapping) and advance.get("context_token") else "")
     if not delta.get("delta_id") or not delta.get("acknowledgeable"):
-        return {"mode": "undo", "plan_id": plan_id,
+        return {"mode": "undo", "plan_id": plan_id, **_access_note(access),
                 "status": str(delta.get("status") or "unavailable"),
                 "reason": delta.get("reason"),
                 "next_call": delta.get("next_call")}
@@ -3153,7 +3250,8 @@ def reaper_edit(mode: str,
         context_token=token, project_id=project_id,
         revision=(undone_revision if isinstance(undone_revision, dict)
                   else expected.to_dict()))
-    return {"mode": "undo", "plan_id": plan_id, "update": update,
+    return {"mode": "undo", "plan_id": plan_id, **_access_note(access),
+            "update": update,
             "next_call": {
                 "tool": None,
                 "context_token": token,
@@ -3512,6 +3610,112 @@ def _handle_argument(value: Any, *, kind: str, revision: ProjectRevision,
                                                                 "guid": "object GUID"}}})
 
 
+def _post_hoc_change_update(session: ProjectSession, project_id: str,
+                            before_digest: Mapping[str, Any]) -> dict[str, Any]:
+    """Stage D3: name the known components a generic mutation actually moved."""
+    context = session.snapshot(include_items=False)
+    tracks = context.get("tracks") or []
+    master = context.get("master") or {}
+    after_digest = session.digest(project_id)
+    return diff_digests(
+        project_id=project_id,
+        before_digest=before_digest,
+        after_digest=after_digest,
+        track_guids=[str(track["guid"]) for track in tracks if track.get("guid")],
+        master_guid=str(master.get("guid") or ""),
+        time_window={"project_start_s": 0.0,
+                     "project_end_s": float(context.get("length_s") or 0.0)},
+        render_contract={
+            "capture": "native_render",
+            "track_stage": "selected_track_via_master_parallel_batch_post_fx",
+            "master_stage": "master_mix_post_fx",
+            "track_signal_includes_master_processing": True,
+        },
+    )
+
+
+def _evidence_context(*, session: ProjectSession, project_id: str,
+                      expected: ProjectRevision,
+                      archive_root: str | None) -> dict[str, Any]:
+    """Facts every gate needs: coverage passport, evidence units, track depth."""
+    context = session.snapshot(include_items=False)
+    tracks = context.get("tracks") or []
+    master_guid = str((context.get("master") or {}).get("guid") or "")
+    depth = {str(track.get("guid")): int(track.get("folder_depth") or 0)
+             for track in tracks if track.get("guid")}
+    total_sources = [f"track:{guid}" for guid in depth]
+    if master_guid:
+        total_sources.append(f"master:{master_guid}")
+    units = EvidenceStore(archive_root).all_units() if archive_root else []
+    coverage: dict[str, Any] | None = None
+    if archive_root:
+        try:
+            fingerprints = current_fingerprints(session, project_id)
+        except Exception:  # noqa: BLE001 - unreadable state means "unknown", not "clean"
+            fingerprints = None
+        passport = passport_from_units(
+            units, scope="project", project_id=project_id,
+            total_sources=total_sources, revision=expected.to_dict(),
+            current_fingerprints=fingerprints)
+        length_s = float(context.get("length_s") or 0.0)
+        required = [{"start_s": 0.0, "end_s": length_s}] if length_s > 0 else []
+        coverage = {
+            "length": (length_coverage(units, project_id=project_id,
+                                       required=required, sources=total_sources)
+                       if required else None),
+            "complete": bool(passport.get("complete")),
+            "sources_measured": passport.get("sources_measured"),
+            "total_sources": passport.get("sources_total"),
+            "measured_sources": list((passport.get("sources") or {}).get("measured") or []),
+            "missing_sources": [str(gap.get("source_id")) for gap in
+                                (passport.get("gaps") or [])
+                                if isinstance(gap, Mapping)][:8],
+        }
+    stale_fraction = None
+    if coverage and coverage.get("total_sources"):
+        measured = coverage.get("sources_measured") or 0
+        stale_fraction = round(1.0 - (measured / coverage["total_sources"]), 6)
+    return {"coverage": coverage, "units": units, "depth": depth,
+            "master_guid": master_guid, "stale_fraction": stale_fraction}
+
+
+def _coverage_gate_report(*, session: ProjectSession, project_id: str,
+                          expected: ProjectRevision,
+                          archive_root: str | None,
+                          requested_class: str = "global") -> dict[str, Any]:
+    """Coverage check shared by save and generic mutations (Stage C1/C2)."""
+    context = _evidence_context(session=session, project_id=project_id,
+                                expected=expected, archive_root=archive_root)
+    return evaluate(requested_class=requested_class, coverage=context["coverage"],
+                    stale_fraction=context["stale_fraction"])
+
+
+def _edit_decision_gate(*, session: ProjectSession, project_id: str,
+                        expected: ProjectRevision,
+                        operations: Sequence[Mapping[str, Any]],
+                        decision_class: str,
+                        basis: Sequence[Mapping[str, Any]] | None,
+                        target_sources: Sequence[str] | None,
+                        archive_root: str | None) -> dict[str, Any]:
+    """Stage C2-C4: verify the declared class against stored evidence.
+
+    The server, not the caller, decides that an edit touches the master or a
+    folder bus; the resulting class can only go up.
+    """
+    context = _evidence_context(session=session, project_id=project_id,
+                                expected=expected, archive_root=archive_root)
+    touched = {str(op.get("target_guid") or "") for op in operations}
+    return evaluate(
+        requested_class=decision_class,
+        target_sources=list(target_sources or []),
+        master_touched=bool(context["master_guid"]) and context["master_guid"] in touched,
+        bus_touched=any(context["depth"].get(guid, 0) > 0 for guid in touched if guid),
+        basis=list(basis or []),
+        units={str(unit.get("id")): unit for unit in context["units"] if unit.get("id")},
+        coverage=context["coverage"],
+        stale_fraction=context["stale_fraction"])
+
+
 def _unknown_scope_response(*, delta: Mapping[str, Any] | None,
                             after: ProjectRevision, project_id: str,
                             archive_root: str | None,
@@ -3551,7 +3755,9 @@ def reaper_api_call(name: str,
                     bridge_session_id: str | None = None,
                     timeout_s: float = 30.0,
                     panorama_receipt: str | None = None,
-                    archive_root: str | None = None) -> dict[str, Any]:
+                    archive_root: str | None = None,
+                    decision_class: str | None = None,
+                    structural_token: str | None = None) -> dict[str, Any]:
     """Call any function in the official REAPER ReaScript catalog.
 
     values are positional and must match the catalog signature exactly.
@@ -3572,9 +3778,20 @@ def reaper_api_call(name: str,
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)
     _current_context(session, expected)
+    state = load_mode()
+    if decision_class is not None and state.mode != "off":
+        gate = _coverage_gate_report(session=session, project_id=project_id,
+                                     expected=expected, archive_root=archive_root,
+                                     requested_class=decision_class)
+        gate["mode"] = state.mode
+        if not gate["ok"] and state.mode == "strict":
+            return {"ok": False, "blocked": True, "decision_gate": gate,
+                    "project_id": project_id, "revision": expected.to_dict()}
     if not getattr(_API_GATE_BYPASS, "enabled", False):
-        _require_panorama_receipt(panorama_receipt, project_id, expected.to_dict(),
-                                  archive_root)
+        _require_structural_access(session=session, project_id=project_id,
+                                   expected=expected, archive_root=archive_root,
+                                   structural_token=structural_token,
+                                   panorama_receipt=panorama_receipt)
     if len(values) != len(signature.parameters):
         raise ValidationError("Wrong number of API arguments",
                               details={"name": name,
@@ -3591,6 +3808,7 @@ def reaper_api_call(name: str,
             raise ValidationError("A host handle was supplied for a scalar API parameter",
                                   details={"name": name, "parameter": parameter.name})
         prepared.append(value)
+    digest_before = session.digest(project_id)
     result = session.bridge.call_api(name, *prepared, timeout_s=float(timeout_s))
     after_value = result.project_after if isinstance(result.project_after, Mapping) else None
     after_final = (ProjectRevision.from_dict(dict(after_value))
@@ -3615,10 +3833,14 @@ def reaper_api_call(name: str,
                      "project_id": project_id,
                      "revision": after_revision.to_dict(),
                      "note": "the API call did not change the observed project revision"}
+    change_update = (_post_hoc_change_update(session, project_id, digest_before)
+                     if delta is not None and delta.get("status") != "not_modified"
+                     else None)
     return _unknown_scope_response(
         delta=delta, after=after_final, project_id=project_id,
         archive_root=archive_root,
         extra={"name": result.name,
+               "change_update": change_update,
                "returns": list(result.returns),
                "arrays": {str(index): list(items)
                           for index, items in result.arrays.items()}})
@@ -3635,7 +3857,8 @@ def reaper_action(mode: str,
                   command_id: int | None = None,
                   bridge_session_id: str | None = None,
                   panorama_receipt: str | None = None,
-                  archive_root: str | None = None) -> dict[str, Any]:
+                  archive_root: str | None = None,
+                  structural_token: str | None = None) -> dict[str, Any]:
     """Search a REAPER Action or invoke it against an identified revision.
 
     Search requires query_object and query_operation. Main-section invocation
@@ -3648,7 +3871,6 @@ def reaper_action(mode: str,
         raise ValidationError("mode must be search or invoke")
     if isinstance(section_id, bool) or not isinstance(section_id, int):
         raise ValidationError("section_id must be an integer")
-    bridge = ReaperBridge(bridge_session_id=bridge_session_id)
     if mode == "search":
         if not isinstance(query_object, str) or not query_object.strip() or not isinstance(query_operation, str) or not query_operation.strip():
             raise ValidationError("Action search needs query_object and query_operation")
@@ -3662,11 +3884,14 @@ def reaper_action(mode: str,
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)
     _current_context(session, expected)
-    _require_panorama_receipt(panorama_receipt, project_id, expected.to_dict(),
-                              archive_root)
+    _require_structural_access(session=session, project_id=project_id,
+                               expected=expected, archive_root=archive_root,
+                               structural_token=structural_token,
+                               panorama_receipt=panorama_receipt)
     project_handle = ReaperHandle(kind="ReaProject", project_id=project_id,
                                   change_count=expected.change_count,
                                   stable_id=project_id)
+    digest_before_action = session.digest(project_id)
     if section_id == 0:
         result = session.bridge.call_api("Main_OnCommandEx", command_id, 0,
                                          project_handle)
@@ -3698,11 +3923,58 @@ def reaper_action(mode: str,
         delta = {"status": "not_modified", "acknowledgeable": False,
                  "project_id": project_id, "revision": after.to_dict(),
                  "note": "the Action did not change the observed project revision"}
+    change_update = (_post_hoc_change_update(session, project_id, digest_before_action)
+                     if after != expected else None)
     return _unknown_scope_response(
         delta=delta, after=after, project_id=project_id, archive_root=archive_root,
-        extra={"command_id": command_id, "section_id": section_id,
+        extra={"change_update": change_update,
+               "command_id": command_id, "section_id": section_id,
                "state_changed": after != expected,
                "returns": list(result.returns)})
+
+
+@server.tool()
+@_guard
+def reaper_structural_token(project_id: str,
+                            bridge_session_id: str | None = None) -> dict[str, Any]:
+    """Mint a structural token for an edit: cheap, no capture and no audio.
+
+    The token binds project id, instance, epoch, revision and the digest of the
+    project map (tracks, routing, FX, automation).  Pass it to ``reaper_edit``
+    apply/undo, ``reaper_api_call``, ``reaper_action`` or ``reaper_save``.
+    It authorises structure only: audio claims still need measurements.
+    """
+    session = _session(project_id, bridge_session_id)
+    return mint_structural_token(session, project_id)
+
+
+@server.tool()
+@_guard
+def reaper_mode(action: str = "get",
+                mode: str | None = None,
+                stale_threshold_pct: int | None = None,
+                reason: str | None = None,
+                requested_by: str = "user",
+                lock: bool | None = None) -> dict[str, Any]:
+    """Read or change the server work mode (strict / advisory / off).
+
+    Changing the mode is a user decision.  Call ``action="set"`` only when the
+    user asked for it in this conversation, name them in ``requested_by`` and
+    state why in ``reason``.  The model never changes the mode on its own and
+    never to get past a gate: if the mode blocks the work, ask the user.
+    ``lock=true`` freezes the rules; unlocking is only possible outside MCP.
+    """
+    if action == "get":
+        return {"mode_state": load_mode().as_dict()}
+    if action != "set":
+        raise ValidationError("action must be get or set")
+    if not reason or not str(reason).strip():
+        raise ValidationError("changing the mode needs a stated reason")
+    state = set_mode(mode=mode, stale_threshold_pct=stale_threshold_pct,
+                     reason=str(reason), requested_by=requested_by)
+    if lock is not None:
+        state = set_locked(bool(lock), reason=str(reason), requested_by=requested_by)
+    return {"mode_state": state.as_dict()}
 
 
 @server.tool()
@@ -3714,8 +3986,15 @@ def reaper_save(mode: str,
                 overwrite_existing: bool = False,
                 bridge_session_id: str | None = None,
                 panorama_receipt: str | None = None,
-                archive_root: str | None = None) -> dict[str, Any]:
+                archive_root: str | None = None,
+                structural_token: str | None = None) -> dict[str, Any]:
     """Save through REAPER. save_as is absolute .RPP and refuses overwrite by default.
+
+    A save is not an assertion: it checks project/instance/epoch/revision and a
+    path conflict, never coverage or audio evidence. ``panorama_receipt`` is a
+    deprecated compatibility parameter — when supplied it is still verified, so
+    a caller cannot believe it was checked when it was not; new callers should
+    pass ``structural_token`` or nothing.
 
     A save that moves the revision or path sets ``context_invalidated`` and
     returns no changed-value payload: the previous token cannot be reused, and no
@@ -3727,8 +4006,14 @@ def reaper_save(mode: str,
         raise ValidationError("overwrite_existing must be boolean")
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)
-    _require_panorama_receipt(panorama_receipt, project_id, expected.to_dict(),
-                              archive_root)
+    _current_context(session, expected)
+    if structural_token:
+        require_structural_token(session, project_id, structural_token)
+    if panorama_receipt:
+        # Deprecated, but never silently ignored: if a caller presents one, it
+        # is checked rather than believed validated.
+        _require_panorama_receipt(panorama_receipt, project_id,
+                                  expected.to_dict(), archive_root)
     if mode == "save_current":
         if path is not None or overwrite_existing:
             raise ValidationError("path and overwrite_existing only apply to save_as")
@@ -3769,7 +4054,15 @@ def reaper_release(analysis_id: str) -> dict[str, Any]:
 
 MODEL_GUIDE: dict[str, Any] = {
     "schema": "reaper-workbench.model-guide/1",
-    "purpose": ("Canonical navigation contract for a model using REAPER Workbench. "
+
+    "modes": ("The work mode (strict / advisory / off), the stale-share threshold and the "
+              "lock belong to the user: change them only at the user's explicit request "
+              "through reaper_mode, never on your own and never to pass a gate; if the "
+              "mode blocks the work, ask. Every response repeats it."),
+    "tokens": ("An edit needs a current structural_token from reaper_structural_token "
+               "(project, instance, epoch, revision and the project-map digest) - one cheap "
+               "read, no capture, no audio. A full panorama is needed only for audio claims "
+               "and global verdicts; a panorama receipt is still accepted for compatibility."),    "purpose": ("Canonical navigation contract for a model using REAPER Workbench. "
                 "It names the complete panorama path, current-state updates, exact query, "
                 "operation discovery and verification; it does not prescribe a genre "
                 "or a fixed mixing recipe."),
@@ -3861,7 +4154,8 @@ MODEL_GUIDE: dict[str, Any] = {
                      "Action. Neither is a separate tool per ReaScript function."),
     },
     "edits": {
-        "flow": ("preview a plan, apply with expected_revision, read back the affected "
+        "flow": ("preview a plan (no token needed), apply with expected_revision plus the "
+                 "structural_token, read back the affected "
                  "objects and the returned update. Save only when requested."),
         "authority": ("only a complete panorama receipt/context token unlocks a project "
                       "edit; a read_scope is read-only."),
@@ -4602,6 +4896,96 @@ def _read_capture_panorama(capture_id: str, archive_root: str,
         "archive": {"capture_id": capture_id, "root": str(archive.root)},
     }
 
+
+
+@server.tool()
+@_guard
+def reaper_measure(archive_root: str,
+                   project_id: str | None = None,
+                   sources: list[str] | str = "all",
+                   start_s: float | None = None,
+                   end_s: float | None = None,
+                   stage: str = "via_master",
+                   channels: str = "stereo",
+                   sample_rate: int | None = None,
+                   tail_ms: int = 0,
+                   analysis_workers: int | None = None,
+                   bridge_session_id: str | None = None) -> dict[str, Any]:
+    """Measure only the requested sources over a caller-declared interval.
+
+    This is the edit -> listen unit.  It renders the named sources (or the
+    master alone with ``stage="master"``), measures them, stores evidence units
+    and mints an evidence token.  It does **not** create a project capture and
+    does not mint a global receipt.
+
+    The interval is a parameter: pass ``start_s``/``end_s`` for the exact
+    window you want measured (both or neither).  The library has no notion of
+    bars, sections or "enough" — it only reports what it measured there.
+
+    ``stage="premaster"`` is refused with ``stage_not_rendered``: this renderer
+    produces only via-master stems and the master mix, and it never substitutes
+    one stage for another.
+    """
+    if (start_s is None) != (end_s is None):
+        raise ValidationError("start_s and end_s must both be provided or both be null")
+    section = None
+    if start_s is not None and end_s is not None:
+        section = (float(start_s), float(end_s))
+    session = _session(project_id, bridge_session_id)
+    service = MeasureService(session, archive_root)
+    return service.measure(sources=sources, section=section, stage=stage,
+                           channels=channels, sample_rate=sample_rate,
+                           tail_ms=tail_ms, analysis_workers=analysis_workers)
+
+
+@server.tool()
+@_guard
+def reaper_freshness(archive_root: str,
+                     project_id: str | None = None,
+                     capture_id: str | None = None,
+                     bridge_session_id: str | None = None) -> dict[str, Any]:
+    """Per-source, per-stage freshness of a capture against the live project.
+
+    ``sources[source_id][stage]`` is ``current``/``stale``/``unknown`` with the
+    reason and both fingerprints.  A track edit makes that track and the master
+    stale; a master/bus edit makes every source under it stale.  Unknown is
+    never treated as clean.
+    """
+    session = _session(project_id, bridge_session_id)
+    selected = project_id or session.project_id
+    if not selected:
+        raise ValidationError("project_id is required when no project is active")
+    report = freshness_report(session, archive_root, project_id=selected,
+                              capture_id=capture_id)
+    return {"ok": True, "freshness": report}
+
+
+@server.tool()
+@_guard
+def reaper_coverage(archive_root: str,
+                    project_id: str | None = None,
+                    scope: str = "global",
+                    bridge_session_id: str | None = None) -> dict[str, Any]:
+    """Coverage passport built from stored evidence units of this project.
+
+    Reports measured/total sources, the intervals each source actually covers,
+    the revision and every gap.  A global claim without a complete passport is
+    refused by the gates; this tool is how a caller sees the numbers first.
+    """
+    session = _session(project_id, bridge_session_id)
+    context = session.snapshot(include_items=False)
+    project = project_id or str((context.get("revision") or {}).get("project_id"))
+    tracks = context.get("tracks") or []
+    master = context.get("master") or {}
+    total = [f"track:{track.get('guid')}" for track in tracks if track.get("guid")]
+    if master.get("guid"):
+        total.append(f"master:{master.get('guid')}")
+    revision = context.get("revision") or {}
+    store = EvidenceStore(archive_root)
+    passport = passport_from_units(store.all_units(), scope=scope,
+                                   project_id=project, total_sources=total,
+                                   revision=revision)
+    return {"ok": True, "passport": passport}
 
 
 @server.tool()

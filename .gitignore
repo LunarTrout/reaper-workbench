@@ -47,3 +47,9 @@ env/
 Thumbs.db
 .idea/
 .vscode/
+
+# Local run artifacts (not part of the product)
+/capture-archive/
+/index.jsonl
+/work-cache-manifest-*.txt
+/work-cache-scripts-*.tar.gz

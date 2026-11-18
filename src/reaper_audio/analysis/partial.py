@@ -68,7 +68,6 @@ def _bands29(samples: np.ndarray, sample_rate: int, hop_s: float) -> tuple[np.nd
     padded_frames = frame_count * hop
     if padded_frames > len(x):
         x = np.pad(x, ((0, padded_frames - len(x)), (0, 0)))
-    frames = x[:padded_frames].reshape(frame_count, hop, x.shape[1])
     levels = np.full((frame_count, len(THIRD_OCTAVE_29_HZ)), -300.0, dtype=np.float64)
     nyquist = sample_rate / 2.0
     for band_index, center_hz in enumerate(THIRD_OCTAVE_29_HZ):

@@ -16,7 +16,7 @@ import json
 import os
 import re
 import shutil
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from datetime import datetime, timezone
@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import ValidationError
-from .ids import new_id
+from .contract_v2 import partial_evidence_enabled
+from .evidence_documents import write_capture_documents
 from .panorama import (DEFAULT_MAX_BYTES, PANORAMA_FILE_NAME,
                        build_panorama, write_panorama_atomic)
 
@@ -705,6 +706,18 @@ class CaptureArchive:
                 blob.unlink(missing_ok=True)
             raise
         record_path = destination / "record.json"
+        if partial_evidence_enabled():
+            try:
+                write_capture_documents(
+                    archive_root=self.root_real, capture_id=capture_id,
+                    data=data, record_bytes=os.path.getsize(record_path))
+            except Exception:
+                # The manifest is part of the capture contract: without it the
+                # archive would claim a thin index it cannot serve.
+                shutil.rmtree(destination, ignore_errors=True)
+                for blob in created_blobs:
+                    blob.unlink(missing_ok=True)
+                raise
         index_entry = {
             "schema_version": ARCHIVE_SCHEMA_VERSION,
             "capture_id": capture_id,

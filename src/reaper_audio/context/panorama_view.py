@@ -37,11 +37,14 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections import Counter
+import copy
+import time
+from collections import Counter, OrderedDict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from reaper_audio.errors import ValidationError
+from . import contract_v2
 from .relations import RELATION_KINDS
 
 VIEW_SCHEMA = "reaper-workbench.panorama-view/2"
@@ -1576,6 +1579,64 @@ def serialise_view(view: Mapping[str, Any]) -> str:
                       separators=(",", ":"), default=_json_default)
 
 
+_VIEW_CACHE: "OrderedDict[tuple, dict[str, Any]]" = OrderedDict()
+_VIEW_CACHE_STATS: dict[str, Any] = {"hits": 0, "misses": 0, "disabled": 0,
+                                     "build_s": 0.0, "last_build_s": 0.0,
+                                     "entries": 0, "limit": 0}
+
+
+def view_cache_stats() -> dict[str, Any]:
+    """Measured counters for the Stage A2 view cache."""
+    return dict(_VIEW_CACHE_STATS, entries=len(_VIEW_CACHE),
+                limit=contract_v2.panorama_view_cache_size())
+
+
+def build_view_memoized(document: Mapping[str, Any], *,
+                        record_path: str | None = None,
+                        max_response_bytes: int = DEFAULT_RESPONSE_BYTES,
+                        lean: bool = False,
+                        exact_metrics: bool = False,
+                        document_key: str | None = None) -> dict[str, Any]:
+    """Stage A2: ``build_view`` memoised per immutable document.
+
+    The capture document is sealed and immutable, so a view built from it is
+    also immutable for these arguments.  The key covers everything the view
+    depends on (document hash, record path, byte budget, lean and exact
+    switches); a cached view is returned as a deep copy so a caller cannot
+    mutate the stored entry.  Disabled by ``REAPER_V2_PANORAMA_VIEW_CACHE``.
+    """
+    if not contract_v2.panorama_view_cache_enabled():
+        _VIEW_CACHE_STATS["disabled"] += 1
+        return build_view(document, record_path=record_path,
+                          max_response_bytes=max_response_bytes,
+                          lean=lean, exact_metrics=exact_metrics)
+    sealed = document_key or document.get("document_sha256")
+    if not isinstance(sealed, str) or not sealed:
+        return build_view(document, record_path=record_path,
+                          max_response_bytes=max_response_bytes,
+                          lean=lean, exact_metrics=exact_metrics)
+    key = (sealed, record_path, int(max_response_bytes), bool(lean),
+           bool(exact_metrics))
+    cached = _VIEW_CACHE.get(key)
+    if cached is not None:
+        _VIEW_CACHE.move_to_end(key)
+        _VIEW_CACHE_STATS["hits"] += 1
+        return copy.deepcopy(cached)
+    started = time.perf_counter()
+    view = build_view(document, record_path=record_path,
+                      max_response_bytes=max_response_bytes,
+                      lean=lean, exact_metrics=exact_metrics)
+    elapsed = time.perf_counter() - started
+    _VIEW_CACHE_STATS["misses"] += 1
+    _VIEW_CACHE_STATS["build_s"] = round(
+        float(_VIEW_CACHE_STATS["build_s"]) + elapsed, 6)
+    _VIEW_CACHE_STATS["last_build_s"] = round(elapsed, 6)
+    _VIEW_CACHE[key] = view
+    while len(_VIEW_CACHE) > contract_v2.panorama_view_cache_size():
+        _VIEW_CACHE.popitem(last=False)
+    return copy.deepcopy(view)
+
+
 __all__ = [
     "ARCHIVE_FAMILIES",
     "DEFAULT_RESPONSE_BYTES",
@@ -1586,6 +1647,7 @@ __all__ = [
     "VIEW_SCHEMA",
     "budget_report",
     "build_view",
+    "build_view_memoized",
     "canonical",
     "dominant_sections",
     "nz",

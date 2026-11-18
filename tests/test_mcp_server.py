@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 
 import numpy as np
+from pathlib import Path
+
 import pytest
 import soundfile as sf
 
@@ -145,10 +147,12 @@ def test_mcp_surface_is_bounded_and_has_discovery_resources() -> None:
     names = {tool.name for tool in tools}
     uris = {resource.uri_template for resource in templates}
 
-    # 29 project tools plus the lifecycle call that activates a new bridge build
+    # 32 project tools plus the lifecycle call that activates a new bridge build
     # and the narrow checkpoint save that persists unsaved state before it.
-    assert len(names) == 31
+    assert len(names) == 36
     assert {"reaper_bridge_reload", "reaper_checkpoint_save"} <= names
+    assert {"reaper_measure", "reaper_freshness", "reaper_coverage",
+            "reaper_mode"} <= names
     assert {"reaper_capabilities", "reaper_api_search", "reaper_api_call",
             "reaper_bridge_reload", "reaper_checkpoint_save",
             "reaper_project", "reaper_analyze", "reaper_edit",
@@ -161,7 +165,9 @@ def test_mcp_surface_is_bounded_and_has_discovery_resources() -> None:
             "reaper_capture_read", "reaper_panorama_open",
             "reaper_panorama_page", "reaper_panorama_ack",
             "reaper_panorama_query", "reaper_panorama_status",
-            "reaper_panorama_changes_since", "reaper_panorama_refresh"} == names
+            "reaper_panorama_changes_since", "reaper_panorama_refresh",
+            "reaper_measure", "reaper_freshness", "reaper_coverage",
+            "reaper_mode", "reaper_structural_token"} == names
     # The paged panorama is model-visible; the old slice/detail/delta-ack tools are not.
     for removed in ("reaper_panorama_detail", "reaper_panorama_slice",
                     "reaper_panorama_delta_ack"):
@@ -206,6 +212,10 @@ def test_mcp_read_scope_exact_query_is_read_only(tmp_path) -> None:
             scope["id"], record.project_id, opened["revision"], root)
 
 
+@pytest.mark.skipif(
+    not (Path(__file__).resolve().parents[1] / "work" / "archive" / "captures"
+         / "cap_01M79659V69NDC5YNAA0SMPX51" / "record.json").is_file(),
+    reason="archived capture fixture is not present in this checkout")
 def test_mcp_archived_exact_read_ignores_incomplete_identity(tmp_path) -> None:
     from test_archived_single_view import (
         CAPTURE, _archive_document, _copy_archive_metadata)

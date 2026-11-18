@@ -40,8 +40,9 @@ from .panorama import (PANORAMA_SCHEMA_VERSION, build_panorama, load_panorama,
                        panorama_path_for_record)
 from .query import run_query
 from .panorama_view import (DEFAULT_RESPONSE_BYTES, LEAN_OVERVIEW_BYTES, budget_report,
-                            build_minimum_view, build_view, canonical as view_canonical,
-                            view_bytes)
+                            build_minimum_view, build_view_memoized,
+                            canonical as view_canonical, view_bytes,
+                            view_cache_stats)
 from .render_dependencies import compare_render_manifests
 from .relations import RelationBinding, RelationWindow, build_relation_set
 from .semantic_delta import build_semantic_delta
@@ -2090,10 +2091,11 @@ class PanoramaLifecycle:
         capture, document, _binding, revision = self._capture_document(
             project_id, capture_id, expected_revision)
         record_path = f"captures/{capture}/record.json"
-        view = build_view(document, record_path=record_path, max_response_bytes=budget)
+        view = build_view_memoized(document, record_path=record_path,
+                                   max_response_bytes=budget)
         if allow_lean and view_bytes(view) > LEAN_OVERVIEW_BYTES:
-            lean_view = build_view(document, record_path=record_path,
-                                   max_response_bytes=budget, lean=True)
+            lean_view = build_view_memoized(document, record_path=record_path,
+                                            max_response_bytes=budget, lean=True)
             if view_bytes(lean_view) < view_bytes(view):
                 # Keep all tracks/master and all 24 metric columns; only
                 # high-cardinality item/take rows become exact query families.
@@ -2123,6 +2125,7 @@ class PanoramaLifecycle:
                 "requires_client_reassembly": False,
                 "receipt_guarantee": ("delivered exactly this view (document hash, revision, "
                                       "fact root); not a claim that it was read"),
+                "cache": view_cache_stats(),
             },
             "view": view,
             "handle": "pan_" + "x" * 24,
@@ -2263,8 +2266,8 @@ class PanoramaLifecycle:
         target = min(target, ceiling)
         capture, document, _binding, revision = self._capture_document(
             project_id, capture_id, expected_revision)
-        view = build_view(document, record_path=f"captures/{capture}/record.json",
-                          lean=False)
+        view = build_view_memoized(document, record_path=f"captures/{capture}/record.json",
+                                   lean=False)
         total_bytes = len(view_canonical(view))
         # Reserve room for the manifest that page 1 must carry.  The exact
         # check below still measures the complete envelope; this only avoids a
@@ -2308,6 +2311,7 @@ class PanoramaLifecycle:
                     "max_page_bytes": ceiling,
                     "fits": True,
                     "page_count": len(state["view_pages"]),
+                    "cache": view_cache_stats(),
                 }
                 state["manifest"] = dict(manifest)
                 self._save_handle(str(state["handle"]), state)

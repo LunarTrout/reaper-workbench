@@ -5,7 +5,6 @@ from __future__ import annotations
 from statistics import median
 from typing import Any
 
-import numpy as np
 
 from ..errors import ValidationError
 from ..models import MeasurementReport

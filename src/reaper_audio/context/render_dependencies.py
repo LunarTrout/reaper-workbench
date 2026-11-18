@@ -399,6 +399,18 @@ def _source_components(*, scope: str, track_guid: str | None,
                 continue
             for key in ("track_state", "fx", "fx_state", "automation"):
                 digests[f"track:{guid}:ancestor:{key}"] = row[key]
+        # A folder parent's stem contains its descendants' audio, so their
+        # content belongs to the fingerprint.  Without this a bus key stayed
+        # constant while a child's FX changed (measured 1.38 dB drift) and
+        # reuse/caching would serve stale bus evidence.
+        for guid in closure["children"]:
+            row = track_components.get(guid)
+            if row is None:
+                unknown.append(f"descendant_state_unreadable:{guid}")
+                continue
+            for key in ("track_state", "items", "fx", "fx_state",
+                        "automation", "routing"):
+                digests[f"track:{guid}:descendant:{key}"] = row[key]
         master = components.get("master")
         if not isinstance(master, Mapping):
             unknown.append("master_state_unreadable")
@@ -734,3 +746,40 @@ def compare_render_manifests(before: Mapping[str, Any],
         "reasons": [],
         "complete": True,
     }
+
+
+def render_keys(*, project_id: str, digest: Mapping[str, Any],
+                track_guids: Sequence[str], master_guid: str,
+                time_window: Mapping[str, Any],
+                render_contract: Mapping[str, Any] | None = None,
+                ) -> dict[str, dict[str, str]]:
+    """Return ``{source_id: {stage: render_key}}`` for complete fingerprints.
+
+    ``source_id`` uses the panorama vocabulary (``track:<guid>`` and
+    ``master:<guid>``), so the result can be compared with a capture manifest
+    row-for-row.  Incomplete rows are omitted: an incomplete fingerprint is a
+    dirty source and never authorises reuse (R3).
+    """
+    contract = dict(render_contract or {})
+    track_stage = str(contract.get("track_stage") or "")
+    master_stage = str(contract.get("master_stage") or "")
+    sources = [{"source_guid": guid, "scope": "source", "stage": track_stage}
+               for guid in track_guids]
+    sources.append({"source_guid": master_guid, "scope": "master",
+                    "stage": master_stage})
+    manifest = build_render_manifest(project_id=project_id, digest=digest,
+                                     sources=sources, time_window=time_window,
+                                     render_contract=contract)
+    out: dict[str, dict[str, str]] = {}
+    for row in manifest.get("sources") or []:
+        if not isinstance(row, Mapping) or not row.get("complete"):
+            continue
+        guid = row.get("source_guid")
+        key = row.get("render_key")
+        if not isinstance(guid, str) or not isinstance(key, str) or not key:
+            continue
+        scope = str(row.get("scope") or "source")
+        source_id = (f"master:{guid}" if scope == "master" else f"track:{guid}")
+        stage = ("via_master" if scope == "master" else "via_master")
+        out.setdefault(source_id, {})[stage] = key
+    return out

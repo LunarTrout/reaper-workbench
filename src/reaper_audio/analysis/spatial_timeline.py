@@ -59,7 +59,6 @@ def timeline(path: str | Path, window_s: float = 30.0, hop_s: float | None = Non
              start_s: float = 0.0, end_s: float | None = None) -> dict[str, Any]:
     import soundfile as sf
 
-    info = sf.info(str(path))
     data, sr = sf.read(str(path), dtype="float32", always_2d=True)
     if data.shape[1] < 2:
         raise ValueError("a timeline profile needs a stereo file")

@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.signal import correlate, find_peaks
+from scipy.signal import correlate
 
 from ..analysis.transients import detect_transients
 from ..models import AudioBuffer

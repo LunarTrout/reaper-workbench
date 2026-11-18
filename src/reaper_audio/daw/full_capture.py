@@ -12,28 +12,33 @@ import json
 import math
 import multiprocessing
 import os
-import tempfile
+import shutil
 import time
 from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import soundfile as sf
 
 from ..analysis.artifacts import AudioArtifactWorkspace
 from ..analysis.audio import load_audio
-from ..analysis.metrics import measure_audio
 from ..context.full_capture import CaptureArchive, FullCaptureRecord, REQUIRED_MAP_KEYS
 from ..context.ids import new_id
+from ..context import contract_v2
+from ..context.measurement_cache import MeasurementCache
 from ..context.panorama import (build_panorama, build_relation_domain, load_panorama,
                                 panorama_path_for_record)
 from ..context.render_dependencies import build_render_manifest
 from ..context.changes import digest_facts
-from ..errors import BridgeUnavailable, CaptureMasterInvalid, ValidationError
+from ..errors import (BridgeUnavailable, CaptureMasterInvalid, StaleContext,
+                      ValidationError)
 from ..reaper.handles import ReaperHandle
+from .analysis_cache_stage import merge as merge_cached_results
+from .analysis_cache_stage import split as split_cached_payloads
+from .analysis_cache_stage import store as store_measured_results
 from .analysis_pipeline import BoundedAnalysisPool
 from .analysis_policy import (MAX_ANALYSIS_WORKERS,
                               resolve_analysis_workers,
@@ -48,6 +53,11 @@ from .session import ProjectRevision, ProjectSession
 DEFAULT_ANALYSIS_WORKERS = 4
 MAX_CAPTURE_OVERLAP_WORKERS = MAX_ANALYSIS_WORKERS
 MASTER_RENDER_MAX_ATTEMPTS = 2
+#: Signal stages as declared in the capture render contract.  They are part of
+#: every measurement-cache key, so a premaster and a via-master measurement of
+#: the same source can never be confused.
+TRACK_SIGNAL_STAGE = "selected_track_via_master_parallel_batch_post_fx"
+MASTER_SIGNAL_STAGE = "master_mix_post_fx"
 MASTER_SILENCE_DBFS = -120.0
 
 
@@ -417,6 +427,164 @@ class FullCaptureService:
         self.bridge = session.bridge
         self.archive_root = Path(archive_root).expanduser().absolute()
 
+    def _analysis_cache(self, start_s: float | None,
+                        end_s: float | None) -> MeasurementCache | None:
+        """Stage A1 cache for this capture window, or None when disabled."""
+        if not contract_v2.analysis_cache_enabled():
+            return None
+        section = None
+        if start_s is not None and end_s is not None:
+            section = {"start_s": float(start_s), "end_s": float(end_s)}
+        return MeasurementCache(self.archive_root, section=section)
+
+    def _render_fingerprints(self, *, project_id: str,
+                             digest: Mapping[str, Any],
+                             track_guids: Sequence[str],
+                             master_guid: str,
+                             start_s: float | None,
+                             end_s: float | None,
+                             project_length_s: float) -> dict[str, str]:
+        """Complete per-source render fingerprints for the measurement cache.
+
+        Only rows the manifest marks ``complete`` are returned; an incomplete
+        fingerprint is a dirty source and never authorises a cache hit (R3).
+        """
+        sources = [{"source_guid": guid, "scope": "source",
+                    "stage": TRACK_SIGNAL_STAGE} for guid in track_guids]
+        sources.append({"source_guid": master_guid, "scope": "master",
+                        "stage": MASTER_SIGNAL_STAGE})
+        manifest = build_render_manifest(
+            project_id=project_id,
+            digest=digest,
+            sources=sources,
+            time_window={
+                "project_start_s": 0.0 if start_s is None else float(start_s),
+                "project_end_s": (float(project_length_s) if end_s is None
+                                  else float(end_s)),
+            },
+            render_contract={
+                "capture": "native_render",
+                "track_stage": TRACK_SIGNAL_STAGE,
+                "master_stage": MASTER_SIGNAL_STAGE,
+                "track_signal_includes_master_processing": True,
+            },
+        )
+        keys: dict[str, str] = {}
+        for row in manifest.get("sources") or []:
+            if not isinstance(row, Mapping) or not row.get("complete"):
+                continue
+            guid = row.get("source_guid")
+            key = row.get("render_key")
+            if isinstance(guid, str) and isinstance(key, str) and key:
+                keys[guid] = key
+        return keys
+
+    # ------------------------------------------------------------------ #
+    # Stage D1: source reuse
+    # ------------------------------------------------------------------ #
+    def _previous_source_state(self, project_id: str) -> dict[str, dict[str, Any]] | None:
+        """Latest archived capture's per-source fingerprints and blob hashes.
+
+        Returns ``None`` when there is no earlier capture: the caller then
+        renders everything, exactly like the pre-D1 path.
+        """
+        index_path = self.archive_root / "index.jsonl"
+        try:
+            lines = index_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+        capture_id = None
+        for line in reversed(lines):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("project_id") == project_id and row.get("capture_id"):
+                capture_id = str(row["capture_id"])
+                break
+        if not capture_id:
+            return None
+        record_path = self.archive_root / "captures" / capture_id / "record.json"
+        try:
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        project_map = record.get("project_map") or {}
+        manifest = project_map.get("render_manifest") or {}
+        rows = manifest.get("sources") or []
+        audio_rows = {row.get("source_guid"): row for row in record.get("audio") or []
+                      if isinstance(row, Mapping)}
+        state: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, Mapping) or row.get("scope") == "master":
+                continue
+            guid = row.get("source_guid")
+            key = row.get("render_key")
+            audio = audio_rows.get(guid) or {}
+            if not isinstance(guid, str) or not isinstance(key, str) or not key:
+                continue
+            if not row.get("complete") or not audio.get("sha256"):
+                continue
+            state[guid] = {"render_key": key, "sha256": str(audio["sha256"]),
+                           "capture_id": capture_id,
+                           "stage": str(row.get("stage") or TRACK_SIGNAL_STAGE)}
+        return state or None
+
+    def _adopt_reusable_sources(self, *, previous: Mapping[str, Mapping[str, Any]],
+                                fingerprints: Mapping[str, str],
+                                tracks_by_guid: Mapping[str, Mapping[str, Any]],
+                                workspace: AudioArtifactWorkspace,
+                                ) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+        """Adopt stems whose complete fingerprint is unchanged.
+
+        A source is reusable only when its current fingerprint equals the one
+        recorded in the previous capture.  The master chain and every bus are
+        part of that fingerprint closure, so a master/bus edit dirties every
+        source under it without a special case here (R1).
+        """
+        adopted: list[dict[str, Any]] = []
+        dirty: list[str] = []
+        reasons: list[str] = []
+        for guid, track in tracks_by_guid.items():
+            current = fingerprints.get(guid)
+            recorded = previous.get(guid)
+            if not current or not recorded:
+                dirty.append(guid)
+                reasons.append(f"{guid[:8]}:no_complete_fingerprint")
+                continue
+            if current != recorded.get("render_key"):
+                dirty.append(guid)
+                reasons.append(f"{guid[:8]}:fingerprint_changed")
+                continue
+            blob = self.archive_root / "audio" / "sha256" / f"{recorded['sha256']}.wav"
+            if not blob.is_file():
+                dirty.append(guid)
+                reasons.append(f"{guid[:8]}:archived_blob_missing")
+                continue
+            target = workspace.directory / f"reuse-{guid.strip('{}')[:8]}.wav"
+            shutil.copy2(blob, target)
+            artifact = workspace.register_asset(target)
+            info = sf.info(str(target))
+            adopted.append({
+                "source_guid": guid,
+                "path": str(artifact.path),
+                "name": str(track.get("name") or f"track {track.get('index')}"),
+                "track_index": int(track.get("index", -1)),
+                "is_master": False,
+                "stage": TRACK_SIGNAL_STAGE,
+                "soloed_guid": None,
+                "sha256": artifact.sha256,
+                "bytes": int(artifact.bytes),
+                "frames": int(info.frames),
+                "sample_rate": int(info.samplerate),
+                "channels": int(info.channels),
+                "render_s": 0.0,
+                "reused": True,
+                "reused_from_capture": recorded["capture_id"],
+                "render_key": recorded["render_key"],
+            })
+        return adopted, dirty, reasons
+
     # ------------------------------------------------------------------ #
     # public
     # ------------------------------------------------------------------ #
@@ -496,7 +664,6 @@ class FullCaptureService:
             str(track.get("guid")): int(bool(track.get("mute")))
             for track in tracks if isinstance(track, Mapping) and track.get("guid")
         }
-        routing = self._routing_graph(tracks, digest)
         rendered_files: list[dict[str, Any]] = []
         track_items: list[dict[str, Any]] = []
         master_item: dict[str, Any] | None = None
@@ -545,6 +712,12 @@ class FullCaptureService:
                 requested=analysis_workers,
             )
             workers = worker_plan.workers
+            analysis_cache = self._analysis_cache(start_s, end_s) if workers > 1 else None
+            fingerprints = (self._render_fingerprints(
+                project_id=revision.project_id, digest=digest,
+                track_guids=all_guids, master_guid=master_guid,
+                start_s=start_s, end_s=end_s, project_length_s=project_length_s)
+                if analysis_cache is not None else {})
 
             # The master is rendered and validated before any track batch.
             # A silent master is kept as an attempt and classified only after
@@ -577,21 +750,69 @@ class FullCaptureService:
             last_render_end = time.perf_counter()
             render_ends.append(last_render_end)
 
+            stage_by_guid: dict[str, str] = {master_guid: MASTER_SIGNAL_STAGE}
+            cache_hits: dict[str, dict[str, Any]] = {}
+            cache_misses: list[tuple[str, str]] = []
+
+            def submit_cached(payloads: list[tuple[str, str]]) -> None:
+                """Submit only payloads the measurement cache cannot answer."""
+                if analysis_cache is None:
+                    pipeline.submit(payloads)
+                    return
+                hits, misses = split_cached_payloads(payloads, stage_by_guid,
+                                                     analysis_cache, fingerprints)
+                cache_hits.update(hits)
+                cache_misses.extend(misses)
+                if misses:
+                    pipeline.submit(misses)
+
             if workers > 1:
                 pool_created_at = time.perf_counter()
                 pipeline = BoundedAnalysisPool(workers)
                 if not master_is_silent:
-                    pipeline.submit([(master_guid, str(master_path))])
+                    submit_cached([(master_guid, str(master_path))])
                     master_submitted = True
                     first_submit_at = time.perf_counter()
 
+            incremental = (contract_v2.incremental_render_enabled()
+                           and analysis_cache is not None)
+            reused_items: list[dict[str, Any]] = []
+            dirty_guids = list(all_guids)
+            incremental_info: dict[str, Any] = {"enabled": bool(incremental)}
+            if incremental:
+                previous = self._previous_source_state(revision.project_id)
+                if previous is None:
+                    incremental_info["reason"] = "no_previous_capture"
+                else:
+                    reused_items, dirty_guids, reuse_reasons = self._adopt_reusable_sources(
+                        previous=previous, fingerprints=fingerprints,
+                        tracks_by_guid=tracks_by_guid, workspace=workspace)
+                    incremental_info.update({
+                        "previous_capture": sorted(
+                            {row["capture_id"] for row in previous.values()})[0],
+                        "reused_sources": [row["source_guid"] for row in reused_items],
+                        "dirty_sources": list(dirty_guids),
+                        "reasons": reuse_reasons[:20],
+                    })
+                    if reused_items:
+                        # Reused stems still go through the measurement cache:
+                        # by fingerprint they hit; if a key is missing they are
+                        # measured from the archived audio instead of re-rendered.
+                        for adopted_row in reused_items:
+                            stage_by_guid[str(adopted_row["source_guid"])] = TRACK_SIGNAL_STAGE
+                        submit_cached([(str(row["source_guid"]), str(row["path"]))
+                                       for row in reused_items])
             batch_plan = plan_capture_batches(tracks, digest)
-            full_project_render = (batch_plan.fallback_reason is not None or
-                                   len(batch_plan.batches) <= 1)
-            if full_project_render:
-                planned_batches: list[tuple[list[str], int | None]] = [
-                    (all_guids, None)]
+            if incremental and incremental_info.get("previous_capture"):
+                # D1 renders only the dirty subset; the master is always fresh.
+                planned_batches: list[tuple[list[str], int | None]] = (
+                    [(list(dirty_guids), None)] if dirty_guids else [])
+                full_project_render = False
+            elif batch_plan.fallback_reason is not None or len(batch_plan.batches) <= 1:
+                full_project_render = True
+                planned_batches = [(all_guids, None)]
             else:
+                full_project_render = False
                 planned_batches = [
                     (list(batch.guids), index)
                     for index, batch in enumerate(batch_plan.batches, 1)
@@ -599,12 +820,29 @@ class FullCaptureService:
             for batch_guids, batch_number in planned_batches:
                 job_suffix = ("batch" if batch_number is None
                               else f"batch-{batch_number}")
-                rendered = self._render_batch(
-                    current, workspace, f"{workspace.job_id}-{job_suffix}",
-                    len(batch_guids), start_s, end_s, channels, sample_rate,
-                    tail_ms,
-                    track_guids=(None if full_project_render else batch_guids),
-                )
+                try:
+                    rendered = self._render_batch(
+                        current, workspace, f"{workspace.job_id}-{job_suffix}",
+                        len(batch_guids), start_s, end_s, channels, sample_rate,
+                        tail_ms,
+                        track_guids=(None if full_project_render else batch_guids),
+                    )
+                except StaleContext:
+                    # The capture itself bumps change_count (render settings and
+                    # mute restore, R4).  Re-read the revision and retry once;
+                    # the semantic digest is what authorises the render, not the
+                    # counter.
+                    current_digest = self.bridge.project_digest(revision.project_id)
+                    if current_digest.get("sha256") != digest.get("sha256"):
+                        raise
+                    refreshed = self.session.snapshot(include_items=False).get("revision") or {}
+                    current = ProjectRevision.from_dict(refreshed)
+                    rendered = self._render_batch(
+                        current, workspace, f"{workspace.job_id}-{job_suffix}",
+                        len(batch_guids), start_s, end_s, channels, sample_rate,
+                        tail_ms,
+                        track_guids=(None if full_project_render else batch_guids),
+                    )
                 current = ProjectRevision.from_dict(rendered["revision_after"])
                 admitted = self._admit_track_batch(
                     rendered, batch_guids, tracks_by_guid, workspace)
@@ -615,8 +853,11 @@ class FullCaptureService:
                 render_ends.append(last_render_end)
                 payloads = [(str(item["source_guid"]), str(item["path"]))
                             for item in admitted]
+                for admitted_item in admitted:
+                    stage_by_guid[str(admitted_item["source_guid"])] = str(
+                        admitted_item.get("stage") or TRACK_SIGNAL_STAGE)
                 if pipeline is not None:
-                    pipeline.submit(payloads)
+                    submit_cached(payloads)
                     if first_submit_at is None:
                         first_submit_at = time.perf_counter()
                     admission_times.append({
@@ -625,6 +866,7 @@ class FullCaptureService:
                         "at_s": round(time.perf_counter() - started, 3),
                     })
 
+            track_items.extend(reused_items)
             track_items.sort(key=lambda item: int(item.get("track_index", -1)))
             if (len(track_items) != len(tracks) or
                     {str(item["source_guid"]) for item in track_items} != set(all_guids)):
@@ -697,7 +939,7 @@ class FullCaptureService:
             payload_guids = [str(item["source_guid"]) for item in rendered_files]
             if pipeline is not None:
                 if not master_submitted:
-                    pipeline.submit([(master_guid, str(master_path))])
+                    submit_cached([(master_guid, str(master_path))])
                     master_submitted = True
                     if first_submit_at is None:
                         first_submit_at = time.perf_counter()
@@ -726,17 +968,27 @@ class FullCaptureService:
                 pipeline.close(wait_workers=True)
                 pipeline_closed = True
                 pool_end = time.perf_counter()
-                missing = [guid for guid in payload_guids
-                           if guid not in results_map]
-                if missing:
-                    raise RuntimeError(
-                        "Analysis results are incomplete: "
-                        + ", ".join(sorted(missing)[:8]))
-                results = [results_map[guid] for guid in payload_guids]
+                payloads_all = [(str(item["source_guid"]), str(item["path"]))
+                                for item in rendered_files]
+                if analysis_cache is not None:
+                    results = merge_cached_results(payloads_all, cache_hits,
+                                                   list(results_map.values()))
+                    store_measured_results(payloads_all, stage_by_guid, results,
+                                           analysis_cache)
+                else:
+                    missing = [guid for guid in payload_guids
+                               if guid not in results_map]
+                    if missing:
+                        raise RuntimeError(
+                            "Analysis results are incomplete: "
+                            + ", ".join(sorted(missing)[:8]))
+                    results = [results_map[guid] for guid in payload_guids]
                 analysis_timing = {
                     "analysis_wall_s": analysis_end - (first_submit_at or started),
                     "analysis_pool_wall_s": pool_end - (pool_created_at or started),
                 }
+                if analysis_cache is not None:
+                    analysis_timing["analysis_cache"] = analysis_cache.stats()
 
             batch_summary = {
                 "files": list(track_items),
@@ -789,6 +1041,10 @@ class FullCaptureService:
                     "source_activity_s": round(source_activity_s, 3),
                     "render_master_s": master_rendered.get("_elapsed_s"),
                     "render_calls": self._profile["render_calls"],
+                    "renders": self._profile["render_calls"],
+                    "incremental_render": incremental_info,
+                    "analyses": sum(1 for item in (results or []) if not item.get("reused")),
+                    "analyses_reused": sum(1 for item in (results or []) if item.get("reused")),
                     "render_per_track_s": dict(self._profile.get("render_times", {})),
                     "batch_render_settings": dict(
                         batch_summary.get("render_settings_used") or {}),
@@ -800,6 +1056,8 @@ class FullCaptureService:
                     "master_target_count": master_rendered.get("target_count"),
                     "master_file_count": len(master_rendered.get("files") or []),
                     "restore_verification_s": round(restore_end - restore_start, 3),
+                    **(({"analysis_cache": (analysis_timing or {})["analysis_cache"]}
+                        if (analysis_timing or {}).get("analysis_cache") else {})),
                     **overlap_timing,
                 },
                 analysis_results=results,
@@ -1547,7 +1805,32 @@ class FullCaptureService:
                 requested=analysis_workers)
             workers = worker_plan.workers
             pool_started = time.perf_counter()
-            results = _analyze_rendered_files(payloads, workers)
+            cache = self._analysis_cache(section[0], section[1])
+            if cache is not None:
+                master_row = next((row for row in rendered_files
+                                   if row.get("is_master")), {})
+                fingerprints = self._render_fingerprints(
+                    project_id=revision.project_id, digest=digest,
+                    track_guids=[str(row["source_guid"]) for row in rendered_files
+                                 if not row.get("is_master")],
+                    master_guid=str(master_row.get("source_guid") or ""),
+                    start_s=section[0], end_s=section[1],
+                    project_length_s=float(context.get("length_s") or 0.0))
+                stage_map = {
+                    str(item["source_guid"]): str(
+                        item.get("stage")
+                        or (MASTER_SIGNAL_STAGE if item.get("is_master")
+                            else TRACK_SIGNAL_STAGE))
+                    for item in rendered_files
+                }
+                hits, misses = split_cached_payloads(payloads, stage_map, cache,
+                                                     fingerprints)
+                measured = _analyze_rendered_files(misses, workers) if misses else []
+                results = merge_cached_results(payloads, hits, measured)
+                store_measured_results(payloads, stage_map, results, cache)
+                self._profile["analysis_cache"] = cache.stats()
+            else:
+                results = _analyze_rendered_files(payloads, workers)
             pool_elapsed = time.perf_counter() - pool_started
         else:
             results = list(analysis_results)
@@ -1596,6 +1879,13 @@ class FullCaptureService:
                 "render_s": item.get("render_s"),
                 "soloed_guid": item.get("soloed_guid"),
             })
+            if item.get("reused"):
+                audio[-1].update({
+                    "reused": True,
+                    "reused_from_capture": item.get("reused_from_capture"),
+                    "render_key": item.get("render_key"),
+                    "capture_method": "reused_archived_render",
+                })
             analysis[guid] = report
         coverage = {name: True for name in REQUIRED_MAP_KEYS - {"coverage"} | {"audio", "analysis"}}
         time_window = {

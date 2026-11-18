@@ -110,7 +110,12 @@ def test_server_instructions_state_the_complete_panorama_and_delta_path() -> Non
     text = mcp_server.server.instructions or ""
     assert "size-independent" in text
     assert "reaper_panorama_open()" in text
-    assert "fetching every declared page" in text
+    # A whole-project claim still needs every page; an edit does not.
+    assert "every declared page acknowledged" in text
+    assert "structural token" in text
+    assert "not a full panorama" in text
+    assert "or edit requires fetching every declared page" not in text
+    assert "work mode" in text.lower() or "work mode" in text
     assert "page_id_pattern" in text
     assert "manifest_sha256" in text
     assert "status=change_page" in text

@@ -597,11 +597,6 @@ def build_structural_delta(*, kind: str, project_id: str, base: Mapping[str, Any
     else:
         render = compare_render_manifests(base_manifest, after_manifest)
 
-    master_id = None
-    for row in _list(base_manifest.get("sources")):
-        if isinstance(row, Mapping) and row.get("scope") == "master":
-            master_id = str(row.get("source_id") or "") or None
-            break
     if scope == "unknown" or not render.get("authoritative"):
         invalidated_sources = sorted(_source_guids(base_document))
         fresh_sources: list[str] = []

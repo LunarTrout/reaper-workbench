@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Mapping
 
-from .edit_map import (Onset, _cluster, _confidence, _group, _nearest_beat,
+from .edit_map import (Onset, _cluster, _confidence, _nearest_beat,
                        tempo_grid)
 
 

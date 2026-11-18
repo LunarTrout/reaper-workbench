@@ -13,8 +13,8 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from .gates import check, gate_values
-from .measure import FEATURE_NAMES, measure_signal
+from .gates import check
+from .measure import measure_signal
 from .model import CorpusModel
 
 

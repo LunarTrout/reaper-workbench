@@ -17,13 +17,12 @@ windows where the original is closer, and the median distance ratio.
 
 from __future__ import annotations
 
-from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 
-from .degrade import DEGRADATIONS, degrade
+from .degrade import DEGRADATIONS
 from .measure import FEATURE_NAMES, measure_signal, windows
 from .model import CorpusModel
 

@@ -1560,7 +1560,6 @@ class ProjectSession:
         tail_s = tail_ms / 1000.0
 
         result: dict[str, Any] | None = None
-        captured: dict[str, Any] | None = None
         with self.capture_audio(
             artifact_root, include_fx_params=include_fx_params,
             timeout_s=timeout_s, section=section, capture_mode=capture_mode,

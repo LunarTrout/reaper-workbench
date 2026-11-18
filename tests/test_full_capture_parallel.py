@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+
+def _coarse_digest(fields=None):
+    """A schema-valid coarse digest: the payload is empty but the envelope is
+    complete, which is what the render-dependency code validates."""
+    from reaper_audio.context.revision import DIGEST_REQUIRED_FIELDS, DIGEST_VERSION
+    return {"digest_version": DIGEST_VERSION, "change_count": 0,
+            "coverage": {name: False for name in DIGEST_REQUIRED_FIELDS},
+            "missing": sorted(DIGEST_REQUIRED_FIELDS),
+            "fields": dict(fields or {})}
+
 import json
 from pathlib import Path
 
@@ -124,7 +134,7 @@ def test_restore_report_verifies_edit_cursor_not_observed_play_position() -> Non
     report = FullCaptureService._restore_report(
         before=_restore_context(cursor=33.6, play_position=12.020136),
         after=_restore_context(cursor=33.6, play_position=29.992381),
-        before_digest={"fields": {}}, after_digest={"fields": {}},
+        before_digest=_coarse_digest(), after_digest=_coarse_digest(),
         revision_before=revision, revision_after=revision,
         last_render={"restore_report": {"dirty_before": 0, "dirty_after": 0}},
     )
@@ -143,7 +153,7 @@ def test_restore_report_fails_if_edit_cursor_moved() -> None:
     report = FullCaptureService._restore_report(
         before=_restore_context(cursor=33.6, play_position=12.0),
         after=_restore_context(cursor=34.0, play_position=12.0),
-        before_digest={"fields": {}}, after_digest={"fields": {}},
+        before_digest=_coarse_digest(), after_digest=_coarse_digest(),
         revision_before=revision, revision_after=revision,
         last_render={"restore_report": {"dirty_before": 0, "dirty_after": 0}},
     )

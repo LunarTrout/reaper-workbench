@@ -708,8 +708,8 @@ def _time_summary(times: Any, values: Any, *, units: str,
                    if isinstance(values, (list, tuple)) else [])
     n = min(len(times_list), len(values_list))
     times_list, values_list = times_list[:n], values_list[:n]
-    duration = (times_list[-1] - times_list[0]) if n else None
-    requested_levels = list(levels) if levels else _curve_levels(duration)
+    span = (times_list[-1] - times_list[0]) if n else 0.0
+    requested_levels = list(levels) if levels else _curve_levels(span)
     result_levels: list[dict[str, Any]] = []
     for level in requested_levels:
         result_levels.append({
@@ -782,7 +782,6 @@ def _quantile_time_summary(times: Any, values: Any, *, units: str,
                    if isinstance(values, (list, tuple)) else [])
     n = min(len(times_list), len(values_list))
     times_list, values_list = times_list[:n], values_list[:n]
-    duration = (times_list[-1] - times_list[0]) if n else None
     result_levels = []
     for level in levels:
         result_levels.append({
@@ -1188,9 +1187,7 @@ def _coverage(project_map: Mapping[str, Any], data: Mapping[str, Any],
     raw_tracks = project_map.get("tracks") if isinstance(project_map.get("tracks"), list) else []
     raw_master = project_map.get("master") if isinstance(project_map.get("master"), Mapping) else {}
     raw_items = project_map.get("items") if isinstance(project_map.get("items"), list) else []
-    raw_takes = project_map.get("takes") if isinstance(project_map.get("takes"), list) else []
     raw_midi = project_map.get("midi") if isinstance(project_map.get("midi"), list) else []
-    raw_fx = project_map.get("fx") if isinstance(project_map.get("fx"), list) else []
     expected_takes = 0
     for item in raw_items:
         if isinstance(item, Mapping):
@@ -1646,8 +1643,7 @@ def _relations_domain(
 def build_panorama(record: Any, *, record_path: str | Path | None = None,
                    max_bytes: int = DEFAULT_MAX_BYTES,
                    max_tokens: int = DEFAULT_MAX_TOKENS,
-                   compact: bool = True,
-                   force_columnar_temporal: bool = False) -> dict[str, Any]:
+                   compact: bool = True) -> dict[str, Any]:
     """Build a deterministic, bounded, self-describing capture panorama.
 
     Shared semantics, units, method, caveats, window and set-level provenance

@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+
+def _coarse_digest(fields=None):
+    """A schema-valid coarse digest: the payload is empty but the envelope is
+    complete, which is what the render-dependency code validates."""
+    from reaper_audio.context.revision import DIGEST_REQUIRED_FIELDS, DIGEST_VERSION
+    return {"digest_version": DIGEST_VERSION, "change_count": 0,
+            "coverage": {name: False for name in DIGEST_REQUIRED_FIELDS},
+            "missing": sorted(DIGEST_REQUIRED_FIELDS),
+            "fields": dict(fields or {})}
+
 import hashlib
 import json
 from pathlib import Path
@@ -281,7 +291,7 @@ def test_build_record_marks_silent_master_invalid(tmp_path: Path) -> None:
         ]
         record = service._build_record(
             capture_id="cap_master_status", created_at="2026-01-01T00:00:00+00:00",
-            producer="test", context=context, digest={"fields": {}},
+            producer="test", context=context, digest=_coarse_digest(),
             revision=revision, revision_after=revision, section=(0.0, 1.0),
             rendered_files=rendered, workspace=workspace,
             restore_report={}, analysis_workers=1,
@@ -326,7 +336,7 @@ def test_expected_silence_record_is_valid_and_archived(tmp_path: Path) -> None:
         ]
         record = service._build_record(
             capture_id="cap_expected_silence", created_at="2026-01-01T00:00:00+00:00",
-            producer="test", context=context, digest={"fields": {}},
+            producer="test", context=context, digest=_coarse_digest(),
             revision=revision, revision_after=revision, section=(0.0, 1.0),
             rendered_files=rendered, workspace=workspace,
             restore_report={}, analysis_workers=1,
