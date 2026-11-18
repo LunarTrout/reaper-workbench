@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 
 def _coarse_digest(fields=None):
     """A schema-valid coarse digest: the payload is empty but the envelope is
@@ -61,12 +63,21 @@ def test_analysis_parallel_is_byte_and_order_identical(tmp_path: Path) -> None:
 
 
 def test_analysis_worker_count_is_bounded() -> None:
+    # The policy also caps by the machine's CPU count, so the expected number is
+    # derived from this runner instead of being hardcoded (CI has 2 cores).
+    cpu = os.cpu_count() or 1
+    plenty = 64 * 1024 ** 3  # isolate CPU capping from the memory heuristic
     assert MAX_ANALYSIS_WORKERS == 8
-    assert _analysis_worker_count(None, 42, window_s=20.0) == 8
-    assert _analysis_worker_count(None, 42, window_s=300.0) == 4
-    assert _analysis_worker_count(None, 42) == 4
-    assert _analysis_worker_count(None, 3, window_s=20.0) == 3
-    assert _analysis_worker_count(4, 42, window_s=300.0) == 4
+    assert _analysis_worker_count(None, 42, window_s=20.0,
+                                  available_memory_bytes=plenty) == min(8, cpu)
+    assert _analysis_worker_count(None, 42, window_s=300.0,
+                                  available_memory_bytes=plenty) == min(4, cpu)
+    assert _analysis_worker_count(None, 42,
+                                  available_memory_bytes=plenty) == min(4, cpu)
+    assert _analysis_worker_count(None, 3, window_s=20.0,
+                                  available_memory_bytes=plenty) == min(3, cpu)
+    assert _analysis_worker_count(4, 42, window_s=300.0,
+                                  available_memory_bytes=plenty) == min(4, cpu)
     with pytest.raises(Exception, match="analysis_workers"):
         _analysis_worker_count(0, 3)
     with pytest.raises(Exception, match="analysis_workers"):
