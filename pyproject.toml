@@ -37,6 +37,7 @@ dependencies = [
   "soundfile>=0.12",
   "pyloudnorm>=0.1",
   "phonometry>=3,<4",
+  "scikit-learn>=1.4",
 ]
 
 [project.urls]
