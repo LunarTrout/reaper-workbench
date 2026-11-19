@@ -3700,6 +3700,12 @@ def reaper_edit(mode: str,
                     auto_calibrated.append(calibration_note)
             parsed.append(EditOperation(kind=kind, target_guid=target_guid,
                                         values=values))
+        if auto_calibrated:
+            # Calibration writes parameters while resolving targets, so the
+            # revision the caller supplied is no longer current; plan against
+            # what the project reports now.
+            fresh = session.snapshot(include_items=False).get("revision") or {}
+            expected = ProjectRevision.from_dict(fresh)
         plan = session.plan(parsed, reason=reason, expected_revision=expected)
         with _LOCK:
             _edit_plans[plan.plan_id] = {"plan": plan, "project_id": project_id,
