@@ -39,6 +39,7 @@ from .analysis_cache_stage import split as split_cached_payloads
 from .analysis_cache_stage import store as store_measured_results
 from .analysis_policy import resolve_analysis_workers, validate_analysis_worker_request
 from .media_preflight import ensure_media_online, unresolved_rows
+from .profile import build_profile
 
 MEASURE_STAGE_VIA_MASTER = "via_master"
 MEASURE_STAGE_MASTER = "master"
@@ -57,6 +58,7 @@ class MeasureService(FullCaptureService):
                 sample_rate: int | None = None,
                 tail_ms: int = 0,
                 analysis_workers: int | None = None,
+                step_s: float | None = None,
                 producer: str = "hermes") -> dict[str, Any]:
         if stage == MEASURE_STAGE_PREMASTER:
             raise ValidationError(
@@ -171,6 +173,19 @@ class MeasureService(FullCaptureService):
                     stage_by_guid[str(row["source_guid"])] = TRACK_SIGNAL_STAGE
             render_s = time.perf_counter() - render_started
 
+            # The rendered file lives in the workspace, which is closed with the
+            # call: read the profile here, while the WAV still exists.
+            profile = None
+            if step_s is not None:
+                if len(item_rows) != 1:
+                    raise ValidationError("profile needs exactly one source",
+                                          details={"sources": len(item_rows)})
+                from ..analysis.audio import load_audio
+                audio = load_audio(str(item_rows[0]["path"]))
+                profile = build_profile(audio.samples, int(audio.sample_rate),
+                                        step_s=float(step_s),
+                                        offset_s=float(start_s or 0.0))
+
             payloads = [(str(row["source_guid"]), str(row["path"])) for row in item_rows]
             window_s = (float(end_s) - float(start_s)
                         if start_s is not None and end_s is not None
@@ -199,7 +214,7 @@ class MeasureService(FullCaptureService):
         unit_ids = store.put_many(units)
         token = store.mint_token(project_id=revision.project_id,
                                  revision=current.to_dict(), units=unit_ids)
-        return {
+        result = {
             "ok": True,
             "operation": "measure",
             "stage": stage,
@@ -220,6 +235,9 @@ class MeasureService(FullCaptureService):
             "project_capture_created": False,
             "producer": producer,
         }
+        if profile is not None:
+            result["profile"] = profile
+        return result
 
     # ------------------------------------------------------------------ #
     def _resolve_sources(self, sources: Sequence[str] | str, *, stage: str,

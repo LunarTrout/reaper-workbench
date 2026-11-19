@@ -45,7 +45,7 @@ if _G.__reaper_audio_bridge_resident and not _G.__reaper_audio_bridge_reloading 
   return
 end
 _G.__reaper_audio_bridge_resident = true
-local bridge_build = "b14-2026-11-19"  -- fx-chain stability probe
+local bridge_build = "b19-2026-11-19"  -- fx-chain stability probe
 -- A second boot inside the same REAPER Lua state must supersede the first:
 -- two loops would both keep heartbeating and the client would see two live
 -- bridges. Every loop compares this token before it reschedules; the newest
@@ -831,10 +831,14 @@ local function envelope_context(env)
     return nil, "point_count_unreadable"
   end
   if point_count > digest_max_envelope_points then return nil, "point_limit" end
+  local scaling = reaper.GetEnvelopeScalingMode(env)
   local points = json.array()
   for index = 0, point_count - 1 do
     local ok, time, value, shape, tension = reaper.GetEnvelopePoint(env, index)
     if not ok then return nil, "point_unreadable" end
+    -- The digest speaks amplitude for every envelope, whatever its scaling, so
+    -- a written 1.288 dB target never reads back as a fader position.
+    if scaling == 1 then value = reaper.ScaleFromEnvelopeMode(1, value) end
     points[#points + 1] = { index = index, time_s = finite_or_zero(time),
                             value = finite_or_zero(value),
                             shape = finite_or_zero(shape),
@@ -878,6 +882,7 @@ local function envelope_context(env)
     visible = visible,
     armed = armed,
     point_count = point_count,
+    scaling_mode = scaling,
     automation_item_count = item_count,
     points = points,
     automation_items = items,
@@ -2715,7 +2720,7 @@ local function validate_track_values(values)
   local allowed = { name = true, volume = true, pan = true, mute = true,
                     record_arm = true, record_mode = true,
                     record_mode_flags = true, main_send = true,
-                    selected = true }
+                    selected = true, automation_mode = true }
   require_object_values(values, allowed)
   for key, value in pairs(values) do
     if key == "name" then
@@ -2729,6 +2734,10 @@ local function validate_track_values(values)
     elseif key == "pan" then
       if not finite_number(value) or value < -1 or value > 1 then
         fail("validation_error", "track pan must be between -1 and 1")
+      end
+    elseif key == "automation_mode" then
+      if not finite_number(value) or value % 1 ~= 0 or value < 0 or value > 5 then
+        fail("validation_error", "track automation_mode must be an integer from 0 to 5")
       end
     elseif key == "record_mode" then
       if not finite_number(value) or value % 1 ~= 0 or value < 0 or value > 8 then
@@ -2983,7 +2992,7 @@ local function validate_item_split_values(values)
 end
 
 local function validate_envelope_values(values)
-  require_object_values(values, { envelope = true, points = true, clear = true },
+  require_object_values(values, { envelope = true, points = true, clear = true, active = true },
                         { envelope = true, points = true })
   if type(values.envelope) ~= "string" or values.envelope == "" then
     fail("validation_error", "envelope.set requires an envelope name")
@@ -3346,9 +3355,15 @@ local function read_edit_state(project, operation)
       elseif key == "selected" then state.selected = reaper.IsTrackSelected(target)
       elseif key == "mute" or key == "record_arm" or key == "main_send" then
         state[key] = reaper.GetMediaTrackInfo_Value(target, fields[key]) ~= 0
+      elseif key == "automation_mode" then
+        state.automation_mode = reaper.GetTrackAutomationMode(target)
       else
         state[key] = reaper.GetMediaTrackInfo_Value(target, fields[key])
       end
+    end
+    if values.automation_mode ~= nil then
+      reaper.SetTrackAutomationMode(target, math.floor(values.automation_mode))
+      state.automation_mode_after = reaper.GetTrackAutomationMode(target)
     end
   elseif kind == "item.set" then
     local fields = { position_s = "D_POSITION", length_s = "D_LENGTH", mute = "B_MUTE",
@@ -3855,9 +3870,14 @@ local function apply_edit(project, inspected)
       reaper.DeleteEnvelopePointRange(envelope, 0,
                                       reaper.GetProjectLength(project) + 1)
     end
+    local scaling = reaper.GetEnvelopeScalingMode(envelope)
     for index, point in ipairs(values.points) do
+      -- A fader-scaled volume envelope expects a scaled position, not the
+      -- amplitude the caller wrote; inserting the amplitude directly stores 0.
+      local value = point.value
+      if scaling == 1 then value = reaper.ScaleToEnvelopeMode(1, value) end
       local inserted = reaper.InsertEnvelopePoint(
-        envelope, point.time_s, point.value, point.shape or 0,
+        envelope, point.time_s, value, point.shape or 0,
         point.tension or 0, point.selected or false, true)
       if inserted ~= true then
         fail("transaction_apply_failed", "REAPER rejected an envelope point",
@@ -3865,9 +3885,31 @@ local function apply_edit(project, inspected)
       end
     end
     reaper.Envelope_SortPoints(envelope)
+    reaper.Envelope_SortPointsEx(envelope, 0)
+    local mismatches = {}
+    for index, point in ipairs(values.points) do
+      local ok, evaluated = reaper.Envelope_Evaluate(envelope, point.time_s, 0, 0)
+      local stored = evaluated
+      if scaling == 1 and ok then stored = reaper.ScaleFromEnvelopeMode(1, evaluated) end
+      if not ok or math.abs((stored or 0) - point.value) > 0.002 then
+        mismatches[#mismatches + 1] = { index = index - 1, time_s = point.time_s,
+                                        requested = point.value,
+                                        stored = stored or 0 }
+      end
+    end
+    if #mismatches > 0 then
+      fail("envelope_write_mismatch",
+           "REAPER stored different envelope values than requested",
+           { mismatches = mismatches, scaling_mode = scaling })
+    end
+    if values.active ~= nil then
+      reaper.GetSetEnvelopeInfo_String(envelope, "ACTIVE",
+                                       values.active and "1" or "0", true)
+    end
     reaper.UpdateArrange()
     return { changed = true, envelope = values.envelope,
-             points_inserted = #values.points, cleared = values.clear == true }
+             points_inserted = #values.points, cleared = values.clear == true,
+             verified = #values.points, scaling_mode = scaling }
   elseif kind == "tempo.set" then
     local time_s = values.time_s or 0.0
     if values.remove == true then

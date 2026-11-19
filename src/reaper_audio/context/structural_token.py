@@ -133,8 +133,19 @@ def register_self_noise(project_id: str, before: int, after: int) -> None:
 
 
 def _explained_by_self_noise(project_id: str, minted: int, current: int) -> bool:
-    return any(before == minted and after == current
-               for before, after in _SELF_NOISE.get(project_id, []))
+    """True when the counter walked from minted to current only through our own
+    measurements.  Back-to-back measures chain (708→774→840), so the check walks
+    the recorded jumps instead of matching one pair."""
+    jumps = list(_SELF_NOISE.get(project_id, []))
+    reachable = {int(minted)}
+    changed = True
+    while changed:
+        changed = False
+        for before, after in jumps:
+            if before in reachable and after not in reachable:
+                reachable.add(after)
+                changed = True
+    return int(current) in reachable
 
 
 def require(session: Any, project_id: str, token: str | None) -> dict[str, Any]:

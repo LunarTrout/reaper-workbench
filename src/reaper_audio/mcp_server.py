@@ -34,6 +34,7 @@ from .analysis.edit_map_report import (build_edit_map_from_report,
                                        tempo_points_from_report)
 from .analysis.mix_evidence import build_mix_evidence
 from .analysis.metrics import measure_audio
+from .daw.leveling import plan_curve
 from .daw.session import EditOperation, EditPlan, ProjectRevision, ProjectSession
 from .daw.full_capture import FullCaptureService
 from .daw.measure import MeasureService
@@ -3659,6 +3660,7 @@ def reaper_edit(mode: str,
             raise ValidationError("preview requires a short reason")
         parsed = []
         auto_calibrated: list[dict[str, Any]] = []
+        leveling: list[dict[str, Any]] = []
         for index, operation in enumerate(operations):
             if not isinstance(operation, dict):
                 raise ValidationError("Each operation must be an object",
@@ -3669,6 +3671,25 @@ def reaper_edit(mode: str,
             kind = str(operation.get("kind", ""))
             target_guid = str(operation.get("target_guid", ""))
             values = operation.get("values", {})
+            if kind == "envelope.level":
+                if not isinstance(values, Mapping):
+                    raise ValidationError("envelope.level needs an object of values")
+                segments = values.get("segments") or []
+                target_db = values.get("target_db")
+                if target_db is None:
+                    raise ValidationError("envelope.level needs target_db "
+                                          "(take it from the measured profile)")
+                points, moves = plan_curve(
+                    segments, target_db=float(target_db),
+                    max_gain_db=float(values.get("max_gain_db", 6.0)),
+                    smooth_s=float(values.get("smooth_s", 0.15)))
+                leveling.append({"target_db": round(float(target_db), 2),
+                                 "max_gain_db": float(values.get("max_gain_db", 6.0)),
+                                 "moves": moves})
+                values = {"envelope": str(values.get("envelope", "Volume")),
+                          "points": points, "clear": values.get("clear", True),
+                          "active": True}
+                kind = "envelope.set"
             if (kind == "fx.set_parameter" and isinstance(values, Mapping)
                     and "target" in values):
                 values, calibration_note = _resolve_parameter_targets(
@@ -3698,6 +3719,8 @@ def reaper_edit(mode: str,
                               "expected_revision": plan.revision.to_dict()}}
         if auto_calibrated:
             response["auto_calibrated"] = auto_calibrated
+        if leveling:
+            response["leveling"] = leveling
         return response
     if not isinstance(plan_id, str) or not plan_id:
         raise ValidationError(f"{mode} requires plan_id returned by preview")
@@ -5496,6 +5519,7 @@ def reaper_measure(archive_root: str,
                    sample_rate: int | None = None,
                    tail_ms: int = 0,
                    analysis_workers: int | None = None,
+                   step_s: float | None = None,
                    bridge_session_id: str | None = None) -> dict[str, Any]:
     """Measure only the requested sources over a caller-declared interval.
 
@@ -5522,7 +5546,8 @@ def reaper_measure(archive_root: str,
     service = MeasureService(session, archive_root)
     result = service.measure(sources=sources, section=section, stage=stage,
                              channels=channels, sample_rate=sample_rate,
-                             tail_ms=tail_ms, analysis_workers=analysis_workers)
+                             tail_ms=tail_ms, analysis_workers=analysis_workers,
+                             step_s=step_s)
     after = (result.get("revision") or {}) if isinstance(result, dict) else {}
     assert_project = str(before.get("project_id") or after.get("project_id") or "")
     if before.get("change_count") is not None and after.get("change_count") is not None:
