@@ -46,7 +46,7 @@ is tracked separately in [validation](docs/VALIDATION.md).
 
 ### Audio analysis
 
-- Capture separate track render outputs and a separate master output through REAPER's offline render mechanism.
+- Capture separate track render outputs and a separate master output through REAPER's offline render mechanism. Re-rendering is incremental by default: only sources whose render fingerprint changed are rendered again, and the master is always rendered.
 - Attach source identity, project revision, time range, render provenance, and available mixer context to the analysis report.
 - Run the integrated measurement suite for the captured sources: level and loudness, dynamics, spectral balance, stereo and phase relationships, transients, temporal profiles, tempo context, and source/reference comparisons.
 - Compare a project source with another file or a selected time window from a reference file.
@@ -113,7 +113,7 @@ The actual report also carries project tempo at each timeline cell, FX/routing c
 
 ### LLM-facing interface
 
-The MCP server currently exposes **36 tools**, **5 resource templates** and **2 static resources**. The interface covers project-context delivery (open, page, acknowledge, exact query, status, change updates and refresh), a plan-bound candidate render (`reaper_render_candidate`), capability discovery, integrated analysis, supported edit batches, listener/spatial diagnostics, timeline context, and lower-level REAPER API functions or Actions. Candidate rendering uses REAPER's native master path and checks settings restoration and project state; if the check detects a mismatch, the WAV is deleted and the request fails closed. Live comparison against a normal REAPER render is still an open validation item; see [Validation status](docs/VALIDATION.md). The server does not publish one tool per ReaScript function.
+The MCP server currently exposes **36 tools**, **5 resource templates** and **2 static resources**. The interface covers project-context delivery (open, page, acknowledge, exact query, status, change updates and refresh), a plan-bound candidate render (`reaper_render_candidate`), capability discovery, integrated analysis, supported edit batches, listener/spatial diagnostics, timeline context, and lower-level REAPER API functions or Actions. Work modes (`strict`/`advisory`/`off`), the stale-share threshold and the lock are set by the user and reported in every response; an edit is authorised by a cheap structural token rather than a full capture. Candidate rendering uses REAPER's native master path and checks settings restoration and project state; if the check detects a mismatch, the WAV is deleted and the request fails closed. Live comparison against a normal REAPER render is still an open validation item; see [Validation status](docs/VALIDATION.md). The server does not publish one tool per ReaScript function.
 
 Project context starts with one complete panorama bound to a capture and revision. `reaper_panorama_open` returns the full view when it fits; otherwise it returns page 1 and a manifest, and the model fetches every remaining page before acknowledging the exact view and receiving its context token. Pagination preserves the bounded projection without transport truncation; dense time series are summarized and linked to exact archived data. Page count adapts to the configured response budget. The token represents the latest project state delivered to the model. After a typed edit, the normal `change_update` contains only added, changed or removed facts, using stable object IDs and the new current values; unchanged facts and the original panorama are not repeated. The update carries its successor token, so the model merges it into its known state instead of reloading the whole view after each edit. Oversized updates are delivered completely in pages and advance the token only after acknowledgement. If continuity is lost or cannot be proven, `reaper_panorama_refresh` opens a new full view. An explicit comparison of two archived captures is separate from these current-state updates; it reports factual changes and comparability, never a quality verdict. Numeric audio-metric comparisons are also separate from project-state updates. The receipt guarantees delivery of the exact view pages, not that a model read or understood them.
 
@@ -125,8 +125,10 @@ The model-facing contract is intentionally broader than preset musical workflows
 
 - Begin from the delivered whole-project view for the exact revision: fetch
   every page in the manifest and acknowledge them. Until `reaper_panorama_ack`
-  returns `complete`, the map is partial and no analysis or edit is allowed.
-  Exact queries fetch detail behind the map; they never replace it.
+  returns `complete`, the map is partial and no audio analysis is allowed; a
+  structural edit needs a current structural token (or a panorama receipt), not
+  the complete map. Exact queries fetch detail behind the map; they never
+  replace it.
 - Choose capabilities from the user's goal and the observed evidence. A full
   capability surface is not an instruction to run every analyzer or add FX.
 - Keep project facts, measured signal properties, model hypotheses and the
