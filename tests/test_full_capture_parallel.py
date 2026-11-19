@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 
 
 def _coarse_digest(fields=None):
@@ -63,26 +62,28 @@ def test_analysis_parallel_is_byte_and_order_identical(tmp_path: Path) -> None:
 
 
 def test_analysis_worker_count_is_bounded() -> None:
-    # The policy also caps by the machine's CPU count, so the expected number is
-    # derived from this runner instead of being hardcoded (CI has 2 cores).
-    cpu = os.cpu_count() or 1
-    plenty = 64 * 1024 ** 3  # isolate CPU capping from the memory heuristic
+    # The policy derives workers from the window class, the asset count and the
+    # available memory — never from a fixed number. Pin memory so the expected
+    # values are deterministic on any runner, then check the environment path
+    # only against its declared bounds.
+    plenty = 64 * 1024 ** 3
     assert MAX_ANALYSIS_WORKERS == 8
     assert _analysis_worker_count(None, 42, window_s=20.0,
-                                  available_memory_bytes=plenty) == min(8, cpu)
+                                  available_memory_bytes=plenty) == 8
     assert _analysis_worker_count(None, 42, window_s=300.0,
-                                  available_memory_bytes=plenty) == min(4, cpu)
+                                  available_memory_bytes=plenty) == 4
     assert _analysis_worker_count(None, 42,
-                                  available_memory_bytes=plenty) == min(4, cpu)
+                                  available_memory_bytes=plenty) == 4
     assert _analysis_worker_count(None, 3, window_s=20.0,
-                                  available_memory_bytes=plenty) == min(3, cpu)
+                                  available_memory_bytes=plenty) == 3
     assert _analysis_worker_count(4, 42, window_s=300.0,
-                                  available_memory_bytes=plenty) == min(4, cpu)
+                                  available_memory_bytes=plenty) == 4
+    # Real machine memory may lower the long-window default, never raise it.
+    assert 1 <= _analysis_worker_count(None, 42, window_s=300.0) <= 4
     with pytest.raises(Exception, match="analysis_workers"):
         _analysis_worker_count(0, 3)
     with pytest.raises(Exception, match="analysis_workers"):
         _analysis_worker_count(MAX_ANALYSIS_WORKERS + 1, 42)
-
 
 def test_analysis_timing_fields_do_not_label_sum_as_dsp_elapsed() -> None:
     fields = _analysis_timing_fields(
