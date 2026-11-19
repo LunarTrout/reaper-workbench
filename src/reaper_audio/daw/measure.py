@@ -47,6 +47,30 @@ MEASURE_STAGE_PREMASTER = "premaster"
 MEASURE_STAGES = (MEASURE_STAGE_VIA_MASTER, MEASURE_STAGE_MASTER)
 
 
+
+def _feeder_guids(digest: Mapping[str, Any], targets: Sequence[str]) -> list[str]:
+    """Tracks that feed the targets through sends, transitively.
+
+    A bus owns no items of its own: rendering only the bus yields silence. The
+    render therefore selects the bus together with every track that sends into
+    it, and the requested sources are filtered back after admission.
+    """
+    rows = {str(track.get("guid")): track
+            for track in (digest.get("fields") or {}).get("tracks") or []}
+    wanted = set(targets)
+    changed = True
+    while changed:
+        changed = False
+        for guid, track in rows.items():
+            if guid in wanted:
+                continue
+            for send in track.get("sends") or []:
+                if str(send.get("dest_guid") or "") in wanted:
+                    wanted.add(guid)
+                    changed = True
+                    break
+    return [guid for guid in wanted if guid not in set(targets)]
+
 class MeasureService(FullCaptureService):
     """Narrow measurement service built on the capture render primitives."""
 
@@ -161,13 +185,18 @@ class MeasureService(FullCaptureService):
                 item_rows = [item]
                 stage_by_guid[master_guid] = MASTER_SIGNAL_STAGE
             else:
+                feeders = _feeder_guids(digest, selected)
+                batch_guids = list(selected) + feeders
                 rendered = self._render_batch(
                     current, workspace, f"{workspace.job_id}-measure",
-                    len(selected), start_s, end_s, channels, sample_rate, tail_ms,
-                    track_guids=None if len(selected) == len(tracks_by_guid) else selected)
+                    len(batch_guids), start_s, end_s, channels, sample_rate, tail_ms,
+                    track_guids=(None if len(batch_guids) == len(tracks_by_guid)
+                                 else batch_guids))
                 current = ProjectRevision.from_dict(rendered["revision_after"])
-                admitted = self._admit_track_batch(rendered, selected, tracks_by_guid,
-                                                    workspace)
+                admitted = self._admit_track_batch(rendered, batch_guids,
+                                                    tracks_by_guid, workspace)
+                admitted = [row for row in admitted
+                            if str(row["source_guid"]) in set(selected)]
                 item_rows = admitted
                 for row in admitted:
                     stage_by_guid[str(row["source_guid"])] = TRACK_SIGNAL_STAGE
