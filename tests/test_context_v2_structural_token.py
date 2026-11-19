@@ -37,7 +37,8 @@ def test_mint_returns_a_token_bound_to_the_map() -> None:
     minted = st.mint(FakeSession(), PROJECT)
     assert minted["structural_token"].startswith("st_")
     assert minted["fingerprint"]["change_count"] == 5
-    assert minted["fingerprint"]["map_sha256"] == "f" * 64
+    assert minted["fingerprint"]["map_sha256"] == st._structural_map_hash(
+        FakeSession().digest(PROJECT))
 
 
 def test_valid_token_is_accepted() -> None:

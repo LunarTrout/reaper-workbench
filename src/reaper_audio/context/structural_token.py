@@ -30,6 +30,11 @@ from .revision import digest_evidence
 
 _TOKEN_PREFIX = "st_"
 _MAX_TOKENS = 512
+# A measurement renders through a temporary project configuration and restores
+# it; REAPER still advances its state counter.  Those exact jumps are recorded
+# here so a token minted before a measure stays valid after it, while any other
+# change still invalidates it.
+_SELF_NOISE: dict[str, list[tuple[int, int]]] = {}
 _SECRET = os.urandom(32)
 _TOKENS: dict[str, dict[str, Any]] = {}
 
@@ -39,11 +44,45 @@ def _canonical(payload: Mapping[str, Any]) -> bytes:
                       separators=(",", ":")).encode("utf-8")
 
 
+_NON_STRUCTURAL_FIELDS = frozenset({"project", "fx_state"})
+# REAPER re-derives beat-attached item positions when render bounds move, so a
+# measurement can shift an item by a few milliseconds.  Rounding keeps the token
+# blind to that drift while a real move (>= 0.1 s) still changes the hash.
+_POSITION_DECIMALS = 1
+
+
+def _stable(value: Any) -> Any:
+    if isinstance(value, float):
+        return round(value, _POSITION_DECIMALS)
+    if isinstance(value, dict):
+        return {key: _stable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_stable(item) for item in value]
+    return value
+
+
+def _structural_map_hash(digest: Mapping[str, Any]) -> str:
+    """Hash the map a mutation depends on, not the render configuration.
+
+    ``fields.project`` carries render and playback settings, which a measurement
+    legitimately changes and restores; including them made every measure look
+    like a structural edit.  Tracks, routing, FX, automation, items and tempo
+    remain part of the hash, so a real change still invalidates the token.
+    """
+    fields = dict(digest.get("fields") or {})
+    for name in _NON_STRUCTURAL_FIELDS:
+        fields.pop(name, None)
+    payload = {"digest_version": digest.get("digest_version"),
+               "fields": _stable(fields),
+               "coverage": dict(digest.get("coverage") or {})}
+    return "sha256:" + hashlib.sha256(_canonical(payload)).hexdigest()
+
+
 def _revision_bits(session: Any, project_id: str) -> tuple[dict[str, Any], dict[str, Any], str]:
     digest = session.digest(project_id)
     context = session.snapshot(include_items=False)
     revision = dict(context.get("revision") or {})
-    map_sha256 = str(getattr(digest_evidence(project_id, digest), "fingerprint", "") or "")
+    map_sha256 = _structural_map_hash(digest)
     return digest, revision, map_sha256
 
 
@@ -84,6 +123,20 @@ def mint(session: Any, project_id: str) -> dict[str, Any]:
     }
 
 
+def register_self_noise(project_id: str, before: int, after: int) -> None:
+    """Remember one revision jump the library itself caused (a measurement)."""
+    if not project_id or after <= before:
+        return
+    jumps = _SELF_NOISE.setdefault(project_id, [])
+    jumps.append((int(before), int(after)))
+    del jumps[:-8]
+
+
+def _explained_by_self_noise(project_id: str, minted: int, current: int) -> bool:
+    return any(before == minted and after == current
+               for before, after in _SELF_NOISE.get(project_id, []))
+
+
 def require(session: Any, project_id: str, token: str | None) -> dict[str, Any]:
     """Fail closed unless the token was minted here for this exact map."""
     if not token:
@@ -108,7 +161,11 @@ def require(session: Any, project_id: str, token: str | None) -> dict[str, Any]:
                      "current_change_count": revision.get("change_count"),
                      "next_action": "mint a fresh token, then retry"})
     current_count = revision.get("change_count")
-    if current_count is not None and int(current_count) != int(payload.get("change_count") or 0):
+    if (current_count is not None
+            and int(current_count) != int(payload.get("change_count") or 0)
+            and not _explained_by_self_noise(project_id,
+                                             int(payload.get("change_count") or 0),
+                                             int(current_count))):
         raise StaleContext(
             "The revision moved since this token was minted",
             details={"gate": "structural_token",

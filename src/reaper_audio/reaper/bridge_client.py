@@ -386,6 +386,24 @@ class ReaperBridge:
         }, timeout_s=timeout_s)
         if not isinstance(result, dict) or not isinstance(result.get("revision"), dict):
             raise BridgeUnavailable("REAPER returned an invalid project context")
+        tracks = result.get("tracks")
+        if isinstance(tracks, list):
+            names = {str(track.get("guid")): track.get("name")
+                     for track in tracks if isinstance(track, dict)}
+            for track in tracks:
+                if not isinstance(track, dict):
+                    continue
+                sends = track.get("sends")
+                if not isinstance(sends, list):
+                    continue
+                for send in sends:
+                    if not isinstance(send, dict):
+                        continue
+                    destination = str(send.get("dest_guid") or "")
+                    if destination:
+                        # A pointer alone tells the reader nothing; the name is
+                        # what makes routing legible without parsing the RPP.
+                        send["dest_name"] = names.get(destination)
         return result
 
     def set_track_mutes(self, *, project_id: str, expected_revision: dict[str, Any],

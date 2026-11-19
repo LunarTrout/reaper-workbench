@@ -28,6 +28,8 @@ from ..errors import (ArtifactCleanupError, BridgeUnavailable,
                       CaptureMasterInvalid, MediaUnresolved, StaleContext,
                       ValidationError)
 from ..models import AudioBuffer, Section
+from ..reaper.window import focus_reaper_window
+from .media_preflight import ensure_media_online, unresolved_rows
 from ..reaper.bridge_client import ReaperBridge
 from ..timebase import MappingStatus
 from .analysis_policy import (resolve_analysis_workers,
@@ -46,41 +48,10 @@ def _main_module_can_spawn() -> bool:
 def _unresolved_source_rows(tracks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return unmuted audio take sources REAPER reports as unresolved.
 
-    The bridge adds ``source_online`` only when it can measure the source.  A
-    missing field is a legacy bridge contract and is left to the bridge's own
-    preflight; an explicit false or zero length/rate/channel count is a
-    fail-closed media state.  Empty tracks and muted items are intentionally
-    silent and are not failures.
+    The rule lives in :mod:`reaper_audio.daw.media_preflight` so the capture path
+    and the repair path can never disagree about what "offline" means.
     """
-    rows: list[dict[str, Any]] = []
-    for track in tracks:
-        if not isinstance(track, Mapping) or bool(track.get("mute")):
-            continue
-        for item in track.get("items") or []:
-            if not isinstance(item, Mapping) or bool(item.get("mute")):
-                continue
-            take = item.get("active_take")
-            if isinstance(take, Mapping) and take.get("is_midi"):
-                continue
-            if "source_online" not in item:
-                continue
-            values = (item.get("source_online"),
-                      item.get("source_length_s"),
-                      item.get("source_sample_rate"),
-                      item.get("source_channels"))
-            if not all(value not in (None, 0, 0.0, False) for value in values):
-                rows.append({
-                    "track_guid": track.get("guid"),
-                    "track_index": track.get("index"),
-                    "track_name": track.get("name"),
-                    "item_guid": item.get("guid"),
-                    "source": (take or {}).get("source") if isinstance(take, Mapping) else None,
-                    "source_online": item.get("source_online"),
-                    "source_length_s": item.get("source_length_s"),
-                    "source_sample_rate": item.get("source_sample_rate"),
-                    "source_channels": item.get("source_channels"),
-                })
-    return rows
+    return unresolved_rows(tracks)
 
 
 def _active_audio_item_count(tracks: list[dict[str, Any]], section: Section | None,
@@ -885,6 +856,7 @@ class ProjectSession:
             raise ValidationError("sample_rate must be a positive integer or None")
         workspace = AudioArtifactWorkspace(artifact_root)
         captured: dict[str, Any] | None = None
+        focus_reaper_window()
         try:
             context = self.snapshot(include_fx_params=include_fx_params)
             revision = ProjectRevision.from_dict(context.get("revision", {}))
@@ -897,10 +869,24 @@ class ProjectSession:
                 raise BridgeUnavailable("REAPER track count does not match its context snapshot")
             unresolved_sources = _unresolved_source_rows(tracks)
             if unresolved_sources:
-                raise MediaUnresolved(
-                    "REAPER reports unmuted take sources with no decodable media",
-                    details={"sources": unresolved_sources},
-                )
+                # REAPER releases media while its window is inactive.  Repair the
+                # host state and prove it by re-reading, instead of telling the
+                # caller to bring media online by hand.
+                preflight = ensure_media_online(self)
+                context = self.snapshot(include_fx_params=include_fx_params)
+                tracks = context.get("tracks") or []
+                unresolved_sources = _unresolved_source_rows(tracks)
+                if unresolved_sources:
+                    raise MediaUnresolved(
+                        "REAPER reports unmuted take sources with no decodable media",
+                        details={
+                            "sources": unresolved_sources,
+                            "preflight": preflight,
+                            "next_action": ("Media stayed offline after focusing REAPER "
+                                            "and running 'Set all media online' (40101); "
+                                            "check the files exist and reopened the project"),
+                        },
+                    )
             digest_before = _bridge_project_digest(self.bridge, revision.project_id)
             capture_revision = _capture_revision(
                 revision.project_id, revision.path, revision.change_count,

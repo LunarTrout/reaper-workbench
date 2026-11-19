@@ -39,7 +39,13 @@ local protocol_version = 1
 -- Bridge contract build. Bumped whenever the resident script's request surface
 -- or its guarantees change, so a client can prove which copy is actually
 -- running before it trusts a reload, a capture or an edit.
-local bridge_build = "b5-2026-11-15"
+-- One resident loop per REAPER process: a second copy exits instead of
+-- opening a second mailbox, which used to split sessions and hide media.
+if _G.__reaper_audio_bridge_resident and not _G.__reaper_audio_bridge_reloading then
+  return
+end
+_G.__reaper_audio_bridge_resident = true
+local bridge_build = "b14-2026-11-19"  -- fx-chain stability probe
 -- A second boot inside the same REAPER Lua state must supersede the first:
 -- two loops would both keep heartbeating and the client would see two live
 -- bridges. Every loop compares this token before it reschedules; the newest
@@ -1024,9 +1030,15 @@ local function send_digest(track)
   local rows = json.array()
   for index = 0, count - 1 do
     local destination = reaper.GetTrackSendInfo_Value(track, 0, index, "P_DESTTRACK")
+    local destination_name = ""
+    if destination then
+      local name_ok, name = reaper.GetTrackName(destination, "")
+      if name_ok then destination_name = name or "" end
+    end
     rows[#rows + 1] = {
       index = index,
       dest_guid = destination and reaper.GetTrackGUID(destination) or "",
+      dest_name = destination_name,
       volume = finite_or_zero(reaper.GetTrackSendInfo_Value(track, 0, index, "D_VOL")),
       pan = finite_or_zero(reaper.GetTrackSendInfo_Value(track, 0, index, "D_PAN")),
       pan_law = finite_or_zero(reaper.GetTrackSendInfo_Value(track, 0, index, "D_PANLAW")),
@@ -1079,6 +1091,17 @@ end
 -- hashed through the digest fingerprint. If a chain cannot be read the whole
 -- fx_state subgroup is reported missing rather than silently downgraded to
 -- parameter values only.
+local function read_fx_chain_block(track)
+  local ok, chunk = reaper.GetTrackStateChunk(track, "", false)
+  if not ok or type(chunk) ~= "string" then return nil, "track_chunk_unreadable" end
+  -- The same project state is spelled <FXCHAIN for tracks and master alike in
+  -- REAPER 7.84, while the saved .rpp writes the master chain as
+  -- <MASTERFXLIST. Accept either so a representation change degrades nothing.
+  local block = chunk_block(chunk, "FXCHAIN")
+  if not block then block = chunk_block(chunk, "MASTERFXLIST") end
+  return block
+end
+
 local function fx_chain_state(track)
   if type(reaper.GetTrackStateChunk) ~= "function" then
     return nil, "track_chunk_api_unavailable"
@@ -1087,22 +1110,31 @@ local function fx_chain_state(track)
   if not finite_number(fx_count) or fx_count < 0 then
     return nil, "fx_count_unreadable"
   end
-  local ok, chunk = reaper.GetTrackStateChunk(track, "", false)
-  if not ok or type(chunk) ~= "string" then return nil, "track_chunk_unreadable" end
-  -- The same project state is spelled <FXCHAIN for tracks and master alike in
-  -- REAPER 7.84, while the saved .rpp writes the master chain as
-  -- <MASTERFXLIST. Accept either so a representation change degrades nothing.
-  local block = chunk_block(chunk, "FXCHAIN")
-  if not block then block = chunk_block(chunk, "MASTERFXLIST") end
+  local block, read_reason = read_fx_chain_block(track)
+  if read_reason then return nil, read_reason end
   if not block then
     if fx_count == 0 then return { fx_count = 0, chunk = "" } end
     return nil, "fx_chain_absent"
   end
   local normalized = normalize_chunk(block, digest_fx_chain_ui_lines)
+  -- Some plug-ins (Kontakt 7 is one) write fresh session identifiers into their
+  -- state every time REAPER serializes the chain.  Those bytes are not project
+  -- state, but hashing them makes every digest differ.  Measure the chain a
+  -- second time: if the normalized text moved, report this track as a declared
+  -- unknown instead of a value that changes on every read.
+  local second_block, second_reason = read_fx_chain_block(track)
+  if second_reason then return nil, second_reason end
+  if second_block then
+    local second = normalize_chunk(second_block, digest_fx_chain_ui_lines)
+    if second ~= normalized then
+      return { fx_count = fx_count, chunk = "", complete = false,
+               unstable = true, reason = "fx_chain_unstable" }
+    end
+  end
   if #normalized > digest_max_fx_chain_chars then
     return nil, "fx_chain_too_large"
   end
-  return { fx_count = fx_count, chunk = normalized }
+  return { fx_count = fx_count, chunk = normalized, complete = true }
 end
 
 local function master_digest(track)
@@ -1173,6 +1205,7 @@ local function project_digest(arguments)
   local fx_state_tracks = json.array()
   local automation_gaps = json.array()
   local fx_state_gaps = json.array()
+  local fx_state_unstable = json.array()
   local seen_envelope = {}
   local fx_ok = true
   local sends_ok = true
@@ -1245,8 +1278,13 @@ local function project_digest(arguments)
     if chain then
       fx_state_tracks[#fx_state_tracks + 1] = {
         track_guid = track_guid, is_master = false, fx_count = chain.fx_count,
-        chunk = chain.chunk, complete = true,
+        chunk = chain.chunk, complete = chain.complete ~= false,
+        unstable = chain.unstable == true,
+        reason = chain.reason,
       }
+      if chain.unstable then
+        fx_state_unstable[#fx_state_unstable + 1] = { track_guid = track_guid }
+      end
     else
       fx_state_ok = false
       fx_state_tracks[#fx_state_tracks + 1] = {
@@ -1483,8 +1521,14 @@ local function project_digest(arguments)
     fx_state_tracks[#fx_state_tracks + 1] = {
       track_guid = master_guid, is_master = true,
       fx_count = master_chain.fx_count, chunk = master_chain.chunk,
-      complete = true,
+      complete = master_chain.complete ~= false,
+      unstable = master_chain.unstable == true,
+      reason = master_chain.reason,
     }
+    if master_chain.unstable then
+      fx_state_unstable[#fx_state_unstable + 1] = { track_guid = master_guid,
+                                                    is_master = true }
+    end
   else
     fx_state_ok = false
     fx_state_tracks[#fx_state_tracks + 1] = {
@@ -1526,6 +1570,7 @@ local function project_digest(arguments)
                                       "FLOATPOS", "WAK", "MULTIFXLINK" }),
       tracks = fx_state_tracks,
       complete = fx_state_ok,
+      unstable = fx_state_unstable,
       gaps = fx_state_gaps,
     },
     project = project_row,
@@ -2359,6 +2404,107 @@ local function action_invoke(arguments)
            changed_project_state = before ~= after,
            change_count_before = before, change_count_after = after,
            note = "Low-level action invoked; inspect resulting project context." }
+end
+
+
+local function midi_velocity_scale(arguments)
+  local project = active_project()
+  local item = resolve_item(project, arguments.item_guid)
+  if not item then
+    fail("item_not_found", "The item is not in the active project",
+         { item_guid = arguments.item_guid })
+  end
+  local take = reaper.GetActiveTake(item)
+  if not take or not reaper.TakeIsMIDI(take) then
+    fail("not_midi", "The active take is not a MIDI take")
+  end
+  local _, note_count = reaper.MIDI_CountEvts(take)
+  local factor = tonumber(arguments.factor) or 1
+  local offset = tonumber(arguments.offset) or 0
+  local jitter = tonumber(arguments.jitter) or 0
+  local pitch_filter = tonumber(arguments.pitch)
+  local start_s = tonumber(arguments.start_s)
+  local end_s = tonumber(arguments.end_s)
+  local changed, unchanged = 0, 0
+  for i = 0, note_count - 1 do
+    local ok, _, _, _, eppq, _, pitch, velocity = reaper.MIDI_GetNote(take, i)
+    if ok then
+      local item_qn = reaper.TimeMap2_timeToQN(project, reaper.GetMediaItemInfo_Value(item, "D_POSITION"))
+      local time_s = reaper.TimeMap2_QNToTime(project, item_qn + eppq)
+      local in_window = (not start_s or time_s >= start_s) and
+                        (not end_s or time_s <= end_s)
+      local pitch_ok = (not pitch_filter) or pitch == pitch_filter
+      if in_window and pitch_ok then
+        local value = velocity * factor + offset
+        if jitter ~= 0 then
+          value = value + jitter * math.sin((i + 1) * 12.9898)
+        end
+        value = math.max(1, math.min(127, math.floor(value + 0.5)))
+        if value ~= velocity then
+          reaper.MIDI_SetNote(take, i, nil, nil, nil, nil, nil, nil, value, true)
+          changed = changed + 1
+        else
+          unchanged = unchanged + 1
+        end
+      else
+        unchanged = unchanged + 1
+      end
+    end
+  end
+  reaper.MIDI_Sort(take)
+  return { changed = changed, unchanged = unchanged, note_count = note_count }
+end
+
+
+local function midi_quantize(arguments)
+  local project = active_project()
+  local item = resolve_item(project, arguments.item_guid)
+  if not item then
+    fail("item_not_found", "The item is not in the active project",
+         { item_guid = arguments.item_guid })
+  end
+  local take = reaper.GetActiveTake(item)
+  if not take or not take or not reaper.TakeIsMIDI(take) then
+    fail("not_midi", "The active take is not a MIDI take")
+  end
+  local grid_s = tonumber(arguments.grid_s)
+  if not finite_number(grid_s) or grid_s <= 0 then
+    fail("validation_error", "grid_s must be a positive number of seconds")
+  end
+  local strength = tonumber(arguments.strength)
+  if strength == nil then strength = 1.0 end
+  if not finite_number(strength) or strength < 0 or strength > 1 then
+    fail("validation_error", "strength must be between 0 and 1")
+  end
+  local pitch_filter = tonumber(arguments.pitch)
+  local item_qn = reaper.TimeMap2_timeToQN(
+    project, reaper.GetMediaItemInfo_Value(item, "D_POSITION"))
+  local _, note_count = reaper.MIDI_CountEvts(take)
+  local changed, unchanged = 0, 0
+  for i = 0, note_count - 1 do
+    local ok, sel, muted, start_qn, end_qn, chan, pitch, velocity =
+      reaper.MIDI_GetNote(take, i)
+    if ok and ((not pitch_filter) or pitch == pitch_filter) then
+      local start_s = reaper.TimeMap2_QNToTime(project, item_qn + start_qn)
+      local target_s = math.floor(start_s / grid_s + 0.5) * grid_s
+      local new_s = start_s + (target_s - start_s) * strength
+      local delta_qn = reaper.TimeMap2_timeToQN(project, new_s) -
+                       reaper.TimeMap2_timeToQN(project, start_s)
+      local new_start = start_qn + delta_qn
+      if math.abs(delta_qn) > 1e-9 then
+        reaper.MIDI_SetNote(take, i, nil, nil, new_start, end_qn + delta_qn,
+                            nil, nil, nil, true)
+        changed = changed + 1
+      else
+        unchanged = unchanged + 1
+      end
+    else
+      unchanged = unchanged + 1
+    end
+  end
+  reaper.MIDI_Sort(take)
+  return { changed = changed, unchanged = unchanged, note_count = note_count,
+           grid_s = grid_s, strength = strength }
 end
 
 local function json_value(value, depth, seen)
@@ -4487,8 +4633,15 @@ local pending_reload = nil
 
 local function bridge_lifecycle(arguments)
   local action = arguments.action
+  if action == "retire" then
+    _G.reaper_bridge_supersede = "retired:" .. tostring(bridge_session_id)
+    os.remove(registry_path)
+    os.remove(registry_path .. ".tmp")
+    os.remove(pulse_path)
+    return { accepted = true, action = "retire", session = bridge_session_id }
+  end
   if action ~= "reload" then
-    fail("validation_error", "lifecycle action must be 'reload'",
+    fail("validation_error", "lifecycle action must be 'reload' or 'retire'",
          { action = tostring(action) })
   end
   local expected = arguments.expected_build
@@ -4552,6 +4705,8 @@ local operations = {
   ["transaction.undo"] = transaction_undo,
   ["actions.list"] = action_list,
   ["action.invoke"] = action_invoke,
+  ["midi.velocity_scale"] = midi_velocity_scale,
+  ["midi.quantize"] = midi_quantize,
   ["api.exists"] = function(arguments)
     local name = arguments.name
     if type(name) ~= "string" then error("name must be a string") end
@@ -4672,7 +4827,9 @@ local function loop()
     -- then ends without rescheduling, so exactly one loop survives. A runtime
     -- failure here leaves no loop at all, which the client reports as a failed
     -- activation instead of silently keeping the old code.
+    _G.__reaper_audio_bridge_reloading = true
     local reloaded, reload_error = pcall(reload.chunk)
+    _G.__reaper_audio_bridge_reloading = nil
     if not reloaded then
       reaper.ShowConsoleMsg("REAPER Workbench reload failed: " ..
                             tostring(reload_error) .. "\n")

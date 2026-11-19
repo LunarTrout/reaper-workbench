@@ -3867,7 +3867,8 @@ class PanoramaLifecycle:
                       operation_facts: Sequence[Mapping[str, Any]] | None,
                       readback_complete: bool,
                       readback_missing: Sequence[str] = (),
-                      target_digest_evidence: Mapping[str, Any] | None = None
+                      target_digest_evidence: Mapping[str, Any] | None = None,
+                      structural_fingerprint: Mapping[str, Any] | None = None
                       ) -> dict[str, Any]:
         """Build, store and return one factual delta for a completed mutation.
 
@@ -3875,8 +3876,28 @@ class PanoramaLifecycle:
         latest": a delta that cannot be tied to the model's current context is
         refused rather than guessed.
         """
-        resolved_token = self._resolve_context_token(context_token)
-        token = self._load_context(resolved_token)
+        if structural_fingerprint is not None:
+            # A structural token authorised this mutation.  It is not a
+            # panorama receipt, so the base context is rebuilt from the
+            # fingerprint the token proved: same project, instance, epoch and
+            # revision.  Everything below then runs unchanged.
+            proven = {key: structural_fingerprint.get(key)
+                      for key in ("change_count", "instance_id", "epoch")}
+            reported = {key: base_revision.get(key) for key in proven}
+            if proven != reported:
+                raise StaleContext(
+                    "The structural token does not describe the base revision",
+                    details={"token": proven, "reported_base": reported})
+            token = {
+                "project_id": project_id,
+                "revision": dict(base_revision),
+                "map_sha256": structural_fingerprint.get("map_sha256"),
+                "source": "structural_token",
+            }
+            resolved_token = "structural:" + str(structural_fingerprint.get("map_sha256") or "")
+        else:
+            resolved_token = self._resolve_context_token(context_token)
+            token = self._load_context(resolved_token)
         self._require_context_identity(token, project_id)
         if str(token.get("project_id")) != project_id:
             raise StaleContext("The context token belongs to another project",
@@ -3901,7 +3922,19 @@ class PanoramaLifecycle:
                          "target_identity": target_identity.to_dict(),
                          "next_action": "capture again and acknowledge the new panorama"})
         capture_id = str(token.get("capture_id") or "")
-        base_document = self._document(capture_id)
+        if structural_fingerprint is not None and not capture_id:
+            # No capture existed at the base revision — that is the point of a
+            # structural token.  The delta is still recorded: it just cannot
+            # name per-object facts, so it is built from the digest alone and
+            # declares the missing base facts instead of inventing them.
+            base_document: Mapping[str, Any] = {
+                "project_id": project_id,
+                "revision": dict(base_revision),
+                "render_manifest": {},
+                "sources": [],
+            }
+        else:
+            base_document = self._document(capture_id)
         facts = token.get("structural_facts")
         if not isinstance(facts, Mapping) or facts.get("available") is not True:
             facts = base_document.get("structural_facts")

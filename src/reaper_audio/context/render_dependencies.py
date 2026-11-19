@@ -276,6 +276,7 @@ def _base_components(*, digest: Mapping[str, Any]) -> dict[str, Any]:
             "item_count": len(track_items),
             "fx_count": len(_as_list(row.get("fx"))),
             "fx_state_complete": chunk_complete,
+            "fx_state_unstable": bool(chunk and chunk.get("unstable") is True),
             "items_complete": all(item.get("state_chunk_complete") is True
                                   for item in track_items),
         }
@@ -299,6 +300,7 @@ def _base_components(*, digest: Mapping[str, Any]) -> dict[str, Any]:
             }),
             "fx_count": len(_as_list(master.get("fx"))),
             "fx_state_complete": master_complete,
+            "fx_state_unstable": bool(master_chunk and master_chunk.get("unstable") is True),
         }
 
     project_settings = _as_mapping(fields.get("project"))
@@ -361,11 +363,13 @@ def _source_components(*, scope: str, track_guid: str | None,
     """Component hashes for one render node plus the reasons that make it weak."""
     unknown: list[str] = []
     digests: dict[str, str] = {}
+    used_guids: set[str] = set()
     track_components: Mapping[str, Any] = components["tracks"]
     if scope == "master":
         dependency_guids = sorted(track_components)
         for guid in dependency_guids:
             row = track_components[guid]
+            used_guids.add(guid)
             digests[f"track:{guid}:track_state"] = row["track_state"]
             digests[f"track:{guid}:items"] = row["items"]
             digests[f"track:{guid}:fx"] = row["fx"]
@@ -386,6 +390,7 @@ def _source_components(*, scope: str, track_guid: str | None,
                                       senders=senders)
         for guid in closure["track"]:
             row = track_components[guid]
+            used_guids.add(guid)
             role = ("self" if guid == track_guid
                     else "sender" if guid in closure["senders"]
                     else "child" if guid in closure["children"]
@@ -397,6 +402,7 @@ def _source_components(*, scope: str, track_guid: str | None,
             if row is None:
                 unknown.append(f"ancestor_state_unreadable:{guid}")
                 continue
+            used_guids.add(guid)
             for key in ("track_state", "fx", "fx_state", "automation"):
                 digests[f"track:{guid}:ancestor:{key}"] = row[key]
         # A folder parent's stem contains its descendants' audio, so their
@@ -408,6 +414,7 @@ def _source_components(*, scope: str, track_guid: str | None,
             if row is None:
                 unknown.append(f"descendant_state_unreadable:{guid}")
                 continue
+            used_guids.add(guid)
             for key in ("track_state", "items", "fx", "fx_state",
                         "automation", "routing"):
                 digests[f"track:{guid}:descendant:{key}"] = row[key]
@@ -423,8 +430,21 @@ def _source_components(*, scope: str, track_guid: str | None,
     digests["project"] = components["project"]
     if not components.get("items_complete", False):
         unknown.append("item_state_chunk_unreadable")
-    if not components.get("fx_state_complete", False):
-        unknown.append("fx_chain_state_unreadable")
+    # A chain whose serialized text is not stable across two reads (some plug-ins
+    # write fresh session identifiers on every serialization) is a declared
+    # unknown for that source only; it must not poison every other source.
+    for guid in sorted(set(used_guids)):
+        row = track_components.get(guid)
+        if row is None or row.get("fx_state_complete", True):
+            continue
+        unknown.append(f"fx_chain_state_unstable:{guid}"
+                       if row.get("fx_state_unstable")
+                       else f"fx_chain_state_unreadable:{guid}")
+    master_state = components.get("master")
+    if isinstance(master_state, Mapping) and master_state.get("fx_state_complete") is False:
+        unknown.append("master_chain_state_unstable"
+                       if master_state.get("fx_state_unstable")
+                       else "master_chain_state_unreadable")
     return dependency_guids, digests, unknown
 
 

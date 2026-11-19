@@ -12,8 +12,10 @@ import json
 import logging
 import os
 import tempfile
+import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass, replace
 from functools import wraps
@@ -38,6 +40,7 @@ from .daw.measure import MeasureService
 from .context.decision_gates import evaluate
 from .context.mode import load_mode, mode_brief, set_locked, set_mode
 from .context.structural_token import mint as mint_structural_token
+from .context.structural_token import register_self_noise
 from .context.structural_token import require as require_structural_token
 from .context.mutation_journal import diff_digests
 from .context.evidence import EvidenceStore
@@ -56,6 +59,9 @@ from .context.lifecycle import (PanoramaLifecycle, _delivered_bytes,
 from .context.panorama import (DEFAULT_MAX_BYTES, DEFAULT_MAX_TOKENS,
                                PANORAMA_SCHEMA_VERSION, build_panorama, load_panorama,
                                panorama_path_for_record)
+from .daw.param_targets import resolve as resolve_parameter_target
+from .context.plugin_state_store import PluginStateStore, chain_fingerprint
+from .context.plugin_summary import PluginDescriptor, summarize
 from .context.panorama_view import DEFAULT_RESPONSE_BYTES
 from .context.revision import digest_evidence
 from .context.identity import identity_from_mapping
@@ -159,7 +165,7 @@ TOOL_SURFACE: dict[str, dict[str, Any]] = {
         "use_when": "at the start of a session, before a risky operation, or on a broken bridge",
         "context": "none (bootstrap); returns the project identity and revision",
         "tools": ["reaper_session", "reaper_checkpoint_save", "reaper_bridge_reload",
-                  "reaper_mode", "reaper_structural_token"],
+                  "reaper_bridge", "reaper_mode", "reaper_structural_token"],
         "not_for": "reading or changing project content",
     },
     "project": {
@@ -204,6 +210,15 @@ TOOL_SURFACE: dict[str, dict[str, Any]] = {
         "tools": ["reaper_measure", "reaper_freshness", "reaper_coverage"],
         "not_for": ("choosing how long to measure, inferring musical sections, or replacing "
                     "a whole-project capture when a global verdict is required"),
+    },
+    "inspect": {
+        "purpose": ("quote an exact evidence token, calibrate a plug-in parameter, "
+                    "or read and reshape a MIDI take"),
+        "use_when": ("a stored measurement must be quoted without rescanning the archive, "
+                     "a value target needs a measured mapping, or velocities must change"),
+        "context": "project_id for MIDI/calibration; archive_root for evidence and calibration",
+        "tools": ["reaper_evidence", "reaper_calibrate", "reaper_midi"],
+        "not_for": "replacing a fresh measurement or editing audio items",
     },
     "edit": {
         "purpose": "preview, apply or undo a revision-bound mutation",
@@ -339,10 +354,10 @@ def _require_panorama_receipt(receipt: str | None, project_id: str,
     if not receipt:
         raise ValidationError(
             "A complete panorama is required before any project mutation",
-            details={"next_action": ("call reaper_panorama_open, fetch every page with "
-                                     "reaper_panorama_page, then reaper_panorama_ack with "
-                                     "all page hashes in order; edits use the receipt's "
-                                     "context_token"),
+            details={"next_action": ("mint a cheap structural token with "
+                                     "reaper_structural_token and pass it as structural_token; "
+                                     "a full panorama (open → every page → ack) is needed only "
+                                     "for audio claims and global verdicts"),
                      "gate": "panorama_completion"})
     lifecycle = _panorama_lifecycle(archive_root)
     return lifecycle.require_receipt(receipt, project_id, expected_revision,
@@ -568,6 +583,14 @@ server = MCPServer(
         "proves the server served these exact pages, not that every text was visible, "
         "that you understood it, or that you heard audio. "
         "The guide resource reaper://guide/model states this protocol in one place. "
+        "Bridge, evidence and MIDI helpers are first-class: reaper_bridge(action=status|cleanup|ensure) "
+        "lists live bridges, retires duplicates and starts REAPER when none answers; exactly one "
+        "resident loop survives per process. reaper_measure reopens offline media itself and returns "
+        "a unique measurement_id, so two identical windows remain two distinct facts. A value target "
+        "(\"25 ms\", \"3:1\") calibrates itself on first use and is cached. reaper_midi reads per-pitch "
+        "statistics, edits velocities and quantises note starts. reaper_evidence returns the units "
+        "behind an evidence token. A measurement no longer invalidates a structural token: its map "
+        "hash ignores render configuration and quantises positions to 0.1 s. "
         "The panorama is a project-wide map, "
         "not full-resolution audio evidence: temporal maps use declared aggregation, and exact series and relation rows "
         "are fetched separately. Check coverage, point counts, resolution, aggregation, units, stage, and provenance. "
@@ -940,11 +963,22 @@ def _mutation_readback(session: ProjectSession, project_id: str) -> dict[str, An
     }
 
 
+def _structural_fingerprint(access: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    """Return the proven fingerprint when a structural token authorised the call."""
+    if isinstance(access, Mapping) and access.get("accepted") == "structural_token":
+        fingerprint = access.get("fingerprint")
+        if isinstance(fingerprint, Mapping):
+            return fingerprint
+    return None
+
+
 def _record_mutation_delta(*, lifecycle: PanoramaLifecycle, kind: str,
                            receipt: str, project_id: str,
                            base_revision: ProjectRevision,
                            session: ProjectSession, scope: str,
-                           operation_facts: list[dict[str, Any]] | None) -> dict[str, Any]:
+                           operation_facts: list[dict[str, Any]] | None,
+                           structural_fingerprint: Mapping[str, Any] | None = None
+                           ) -> dict[str, Any]:
     """Attach one internal mutation record to a successful mutation, or say why not.
 
     A mutation has already happened when this runs.  A delta failure therefore
@@ -975,6 +1009,7 @@ def _record_mutation_delta(*, lifecycle: PanoramaLifecycle, kind: str,
             readback_complete=bool(readback["complete"]),
             readback_missing=readback["missing"],
             target_digest_evidence=readback["evidence"],
+            structural_fingerprint=structural_fingerprint,
         )
     except Exception as exc:  # noqa: BLE001 - mutation already applied
         return {
@@ -985,10 +1020,15 @@ def _record_mutation_delta(*, lifecycle: PanoramaLifecycle, kind: str,
             "error": str(exc),
             "readback": {"complete": bool(readback["complete"]),
                          "missing": readback["missing"]},
-            "next_call": {"tool": "reaper_capture_snapshot", "project_id": project_id,
-                          "then": ("The mutation applied but its context cannot be "
-                                   "proven; capture again before interpreting or "
-                                   "continuing structural edits.")},
+            "next_call": ({"tool": "reaper_structural_token", "project_id": project_id,
+                           "then": ("The mutation applied and the revision advanced. "
+                                    "Mint a fresh structural token to continue editing; "
+                                    "audio evidence stays unknown until a capture.")}
+                          if structural_fingerprint is not None else
+                          {"tool": "reaper_capture_snapshot", "project_id": project_id,
+                           "then": ("The mutation applied but its context cannot be "
+                                    "proven; capture again before interpreting or "
+                                    "continuing structural edits.")}),
         }
     return delta
 
@@ -1580,7 +1620,18 @@ def reaper_session(action: str = "health",
         return {"projects": rows,
                 "clean": all(not row["dirty"] for row in rows),
                 "dirty_count": sum(1 for row in rows if row["dirty"])}
-    return bridge.health(timeout_s=3.0)
+    health = bridge.health(timeout_s=3.0)
+    try:
+        pid = (health.get("project") or {}).get("project_id")
+        if pid:
+            state = bridge.call("project.render_settings.read",
+                                {"project_id": pid}, timeout_s=5.0)
+            dirty = state.get("dirty") if isinstance(state, dict) else None
+            if isinstance(dirty, (int, float)) and not isinstance(dirty, bool):
+                health.setdefault("project", {})["dirty"] = bool(dirty)
+    except Exception:  # noqa: BLE001 - health must not fail over a hint
+        pass
+    return health
 
 
 @server.tool()
@@ -1654,6 +1705,288 @@ def reaper_bridge_reload(timeout_s: float = 45.0,
     )
     result["script_path"] = str(path)
     return result
+
+
+def _bridge_health(session_id: str, timeout_s: float = 2.0) -> dict[str, Any] | None:
+    try:
+        health = ReaperBridge(bridge_session_id=session_id).health(timeout_s=timeout_s)
+    except Exception:
+        return None
+    project = health.get("project") if isinstance(health, Mapping) else None
+    return {"bridge_session_id": session_id,
+            "bridge_build": health.get("bridge_build"),
+            "project_id": (project or {}).get("project_id"),
+            "path": (project or {}).get("path"),
+            "change_count": (project or {}).get("change_count")}
+
+
+@server.tool()
+@_guard
+def reaper_bridge(action: str = "status", project_id: str | None = None,
+                  bridge_session_id: str | None = None,
+                  project_path: str | None = None,
+                  timeout_s: float = 30.0) -> dict[str, Any]:
+    """Discover, tidy up or start the resident REAPER bridge from one place.
+
+    ``status`` lists every live bridge with the project it serves. ``cleanup``
+    retires every duplicate except the one that matches ``project_id`` (or the
+    explicitly named session), which is what makes a second stray copy stop
+    fighting the first. ``ensure`` starts REAPER with ``project_path`` when no
+    bridge answers and waits for one, so a caller never has to remember a
+    startup script.
+    """
+    if action not in {"status", "cleanup", "ensure"}:
+        raise ValidationError("action must be status, cleanup or ensure")
+    if action == "status":
+        instances = []
+        for descriptor in ReaperBridge().discover_instances():
+            session_id = str(descriptor.get("bridge_session_id"))
+            health = _bridge_health(session_id)
+            instances.append(health or {"bridge_session_id": session_id,
+                                        "state": "registered_but_silent"})
+        return {"ok": True, "action": "status", "count": len(instances),
+                "bridges": instances}
+
+    if action == "cleanup":
+        instances = ReaperBridge().discover_instances()
+        keep = bridge_session_id
+        if keep is None and project_id:
+            for descriptor in instances:
+                session_id = str(descriptor.get("bridge_session_id"))
+                health = _bridge_health(session_id) or {}
+                if health.get("project_id") == project_id:
+                    keep = session_id
+                    break
+        if keep is None and instances:
+            keep = str(instances[0].get("bridge_session_id"))
+        retired, failed = [], []
+        for descriptor in instances:
+            session_id = str(descriptor.get("bridge_session_id"))
+            if session_id == keep:
+                continue
+            try:
+                ReaperBridge(bridge_session_id=session_id).call(
+                    "bridge.lifecycle", {"action": "retire"}, timeout_s=5.0)
+                retired.append(session_id)
+            except Exception as error:  # report, never crash cleanup
+                failed.append({"bridge_session_id": session_id,
+                               "error": str(error)})
+        remaining = []
+        for descriptor in ReaperBridge().discover_instances():
+            session_id = str(descriptor.get("bridge_session_id"))
+            remaining.append(_bridge_health(session_id)
+                             or {"bridge_session_id": session_id,
+                                 "state": "registered_but_silent"})
+        return {"ok": not failed, "action": "cleanup", "kept": keep,
+                "retired": retired, "failed": failed, "remaining": remaining}
+
+    live = [descriptor for descriptor in ReaperBridge().discover_instances()
+            if _bridge_health(str(descriptor.get("bridge_session_id")))]
+    if live:
+        return {"ok": True, "action": "ensure", "started": False,
+                "bridges": [descriptor.get("bridge_session_id") for descriptor in live]}
+    executable = Path(os.environ.get("REAPER_EXECUTABLE",
+                                     r"C:/Program Files/REAPER (x64)/reaper.exe"))
+    if not project_path:
+        raise ValidationError(
+            "ensure needs project_path when no bridge is running",
+            details={"next_action": "pass project_path so REAPER can be opened with it"})
+    if not executable.is_file():
+        raise ValidationError("REAPER executable not found",
+                              details={"path": str(executable)})
+    subprocess.Popen([str(executable), str(project_path)])
+    deadline = time.monotonic() + max(5.0, float(timeout_s))
+    while time.monotonic() < deadline:
+        for descriptor in ReaperBridge().discover_instances():
+            session_id = str(descriptor.get("bridge_session_id"))
+            health = _bridge_health(session_id)
+            if health:
+                return {"ok": True, "action": "ensure", "started": True,
+                        "bridge_session_id": session_id,
+                        "project_id": health.get("project_id")}
+        time.sleep(0.5)
+    raise BridgeUnavailable(
+        "REAPER did not expose a bridge before the deadline",
+        details={"project_path": project_path,
+                 "next_action": "check that REAPER started and scripts are enabled"})
+
+
+@server.tool()
+@_guard
+def reaper_evidence(token: str, archive_root: str) -> dict[str, Any]:
+    """Read the units behind an evidence token instead of scanning the archive.
+
+    A token names an exact set of measurements; this returns those units with
+    their metric, value, interval and source, so a caller can quote LUFS or a
+    peak without loading every unit ever stored.
+    """
+    store = EvidenceStore(archive_root)
+    try:
+        record = store.load_token(token)
+    except KeyError as error:
+        raise ValidationError(str(error), details={"token": token,
+                                                   "next_action": "run a measure first"})
+    units = store.get_many(list(record.get("units") or []))
+    return {"ok": True, "token": token, "project_id": record.get("project_id"),
+            "revision": record.get("revision"),
+            "unit_count": len(units),
+            "units": [{"id": unit.get("id"), "metric": unit.get("metric"),
+                       "value": unit.get("value"), "unit": unit.get("unit"),
+                       "interval": unit.get("interval"),
+                       "source_id": unit.get("source_id")}
+                      for unit in units]}
+
+
+@server.tool()
+@_guard
+def reaper_calibrate(track_guid: str, fx_guid: str, archive_root: str,
+                     project_id: str | None = None,
+                     parameters: list[int] | None = None,
+                     points: int = 11) -> dict[str, Any]:
+    """Measure a plug-in parameter so a value target ("25 ms", "3:1") is exact.
+
+    Sweeps normalized positions, records what the plug-in displays, restores the
+    original value and stores the table next to the plug-in summaries. Every
+    later ``fx.set_parameter`` with ``target`` resolves through this table, so
+    nobody has to guess what 0.27 means.
+    """
+    bridge = ReaperBridge()
+    health = bridge.health(timeout_s=5.0)
+    project = health.get("project") or {}
+    project_id = project_id or str(project.get("project_id") or "")
+    if not project_id:
+        raise BridgeUnavailable("REAPER returned no project identity")
+    context = bridge.project_context(project_id, include_items=False,
+                                     include_fx_params=False)
+    track = next((row for row in context.get("tracks") or []
+                  if row.get("guid") == track_guid), None)
+    if track is None:
+        raise ValidationError("track not found", details={"track_guid": track_guid})
+    fx_row = next((row for row in track.get("fx") or []
+                   if row.get("guid") == fx_guid), None)
+    if fx_row is None:
+        raise ValidationError("plug-in not found on the track",
+                              details={"fx_guid": fx_guid})
+    listing = bridge.call("fx.list_params",
+                          {"track_guid": track_guid, "fx_guid": fx_guid})
+    names = {int(row["index"]): str(row.get("name"))
+             for row in listing.get("parameters") or []}
+    wanted = parameters or sorted(names)[:1]
+    store = PluginStateStore(archive_root)
+    measured = []
+    for index in wanted:
+        index = int(index)
+        if index not in names:
+            continue
+
+        def read() -> tuple[float, str]:
+            change_count = bridge.health()["project"]["change_count"]
+            handle = ReaperHandle(kind="MediaTrack", project_id=project_id,
+                                  change_count=change_count, stable_id=track_guid)
+            normalized = float(bridge.call_api("TrackFX_GetParamNormalized", handle,
+                                               int(fx_row["index"]), index).returns[0])
+            formatted = bridge.call_api("TrackFX_GetFormattedParamValue", handle,
+                                        int(fx_row["index"]), index)
+            text = str(formatted.returns[1]) if len(formatted.returns) > 1 else ""
+            return normalized, text
+
+        def write(value: float) -> None:
+            change_count = bridge.health()["project"]["change_count"]
+            handle = ReaperHandle(kind="MediaTrack", project_id=project_id,
+                                  change_count=change_count, stable_id=track_guid)
+            bridge.call_api("TrackFX_SetParamNormalized", handle,
+                            int(fx_row["index"]), index, float(value))
+
+        original, original_text = read()
+        table = []
+        steps = max(3, int(points))
+        for step in range(steps):
+            normalized = step / (steps - 1)
+            write(normalized)
+            _, text = read()
+            table.append({"normalized": round(normalized, 6), "formatted": text})
+        write(original)
+        store.put_calibration(project_id, track_guid, fx_guid, index,
+                              name=names[index], table=table)
+        measured.append({"parameter_index": index, "name": names[index],
+                         "was": original_text, "points": len(table)})
+    return {"ok": True, "track_guid": track_guid, "fx_guid": fx_guid,
+            "measured": measured}
+
+
+@server.tool()
+@_guard
+def reaper_midi(action: str = "notes", item_guid: str | None = None,
+                project_id: str | None = None,
+                pitch: int | None = None,
+                start_s: float | None = None, end_s: float | None = None,
+                factor: float = 1.0, offset: float = 0.0,
+                jitter: float = 0.0,
+                grid_s: float | None = None,
+                strength: float = 1.0) -> dict[str, Any]:
+    """Read a MIDI take or reshape its velocities without leaving MCP.
+
+    ``notes`` returns per-pitch counts and velocity ranges so a caller can see
+    what the kit is doing. ``velocity_scale`` applies a measured factor, offset
+    and deterministic jitter to the named pitch and time window, then sorts the
+    take; it answers with how many notes changed. ``quantize`` snaps note starts
+    to ``grid_s`` seconds with partial ``strength`` (0-1) and keeps lengths.
+    """
+    bridge = ReaperBridge()
+    health = bridge.health(timeout_s=5.0)
+    project = health.get("project") or {}
+    project_id = project_id or str(project.get("project_id") or "")
+    context = bridge.project_context(project_id, include_items=True,
+                                     include_midi_notes=True,
+                                     include_fx_params=False)
+    if action == "notes":
+        rows = []
+        for track in context.get("tracks") or []:
+            for item in track.get("items") or []:
+                take = item.get("active_take") or {}
+                notes = ((take.get("midi") or {}).get("notes")) or []
+                if not notes:
+                    continue
+                by_pitch: dict[int, list[float]] = {}
+                for note in notes:
+                    by_pitch.setdefault(int(note.get("pitch")), []).append(
+                        float(note.get("velocity") or 0))
+                rows.append({"track_name": track.get("name"),
+                             "item_guid": item.get("guid"),
+                             "note_count": len(notes),
+                             "pitches": [{"pitch": key,
+                                          "notes": len(values),
+                                          "velocity_min": min(values),
+                                          "velocity_mean": round(sum(values) / len(values), 1),
+                                          "velocity_max": max(values)}
+                                         for key, values in sorted(by_pitch.items())]})
+        return {"ok": True, "action": "notes", "items": rows}
+    if action == "quantize":
+        if not item_guid:
+            raise ValidationError("quantize needs item_guid")
+        if grid_s is None or float(grid_s) <= 0:
+            raise ValidationError("quantize needs a positive grid_s")
+        payload: dict[str, Any] = {"item_guid": item_guid,
+                                   "grid_s": float(grid_s),
+                                   "strength": float(strength)}
+        if pitch is not None:
+            payload["pitch"] = int(pitch)
+        result = bridge.call("midi.quantize", payload)
+        return {"ok": True, "action": "quantize", **result}
+    if action != "velocity_scale":
+        raise ValidationError("action must be notes, velocity_scale or quantize")
+    if not item_guid:
+        raise ValidationError("velocity_scale needs item_guid")
+    payload: dict[str, Any] = {"item_guid": item_guid, "factor": float(factor),
+                               "offset": float(offset), "jitter": float(jitter)}
+    if pitch is not None:
+        payload["pitch"] = int(pitch)
+    if start_s is not None:
+        payload["start_s"] = float(start_s)
+    if end_s is not None:
+        payload["end_s"] = float(end_s)
+    result = bridge.call("midi.velocity_scale", payload)
+    return {"ok": True, "action": "velocity_scale", **result}
 
 
 @server.tool()
@@ -1810,6 +2143,207 @@ def reaper_api_search(object: str, operation: str,
     return result
 
 
+def _plugin_state_store(archive_root: str | None = None) -> PluginStateStore:
+    root = Path(archive_root or _LAST_PANORAMA_ROOT or
+                os.environ.get("REAPER_CAPTURE_ARCHIVE", "capture-archive")).resolve()
+    return PluginStateStore(root)
+
+
+def _attach_send_routing(session, context: dict[str, Any]) -> dict[str, Any]:
+    """Replace each track's send count with the digest rows, names included.
+
+    ``project.context`` can only say how many sends a track has; the routing
+    itself (destination, level, mode) lives in the digest. Reading it once here
+    turns "sends: 1" into "1 send to FEMALE at 0 dB", which is what a mixer
+    actually needs.
+    """
+    revision = context.get("revision") or {}
+    project_id = str(revision.get("project_id") or "")
+    if not project_id or not context.get("tracks"):
+        return context
+    try:
+        digest = session.bridge.project_digest(project_id)
+    except Exception:
+        return context
+    rows = {str(track.get("guid")): track.get("sends")
+            for track in (digest.get("fields") or {}).get("tracks") or []}
+    for track in context["tracks"]:
+        sends = rows.get(str(track.get("guid")))
+        if isinstance(sends, list):
+            track["send_count"] = track.get("sends")
+            track["sends"] = sends
+    return context
+
+
+def _attach_fx_summaries(*, session: ProjectSession, revision: ProjectRevision,
+                         context: dict[str, Any], archive_root: str | None,
+                         refresh: bool) -> dict[str, Any]:
+    """Attach compact plug-in summaries to every FX row of the selected tracks.
+
+    A cached summary is reused only while the track's serialized FX chain hash
+    matches the digest; otherwise the row says ``stale`` (or ``unverified`` for a
+    chain that cannot be hashed) instead of showing an older state.  ``refresh``
+    reads parameters once, rebuilds the summaries and stores them.
+    """
+    tracks = context.get("tracks") or []
+    if not isinstance(tracks, list) or not tracks:
+        return context
+    store = _plugin_state_store(archive_root)
+    digest = session.digest(revision.project_id) if refresh else None
+    chains: dict[str, tuple[str | None, bool]] = {}
+    if isinstance(digest, Mapping):
+        for row in ((digest.get("fields") or {}).get("fx_state") or {}).get("tracks") or []:
+            if isinstance(row, Mapping):
+                chains[str(row.get("track_guid"))] = (
+                    str(row.get("chunk") or "") or None,
+                    bool(row.get("unstable")))
+    elif not refresh:
+        digest = session.digest(revision.project_id)
+        for row in ((digest.get("fields") or {}).get("fx_state") or {}).get("tracks") or []:
+            if isinstance(row, Mapping):
+                chains[str(row.get("track_guid"))] = (
+                    str(row.get("chunk") or "") or None,
+                    bool(row.get("unstable")))
+
+    def _params(track_guid: str, fx_guid: str) -> list[dict[str, Any]]:
+        """Read one plug-in's parameters; the full-project dump is never needed."""
+        response = session.bridge.call("fx.list_params",
+                                       {"track_guid": track_guid,
+                                        "fx_guid": fx_guid})
+        return [dict(row) for row in (response.get("parameters") or [])]
+
+    for track in tracks:
+        track_guid = str(track.get("guid"))
+        chunk, unstable = chains.get(track_guid, (None, False))
+        current = None if unstable else chain_fingerprint(chunk)
+        for fx in track.get("fx") or []:
+            if not isinstance(fx, dict):
+                continue
+            fx_guid = str(fx.get("guid"))
+            if refresh:
+                try:
+                    parameters = _params(track_guid, fx_guid)
+                except Exception as error:  # noqa: BLE001 - reported, not raised
+                    fx["summary_state"] = "missing"
+                    fx["summary_error"] = f"{type(error).__name__}: {error}"[:200]
+                    continue
+                summary = summarize(PluginDescriptor(name=str(fx.get("name")),
+                                                     active=bool(fx.get("enabled")),
+                                                     parameters=parameters))
+                store.put(revision.project_id, track_guid, fx_guid,
+                          summary=summary, chain_fingerprint=current)
+                fx["summary"] = summary
+                fx["summary_state"] = ("unverified" if current is None
+                                       else "current")
+                continue
+            summary, state = store.status(revision.project_id, track_guid,
+                                          fx_guid, current)
+            if summary is not None:
+                fx["summary"] = summary
+            fx["summary_state"] = state
+    context["fx_summary"] = {
+        "schema": "reaper-workbench.plugin-state-store/1",
+        "mode": "refresh" if refresh else "cache",
+        "note": ("summary_state=current means the chain hash matches the digest; "
+                 "stale/missing means re-read with refresh_fx_summaries=true"),
+    }
+    return context
+
+
+def _calibrate_mapping(bridge, *, project_id: str, track_guid: str,
+                       fx_index: int, index: int, points: int = 7
+                       ) -> tuple[list[dict[str, Any]], str]:
+    """Sweep one parameter and return its normalized -> displayed table."""
+    def read() -> tuple[float, str]:
+        change_count = bridge.health()["project"]["change_count"]
+        handle = ReaperHandle(kind="MediaTrack", project_id=project_id,
+                              change_count=change_count, stable_id=track_guid)
+        normalized = float(bridge.call_api("TrackFX_GetParamNormalized", handle,
+                                           int(fx_index), index).returns[0])
+        formatted = bridge.call_api("TrackFX_GetFormattedParamValue", handle,
+                                    int(fx_index), index)
+        text = str(formatted.returns[1]) if len(formatted.returns) > 1 else ""
+        return normalized, text
+
+    def write(value: float) -> None:
+        change_count = bridge.health()["project"]["change_count"]
+        handle = ReaperHandle(kind="MediaTrack", project_id=project_id,
+                              change_count=change_count, stable_id=track_guid)
+        bridge.call_api("TrackFX_SetParamNormalized", handle,
+                        int(fx_index), index, float(value))
+
+    original, original_text = read()
+    table: list[dict[str, Any]] = []
+    steps = max(3, int(points))
+    for step in range(steps):
+        normalized = step / (steps - 1)
+        write(normalized)
+        _, text = read()
+        table.append({"normalized": round(normalized, 6), "formatted": text})
+    write(original)
+    return table, original_text
+
+
+def _resolve_parameter_targets(*, project_id: str, track_guid: str,
+                               values: Mapping[str, Any],
+                               archive_root: str | None,
+                               bridge: Any | None = None
+                               ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Rewrite ``target="25 ms"`` into the normalized value the plug-in expects.
+
+    The mapping comes from a measured calibration table.  When the table is
+    missing and a bridge is available, the parameter is calibrated once here and
+    cached, so the caller never has to know that value targets need a sweep.
+    """
+    target = values.get("target")
+    fx_guid = values.get("fx_guid")
+    index = values.get("parameter_index")
+    if not isinstance(target, str) or not isinstance(fx_guid, str) or index is None:
+        raise ValidationError("fx.set_parameter target requires fx_guid and parameter_index")
+    index = int(index)
+    store = _plugin_state_store(archive_root)
+    calibration = store.get_calibration(project_id, track_guid, fx_guid, index)
+    note = None
+    if not calibration and bridge is not None:
+        context = bridge.project_context(project_id, include_items=False,
+                                         include_fx_params=False)
+        track = next((row for row in context.get("tracks") or []
+                      if row.get("guid") == track_guid), None)
+        fx_row = next((row for row in (track or {}).get("fx") or []
+                       if row.get("guid") == fx_guid), None)
+        if track is None or fx_row is None:
+            raise ValidationError("track or plug-in not found for the value target",
+                                  details={"track_guid": track_guid,
+                                           "fx_guid": fx_guid})
+        listing = bridge.call("fx.list_params",
+                              {"track_guid": track_guid, "fx_guid": fx_guid})
+        name = next((str(row.get("name")) for row in listing.get("parameters") or []
+                     if int(row.get("index", -1)) == index), f"parameter {index}")
+        table, was = _calibrate_mapping(bridge, project_id=project_id,
+                                        track_guid=track_guid,
+                                        fx_index=int(fx_row["index"]),
+                                        index=index)
+        store.put_calibration(project_id, track_guid, fx_guid, index,
+                              name=name, table=table)
+        calibration = store.get_calibration(project_id, track_guid, fx_guid, index)
+        note = {"parameter_index": index, "name": name, "was": was,
+                "points": len(table), "cached": True}
+    if not calibration:
+        raise ValidationError(
+            "No calibration for this parameter; measure it before using a value target",
+            details={"next_action": ("call reaper_calibrate for this track, plug-in "
+                                     "and parameter index, then retry"),
+                     "fx_guid": fx_guid, "parameter_index": index})
+    try:
+        normalized = resolve_parameter_target(calibration["table"], target)
+    except ValueError as error:
+        raise ValidationError(str(error), details={"target": target,
+                                                   "parameter": calibration.get("name")})
+    resolved = {"fx_guid": fx_guid, "parameter_index": index,
+                "normalized": normalized}
+    return resolved, note
+
+
 @server.tool()
 @_guard
 def reaper_project(project_id: str | None = None,
@@ -1817,6 +2351,8 @@ def reaper_project(project_id: str | None = None,
                    include_items: bool = False,
                    include_fx_params: bool = False,
                    include_midi_notes: bool = False,
+                   include_fx_summary: bool = True,
+                   refresh_fx_summaries: bool = False,
                    track_guids: list[str] | None = None,
                    item_guids: list[str] | None = None,
                    expected_revision: dict[str, Any] | None = None,
@@ -1886,6 +2422,11 @@ def reaper_project(project_id: str | None = None,
                               if item.get("guid") in wanted_items]
             found_items.update(item.get("guid") for item in track["items"])
         context["requested_item_guids_not_found"] = sorted(wanted_items - found_items)
+    context = _attach_send_routing(session, context)
+    if include_fx_summary or refresh_fx_summaries:
+        context = _attach_fx_summaries(session=session, revision=revision,
+                                       context=context, archive_root=archive_root,
+                                       refresh=refresh_fx_summaries)
     bridge_id = session.bridge.bridge_session_id
     context["context_uri"] = (
         f"reaper://projects/{quote(bridge_id or '', safe='')}/"
@@ -3117,6 +3658,7 @@ def reaper_edit(mode: str,
         if not isinstance(reason, str) or not reason.strip():
             raise ValidationError("preview requires a short reason")
         parsed = []
+        auto_calibrated: list[dict[str, Any]] = []
         for index, operation in enumerate(operations):
             if not isinstance(operation, dict):
                 raise ValidationError("Each operation must be an object",
@@ -3124,9 +3666,19 @@ def reaper_edit(mode: str,
             if set(operation) - {"kind", "target_guid", "values"}:
                 raise ValidationError("Operation contains unsupported top-level fields",
                                       details={"operation_index": index})
-            parsed.append(EditOperation(kind=str(operation.get("kind", "")),
-                                        target_guid=str(operation.get("target_guid", "")),
-                                        values=operation.get("values", {})))
+            kind = str(operation.get("kind", ""))
+            target_guid = str(operation.get("target_guid", ""))
+            values = operation.get("values", {})
+            if (kind == "fx.set_parameter" and isinstance(values, Mapping)
+                    and "target" in values):
+                values, calibration_note = _resolve_parameter_targets(
+                    project_id=expected.project_id, track_guid=target_guid,
+                    values=values, archive_root=archive_root,
+                    bridge=session.bridge)
+                if calibration_note:
+                    auto_calibrated.append(calibration_note)
+            parsed.append(EditOperation(kind=kind, target_guid=target_guid,
+                                        values=values))
         plan = session.plan(parsed, reason=reason, expected_revision=expected)
         with _LOCK:
             _edit_plans[plan.plan_id] = {"plan": plan, "project_id": project_id,
@@ -3137,13 +3689,16 @@ def reaper_edit(mode: str,
                 oldest = sorted(_edit_plans.items(), key=lambda pair: pair[1]["created_at"])
                 for expired_id, _ in oldest[:len(_edit_plans) - _MAX_PLAN_CACHE]:
                     _edit_plans.pop(expired_id, None)
-        return {"mode": "preview", "changed": False,
-                "plan": plan.to_dict(),
-                "decision_gate": decision_gate,
+        response = {"mode": "preview", "changed": False,
+                    "plan": plan.to_dict(),
+                    "decision_gate": decision_gate,
                 "next_call": {"tool": "reaper_edit", "mode": "apply",
                               "plan_id": plan.plan_id,
                               "project_id": project_id,
                               "expected_revision": plan.revision.to_dict()}}
+        if auto_calibrated:
+            response["auto_calibrated"] = auto_calibrated
+        return response
     if not isinstance(plan_id, str) or not plan_id:
         raise ValidationError(f"{mode} requires plan_id returned by preview")
     with _LOCK:
@@ -3189,7 +3744,8 @@ def reaper_edit(mode: str,
             lifecycle=_panorama_lifecycle(archive_root), kind="edit",
             receipt=str(panorama_receipt), project_id=project_id,
             base_revision=expected, session=session, scope="known",
-            operation_facts=_edit_operation_facts(result))
+            operation_facts=_edit_operation_facts(result),
+            structural_fingerprint=_structural_fingerprint(access))
         advance = delta.get("advance") if isinstance(delta, Mapping) else None
         token = (str(advance["context_token"])
                  if isinstance(advance, Mapping) and advance.get("context_token") else "")
@@ -3197,10 +3753,29 @@ def reaper_edit(mode: str,
             cached["applied_context_token"] = token
         cached["applied_archive_root"] = archive_root
         if not delta.get("delta_id") or not delta.get("acknowledgeable"):
-            return {"mode": "apply", "plan_id": plan_id, **_access_note(access),
-                    "status": str(delta.get("status") or "unavailable"),
-                    "reason": delta.get("reason"),
-                    "next_call": delta.get("next_call")}
+            next_token: str | None = None
+            if _structural_fingerprint(access) is not None:
+                # The edit was proven by a cheap structural token; the revision
+                # advanced, so mint its successor here instead of sending the
+                # caller back to a capture it does not need.
+                try:
+                    next_token = str(mint_structural_token(session, project_id)
+                                     .get("structural_token") or "") or None
+                except Exception:  # noqa: BLE001 - the edit itself succeeded
+                    next_token = None
+            next_call = delta.get("next_call")
+            if next_token:
+                next_call = {"tool": "reaper_edit", "mode": "apply",
+                             "structural_token": next_token,
+                             "note": ("continue against this token; project audio "
+                                      "stays unknown until a capture")}
+            result = {"mode": "apply", "plan_id": plan_id, **_access_note(access),
+                      "status": str(delta.get("status") or "unavailable"),
+                      "reason": delta.get("reason"),
+                      "next_call": next_call}
+            if next_token:
+                result["structural_token"] = next_token
+            return result
         update = change_update_view(_panorama_lifecycle(archive_root), delta,
                                     context_token=token, project_id=project_id,
                                     revision=applied.to_dict())
@@ -3234,7 +3809,8 @@ def reaper_edit(mode: str,
         lifecycle=_panorama_lifecycle(archive_root), kind="undo",
         receipt=str(panorama_receipt), project_id=project_id,
         base_revision=expected, session=session, scope="known",
-        operation_facts=undo_facts)
+        operation_facts=undo_facts,
+        structural_fingerprint=_structural_fingerprint(access))
     with _LOCK:
         _edit_plans.pop(plan_id, None)
     advance = delta.get("advance") if isinstance(delta, Mapping) else None
@@ -3787,11 +4363,12 @@ def reaper_api_call(name: str,
         if not gate["ok"] and state.mode == "strict":
             return {"ok": False, "blocked": True, "decision_gate": gate,
                     "project_id": project_id, "revision": expected.to_dict()}
+    access: Mapping[str, Any] | None = None
     if not getattr(_API_GATE_BYPASS, "enabled", False):
-        _require_structural_access(session=session, project_id=project_id,
-                                   expected=expected, archive_root=archive_root,
-                                   structural_token=structural_token,
-                                   panorama_receipt=panorama_receipt)
+        access = _require_structural_access(session=session, project_id=project_id,
+                                            expected=expected, archive_root=archive_root,
+                                            structural_token=structural_token,
+                                            panorama_receipt=panorama_receipt)
     if len(values) != len(signature.parameters):
         raise ValidationError("Wrong number of API arguments",
                               details={"name": name,
@@ -3821,6 +4398,7 @@ def reaper_api_call(name: str,
                 lifecycle=_panorama_lifecycle(archive_root), kind="api_call",
                 receipt=str(panorama_receipt), project_id=project_id,
                 base_revision=expected, session=session, scope="unknown",
+                structural_fingerprint=_structural_fingerprint(access),
                 operation_facts=[{
                     "operation_index": 0, "kind": name,
                     "target_guid": None,
@@ -3884,10 +4462,10 @@ def reaper_action(mode: str,
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)
     _current_context(session, expected)
-    _require_structural_access(session=session, project_id=project_id,
-                               expected=expected, archive_root=archive_root,
-                               structural_token=structural_token,
-                               panorama_receipt=panorama_receipt)
+    access = _require_structural_access(session=session, project_id=project_id,
+                                        expected=expected, archive_root=archive_root,
+                                        structural_token=structural_token,
+                                        panorama_receipt=panorama_receipt)
     project_handle = ReaperHandle(kind="ReaProject", project_id=project_id,
                                   change_count=expected.change_count,
                                   stable_id=project_id)
@@ -3912,6 +4490,7 @@ def reaper_action(mode: str,
             lifecycle=_panorama_lifecycle(archive_root), kind="action",
             receipt=str(panorama_receipt), project_id=project_id,
             base_revision=expected, session=session, scope="unknown",
+            structural_fingerprint=_structural_fingerprint(access),
             operation_facts=[{
                 "operation_index": 0, "kind": f"action:{command_id}",
                 "target_guid": None,
@@ -4025,6 +4604,13 @@ def reaper_save(mode: str,
     after = session.snapshot()
     after_revision = after.get("revision") or {}
     changed_identity = (ProjectRevision.from_dict(after_revision) != expected)
+    new_project_id = str(after_revision.get("project_id") or project_id)
+    if new_project_id != project_id:
+        # Summaries are keyed by project_id; a save-as must not throw them away.
+        try:
+            _plugin_state_store(archive_root).migrate(project_id, new_project_id)
+        except Exception:  # noqa: BLE001 - a summary cache must never fail a save
+            pass
     result_value = {
         "result": result,
         "revision": after_revision,
@@ -4932,10 +5518,21 @@ def reaper_measure(archive_root: str,
     if start_s is not None and end_s is not None:
         section = (float(start_s), float(end_s))
     session = _session(project_id, bridge_session_id)
+    before = session.snapshot(include_items=False).get("revision") or {}
     service = MeasureService(session, archive_root)
-    return service.measure(sources=sources, section=section, stage=stage,
-                           channels=channels, sample_rate=sample_rate,
-                           tail_ms=tail_ms, analysis_workers=analysis_workers)
+    result = service.measure(sources=sources, section=section, stage=stage,
+                             channels=channels, sample_rate=sample_rate,
+                             tail_ms=tail_ms, analysis_workers=analysis_workers)
+    after = (result.get("revision") or {}) if isinstance(result, dict) else {}
+    assert_project = str(before.get("project_id") or after.get("project_id") or "")
+    if before.get("change_count") is not None and after.get("change_count") is not None:
+        register_self_noise(assert_project, int(before["change_count"]),
+                            int(after["change_count"]))
+    if isinstance(result, dict):
+        # Two identical calls produce identical bytes; the id keeps each
+        # measurement an individually addressable fact for the client.
+        result.setdefault("measurement_id", uuid.uuid4().hex)
+    return result
 
 
 @server.tool()

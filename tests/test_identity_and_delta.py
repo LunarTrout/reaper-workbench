@@ -572,6 +572,42 @@ def test_two_sequential_edits_advance_without_a_new_capture(tmp_path: Path) -> N
     assert "from_revision" not in ahead and "to_revision" not in ahead
 
 
+def test_structural_token_authorises_a_delta_without_a_panorama(tmp_path: Path) -> None:
+    """An edit proven by a structural token still yields a change update.
+
+    The token is not a panorama receipt, so the delta builder must take its
+    base context from the fingerprint instead of a page-walk token; otherwise
+    every token-authorised edit applies and then reports ``StaleContext``.
+    """
+    root = _archive(tmp_path)
+    _capture(root, "cap_00000001", _revision(1), _digest(change_count=1))
+    lifecycle = PanoramaLifecycle(root, page_bytes=4096)
+    fingerprint = {
+        "project_id": PROJECT_ID,
+        "instance_id": "pri_A",
+        "epoch": 1,
+        "change_count": 1,
+        "map_sha256": "sha256:" + "a" * 64,
+    }
+
+    delta = lifecycle.record_change(
+        kind="edit", context_token="", project_id=PROJECT_ID,
+        base_revision=_revision(1), target_revision=_revision(2),
+        after_digest=_digest(change_count=2, pan_a=-1.0), scope="known",
+        operation_facts=[{"operation_index": 1, "kind": "track.set",
+                          "target_guid": TRACK_A,
+                          "before": {"pan": 0.0}, "after": {"pan": -1.0}}],
+        readback_complete=True, readback_missing=(),
+        structural_fingerprint=fingerprint)
+
+    # Without a base capture the delta is recorded but cannot be acknowledged:
+    # there are no base facts to diff against, so no successor token is minted.
+    assert delta.get("delta_id")
+    assert delta.get("acknowledgeable") is False
+    assert delta.get("refresh_required") is True
+    assert delta.get("audio_evidence", {}).get("state") == "stale"
+
+
 def test_changes_since_current_token_returns_not_modified(tmp_path: Path) -> None:
     """A token already at the newest known revision must not replay history."""
     root = _archive(tmp_path)

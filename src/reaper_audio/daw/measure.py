@@ -30,7 +30,7 @@ from typing import Any
 from ..analysis.artifacts import AudioArtifactWorkspace
 from ..context import contract_v2
 from ..context.evidence import EvidenceStore
-from ..errors import BridgeUnavailable, ValidationError
+from ..errors import BridgeUnavailable, MediaUnresolved, ValidationError
 from .full_capture import (MASTER_SIGNAL_STAGE, TRACK_SIGNAL_STAGE,
                            FullCaptureService, ProjectRevision,
                            _analyze_rendered_files, _number)
@@ -38,6 +38,7 @@ from .analysis_cache_stage import merge as merge_cached_results
 from .analysis_cache_stage import split as split_cached_payloads
 from .analysis_cache_stage import store as store_measured_results
 from .analysis_policy import resolve_analysis_workers, validate_analysis_worker_request
+from .media_preflight import ensure_media_online, unresolved_rows
 
 MEASURE_STAGE_VIA_MASTER = "via_master"
 MEASURE_STAGE_MASTER = "master"
@@ -94,6 +95,17 @@ class MeasureService(FullCaptureService):
                          "admit_s": 0.0, "decode_s": 0.0, "dsp_s": 0.0}
         context = self.session.snapshot(include_items=True, include_fx_params=True,
                                         include_midi_notes=False)
+        if unresolved_rows(context.get("tracks") or []):
+            # REAPER drops media while its window is inactive; repair and prove
+            # it before declaring the render silent.
+            preflight = ensure_media_online(self.session)
+            context = self.session.snapshot(include_items=True, include_fx_params=True,
+                                            include_midi_notes=False)
+            remaining = unresolved_rows(context.get("tracks") or [])
+            if remaining:
+                raise MediaUnresolved(
+                    "Some take sources could not be resolved; the analysis render would be silent",
+                    details={"sources": remaining, "preflight": preflight})
         revision = ProjectRevision.from_dict(context.get("revision", {}))
         if not revision.project_id or not revision.path:
             raise BridgeUnavailable("REAPER returned an incomplete project identity")

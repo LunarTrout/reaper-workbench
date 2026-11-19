@@ -518,8 +518,15 @@ def _payload_fx_state(fields: Mapping[str, object]) -> bool:
     rows = value.get("tracks")
     if not _rows_are_mappings(rows) or not rows:
         return False
-    return all(isinstance(row.get("chunk"), str) and row.get("complete") is not False
-               for row in rows)  # type: ignore[union-attr]
+    def _row_backs_fx_state(row: Mapping[str, object]) -> bool:
+        if row.get("complete") is False:
+            # A chain whose bytes change on every serialization is declared
+            # unstable; the digest stays usable, and the affected source is
+            # marked incomplete in every render manifest.
+            return row.get("unstable") is True and row.get("chunk") == ""
+        return isinstance(row.get("chunk"), str)
+
+    return all(_row_backs_fx_state(row) for row in rows)  # type: ignore[union-attr]
 
 
 def _accept_unknown(fields: Mapping[str, object]) -> bool:
