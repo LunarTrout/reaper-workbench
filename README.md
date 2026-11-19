@@ -184,6 +184,13 @@ python -m reaper_audio.mcp_server
 
 The server speaks MCP over stdio. It expects the REAPER bridge to be running in the instance that should be controlled. For API catalog maintenance, use `scripts/generate_api_catalog.py`; the generator reads the official Cockos reference and records its source version and content hash.
 
+## Skills
+
+Operational knowledge lives in  — one directory per skill,  plus .
+The agent must read Error: typer is required. Install with 'pip install mcp[cli]' and the matching reference before changing
+capture/measure/edit behaviour, mapping guitar roles, laying pans, or touching the owner's project.
+See  for the index and the sync rule with the Hermes profile copy.
+
 ## Documentation
 
 - [Installation and connection](docs/INSTALLATION.md)

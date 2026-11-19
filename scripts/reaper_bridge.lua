@@ -45,7 +45,7 @@ if _G.__reaper_audio_bridge_resident and not _G.__reaper_audio_bridge_reloading 
   return
 end
 _G.__reaper_audio_bridge_resident = true
-local bridge_build = "b19-2026-11-19"  -- fx-chain stability probe
+local bridge_build = "b21-2026-11-19"  -- midi.notes uses project time
 -- A second boot inside the same REAPER Lua state must supersede the first:
 -- two loops would both keep heartbeating and the client would see two live
 -- bridges. Every loop compares this token before it reschedules; the newest
@@ -2512,6 +2512,35 @@ local function midi_quantize(arguments)
            grid_s = grid_s, strength = strength }
 end
 
+local function midi_notes(arguments)
+  local project = active_project()
+  local item = resolve_item(project, arguments.item_guid)
+  if not item then
+    fail("item_not_found", "The item is not in the active project",
+         { item_guid = arguments.item_guid })
+  end
+  local take = reaper.GetActiveTake(item)
+  if not take or not reaper.TakeIsMIDI(take) then
+    fail("not_midi", "The active take is not a MIDI take")
+  end
+  local limit = tonumber(arguments.limit) or 20000
+  local item_qn = reaper.TimeMap2_timeToQN(
+    project, reaper.GetMediaItemInfo_Value(item, "D_POSITION"))
+  local _, note_count = reaper.MIDI_CountEvts(take)
+  local notes = {}
+  for i = 0, math.min(note_count, limit) - 1 do
+    local ok, sel, muted, start_qn, end_qn, chan, pitch, velocity =
+      reaper.MIDI_GetNote(take, i)
+    if ok then
+      notes[#notes + 1] = {
+        time_s = reaper.MIDI_GetProjTimeFromPPQPos(take, start_qn),
+        end_s = reaper.MIDI_GetProjTimeFromPPQPos(take, end_qn),
+        pitch = pitch, velocity = velocity, channel = chan }
+    end
+  end
+  return { note_count = note_count, notes = notes }
+end
+
 local function json_value(value, depth, seen)
   if depth > 64 then fail("api_call_failed", "API result nesting limit exceeded") end
   if value == nil or value == json.null then return json.null end
@@ -4749,6 +4778,7 @@ local operations = {
   ["action.invoke"] = action_invoke,
   ["midi.velocity_scale"] = midi_velocity_scale,
   ["midi.quantize"] = midi_quantize,
+  ["midi.notes"] = midi_notes,
   ["api.exists"] = function(arguments)
     local name = arguments.name
     if type(name) ~= "string" then error("name must be a string") end

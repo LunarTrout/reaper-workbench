@@ -2310,6 +2310,10 @@ def _resolve_parameter_targets(*, project_id: str, track_guid: str,
                                          include_fx_params=False)
         track = next((row for row in context.get("tracks") or []
                       if row.get("guid") == track_guid), None)
+        if track is None:
+            master = context.get("master") or {}
+            if str(master.get("guid")) == track_guid:
+                track = master
         fx_row = next((row for row in (track or {}).get("fx") or []
                        if row.get("guid") == fx_guid), None)
         if track is None or fx_row is None:
