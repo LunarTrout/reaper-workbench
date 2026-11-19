@@ -26,7 +26,7 @@ def test_curve_never_writes_zero_and_respects_the_limit() -> None:
 
 
 def test_curve_clamps_gain_instead_of_following_a_bad_measurement() -> None:
-    points, moves = plan_curve([{"start_s": 10.0, "end_s": 20.0, "level_db": -40.0}],
+    points, moves = plan_curve([{"start_s": 10.0, "end_s": 20.0, "level_db": -30.0}],
                                target_db=-23.0, max_gain_db=6.0)
     assert moves[0]["gain_db"] == 6.0
     assert max(point["value"] for point in points) == pytest.approx(2.0, abs=0.01)

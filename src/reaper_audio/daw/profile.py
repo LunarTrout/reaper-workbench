@@ -16,9 +16,44 @@ FLOOR_PERCENTILE = 20.0
 ACTIVE_MARGIN_DB = 6.0
 
 
+def _split_run(points: list[dict], levels: np.ndarray, start: int, end: int,
+               split_db: float, min_s: float, step_s: float) -> list[tuple[int, int]]:
+    """Split one active run where its level moves by more than ``split_db``.
+
+    Silence alone does not separate phrases: a quiet line inside a loud passage
+    is still active, and averaging it into the run hides exactly the drop a
+    listener hears. The run is walked left to right; when the running mean drifts
+    past the threshold for at least ``min_s`` seconds, a new segment starts.
+    """
+    min_steps = max(1, int(round(min_s / step_s)))
+    spans: list[tuple[int, int]] = []
+    first = start
+    total = 0.0
+    count = 0
+    recent: list[float] = []
+    for index in range(start, end + 1):
+        recent.append(float(levels[index]))
+        if len(recent) > min_steps:
+            recent.pop(0)
+        total += float(levels[index])
+        count += 1
+        mean = total / count
+        if (count >= 2 * min_steps and len(recent) == min_steps
+                and abs(sum(recent) / len(recent) - mean) > split_db):
+            spans.append((first, index - 1))
+            first = index
+            total = float(levels[index])
+            count = 1
+            recent = [float(levels[index])]
+    spans.append((first, end))
+    return spans
+
+
 def build_profile(samples: np.ndarray, sample_rate: int, *,
                   step_s: float, offset_s: float = 0.0,
-                  active_margin_db: float = ACTIVE_MARGIN_DB) -> dict:
+                  active_margin_db: float = ACTIVE_MARGIN_DB,
+                  split_db: float | None = None,
+                  min_segment_s: float = 2.0) -> dict:
     if samples.ndim == 1:
         mono = samples.astype(np.float64)
     else:
@@ -50,11 +85,15 @@ def build_profile(samples: np.ndarray, sample_rate: int, *,
         while index + 1 < len(points) and active[index + 1]:
             index += 1
         end = index
-        block_levels = levels[start:end + 1]
-        power = float(np.mean(10 ** (block_levels / 10.0)))
-        segments.append({"start_s": points[start]["time_s"],
-                         "end_s": round(points[end]["time_s"] + step_s, 3),
-                         "level_db": round(10 * np.log10(power), 2)})
+        spans = ([(start, end)] if split_db is None
+                 else _split_run(points, levels, start, end, float(split_db),
+                                 float(min_segment_s), float(step_s)))
+        for first, last in spans:
+            block_levels = levels[first:last + 1]
+            power = float(np.mean(10 ** (block_levels / 10.0)))
+            segments.append({"start_s": points[first]["time_s"],
+                             "end_s": round(points[last]["time_s"] + step_s, 3),
+                             "level_db": round(10 * np.log10(power), 2)})
         index += 1
     target = float(np.median([segment["level_db"] for segment in segments])) if segments else None
     return {"step_s": float(step_s), "floor_db": round(floor, 2),

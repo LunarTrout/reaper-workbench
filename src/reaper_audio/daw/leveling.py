@@ -50,22 +50,33 @@ def plan_curve(segments: Sequence[Mapping[str, Any]], *,
                                   details={"segment": dict(row)})
         gain_db = _clamp(target_db - level, float(max_gain_db))
         factor = round(10 ** (gain_db / 20.0), 6)
-        left = start
-        right = end
-        # A ramp of ``ramp`` seconds on each side keeps transitions smooth and
-        # never reaches zero: silence stays at unity, a measured phrase gets its
-        # gain, and nothing in between is muted.
-        if previous_end is None or left - previous_end > 2 * ramp:
-            points.append({"time_s": round(max(0.0, left - ramp), 6),
+        # A one-second tail or a fade is not a phrase: boosting it would lift
+        # breaths and reverb, so it stays at unity instead of being levelled.
+        if end - start < 1.0 or level < float(target_db) - 10.0:
+            if previous_end is not None and start - previous_end > 2 * ramp:
+                points.append({"time_s": round(previous_end + ramp, 6),
+                               "value": base_value})
+                points.append({"time_s": round(start - ramp, 6),
+                               "value": base_value})
+            previous_end = max(previous_end or 0.0, end)
+            continue
+        if previous_end is None or start - previous_end > 2 * ramp:
+            if previous_end is not None:
+                points.append({"time_s": round(previous_end + ramp, 6),
+                               "value": base_value})
+            points.append({"time_s": round(max(0.0, start - ramp), 6),
                            "value": base_value})
-        points.append({"time_s": round(left, 6), "value": factor})
-        points.append({"time_s": round(right, 6), "value": factor})
-        points.append({"time_s": round(min(right + ramp, right + 60.0), 6),
-                       "value": base_value})
+        # Adjacent segments meet directly: no unity point between them, or the
+        # curve would saw back to 0 dB at every phrase boundary.
+        points.append({"time_s": round(start, 6), "value": factor})
+        points.append({"time_s": round(end, 6), "value": factor})
         table.append({"start_s": round(start, 3), "end_s": round(end, 3),
                       "level_db": round(level, 2), "gain_db": round(gain_db, 2),
                       "factor": factor})
         previous_end = end
+    if previous_end is not None:
+        points.append({"time_s": round(previous_end + ramp, 6),
+                       "value": base_value})
     points.sort(key=lambda point: point["time_s"])
     deduped: list[dict[str, float]] = []
     for point in points:

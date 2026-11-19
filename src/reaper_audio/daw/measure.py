@@ -40,6 +40,7 @@ from .analysis_cache_stage import store as store_measured_results
 from .analysis_policy import resolve_analysis_workers, validate_analysis_worker_request
 from .media_preflight import ensure_media_online, unresolved_rows
 from .profile import build_profile
+from .render_cache import RenderCache
 
 MEASURE_STAGE_VIA_MASTER = "via_master"
 MEASURE_STAGE_MASTER = "master"
@@ -83,6 +84,7 @@ class MeasureService(FullCaptureService):
                 tail_ms: int = 0,
                 analysis_workers: int | None = None,
                 step_s: float | None = None,
+                split_db: float | None = None,
                 producer: str = "hermes") -> dict[str, Any]:
         if stage == MEASURE_STAGE_PREMASTER:
             raise ValidationError(
@@ -167,12 +169,32 @@ class MeasureService(FullCaptureService):
             project_length_s=project_length_s)
             if analysis_cache is not None else {})
 
+        cache = RenderCache(self.archive_root / "renders")
+        cached = None
+        if len(selected) == 1 and stage != MEASURE_STAGE_MASTER:
+            cached = cache.lookup(project_id=revision.project_id,
+                                  revision=revision.to_dict(),
+                                  source_guid=selected[0], start_s=start_s,
+                                  end_s=end_s, stage=stage, channels=channels,
+                                  sample_rate=sample_rate, tail_ms=tail_ms)
+
         item_rows: list[dict[str, Any]] = []
         stage_by_guid: dict[str, str] = {}
         render_started = time.perf_counter()
         try:
             current = revision
-            if stage == MEASURE_STAGE_MASTER:
+            if cached is not None:
+                track = tracks_by_guid[selected[0]]
+                meta = cached["meta"]
+                item_rows = [{"source_guid": selected[0],
+                              "name": str(track.get("name") or ""),
+                              "path": cached["path"],
+                              "stage": TRACK_SIGNAL_STAGE, "is_master": False,
+                              "channels": int(meta["channels_count"]),
+                              "sample_rate": int(meta["rate"]),
+                              "frames": int(meta["frames"])}]
+                stage_by_guid[selected[0]] = TRACK_SIGNAL_STAGE
+            elif stage == MEASURE_STAGE_MASTER:
                 rendered = self._render_master_only(current, workspace,
                                                     f"{workspace.job_id}-master",
                                                     start_s, end_s, channels,
@@ -198,6 +220,19 @@ class MeasureService(FullCaptureService):
                 admitted = [row for row in admitted
                             if str(row["source_guid"]) in set(selected)]
                 item_rows = admitted
+                if len(selected) == 1 and item_rows:
+                    try:
+                        cache.store(project_id=current.project_id,
+                                    revision=current.to_dict(),
+                                    source_guid=selected[0], start_s=start_s,
+                                    end_s=end_s, stage=stage, channels=channels,
+                                    sample_rate=sample_rate, tail_ms=tail_ms,
+                                    source_wav=Path(str(item_rows[0]["path"])),
+                                    frames=int(item_rows[0].get("frames") or 0),
+                                    rate=int(item_rows[0].get("sample_rate") or 0),
+                                    channels_count=int(item_rows[0].get("channels") or 0))
+                    except OSError:
+                        pass
                 for row in admitted:
                     stage_by_guid[str(row["source_guid"])] = TRACK_SIGNAL_STAGE
             render_s = time.perf_counter() - render_started
@@ -213,7 +248,8 @@ class MeasureService(FullCaptureService):
                 audio = load_audio(str(item_rows[0]["path"]))
                 profile = build_profile(audio.samples, int(audio.sample_rate),
                                         step_s=float(step_s),
-                                        offset_s=float(start_s or 0.0))
+                                        offset_s=float(start_s or 0.0),
+                                        split_db=split_db)
 
             payloads = [(str(row["source_guid"]), str(row["path"])) for row in item_rows]
             window_s = (float(end_s) - float(start_s)
