@@ -74,7 +74,11 @@ def build_profile(samples: np.ndarray, sample_rate: int, *,
                        "level_db": round(20 * np.log10(rms), 2)})
     levels = np.array([row["level_db"] for row in points])
     floor = float(np.percentile(levels, FLOOR_PERCENTILE))
-    active = levels > floor + float(active_margin_db)
+    # Relative-to-floor threshold fails on continuous material: the floor is the
+    # music itself, so nothing is 6 dB above it. Anchor activity to the loudest
+    # step instead, with an absolute noise gate.
+    threshold = max(float(levels.max()) - 50.0, -70.0)
+    active = levels > max(threshold, floor + float(active_margin_db))
     segments = []
     index = 0
     while index < len(points):

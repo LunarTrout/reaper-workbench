@@ -158,6 +158,14 @@ class MeasureService(FullCaptureService):
             raise ValidationError("stage=master measures only the master",
                                   details={"sources": selected})
 
+        for guid in selected:
+            track = tracks_by_guid.get(guid) or {}
+            if not track.get("items") and stage != MEASURE_STAGE_MASTER:
+                if not _feeder_guids(digest, [guid]):
+                    raise ValidationError(
+                        "This source has no items and nothing feeds it; a render would be silent",
+                        details={"source_guid": guid,
+                                 "next_action": "measure the tracks that send into this bus, or the bus after routing is fixed"})
         workspace_root = self.archive_root / ".incoming"
         workspace_root.mkdir(parents=True, exist_ok=True)
         workspace = AudioArtifactWorkspace(workspace_root)
@@ -301,6 +309,11 @@ class MeasureService(FullCaptureService):
             "producer": producer,
         }
         if profile is not None:
+            if not profile.get("segments"):
+                raise ValidationError(
+                    "The rendered window is silent; a profile would describe nothing",
+                    details={"interval": {"start_s": start_s, "end_s": end_s},
+                             "sources": selected})
             result["profile"] = profile
         return result
 
