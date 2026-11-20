@@ -38,6 +38,11 @@ from .daw.leveling import plan_curve
 from .daw.session import EditOperation, EditPlan, ProjectRevision, ProjectSession
 from .daw.full_capture import FullCaptureService
 from .daw.measure import MeasureService
+from .daw.midi import MidiService
+from .daw.edit import run_edit, send_list, undo_receipt
+from .daw.receipt import FileReceiptStore
+from .daw.session_control import app_action as _app_action
+from .daw.session_status import merge_digest_routing
 from .context.decision_gates import evaluate
 from .context.mode import load_mode, mode_brief, set_locked, set_mode
 from .context.structural_token import mint as mint_structural_token
@@ -202,6 +207,13 @@ ANALYZER_CATALOG: dict[str, dict[str, Any]] = {
     },
 }
 
+
+_MIDI_FRAGMENT_RENDERER = None
+
+
+def _receipt_store(archive_root: str | None):
+    root = Path(archive_root or os.environ.get("REAPER_CAPTURE_ARCHIVE", "capture-archive")).resolve()
+    return FileReceiptStore(root / "receipts")
 
 TOOL_SURFACE: dict[str, dict[str, Any]] = {
     "session": {
@@ -1492,7 +1504,25 @@ def _capture_audio_buffer(archive: CaptureArchive, asset: Mapping[str, Any], *,
 @_guard
 def reaper_session(action: str = "health",
                    bridge_session_id: str | None = None,
-                   project_id: str | None = None) -> dict[str, Any]:
+                   project_id: str | None = None,
+                   detail: str = "summary",
+                   sections: list[str] | None = None,
+                   allow_solo: list[str] | None = None,
+                   check_focus: bool = False,
+                   transport_action: str | None = None,
+                   position_s: float | None = None,
+                   project_command: str | None = None,
+                   path: str | None = None,
+                   overwrite_existing: bool = False,
+                   settings_command: str | None = None,
+                   settings_fields: list[str] | None = None,
+                   settings_values: dict[str, float] | None = None,
+                   app_command: str | None = None,
+                   project_path: str | None = None,
+                   force: bool = False,
+                   since: dict[str, Any] | None = None,
+                   timeout_s: float = 30.0,
+                   archive_root: str | None = None) -> dict[str, Any]:
     """Inspect the REAPER connection or list live instances/projects.
 
     action: health, list_instances, list_projects, or dirty. When several
@@ -1500,9 +1530,40 @@ def reaper_session(action: str = "health",
     ``dirty`` is a read-only gate: it reports whether the active project holds
     unsaved changes, which is what a controlled restart must not discard.
     """
-    if action not in {"health", "list_instances", "list_projects", "dirty"}:
-        raise ValidationError(
-            "action must be health, list_instances, list_projects, or dirty")
+    allowed = {"health", "list_instances", "list_projects", "dirty", "status",
+               "preflight", "transport", "project", "settings", "app",
+               "wait_for_change"}
+    if action not in allowed:
+        raise ValidationError("unknown session action", details={"action": action})
+    if action in {"status", "preflight", "transport", "project", "settings",
+                  "app", "wait_for_change"}:
+        session = ProjectSession(ReaperBridge(bridge_session_id=bridge_session_id),
+                                 project_id=project_id, archive_root=archive_root)
+        if action == "status":
+            return session.status(detail=detail, sections=sections,
+                                  archive_root=archive_root)
+        if action == "preflight":
+            return session.preflight(allow_solo=allow_solo, check_focus=check_focus)
+        if action == "transport":
+            if not transport_action:
+                raise ValidationError("transport_action is required")
+            return session.transport(transport_action, position_s=position_s)
+        if action == "project":
+            if not project_command:
+                raise ValidationError("project_command is required")
+            return session.project(project_command, path=path,
+                                   overwrite_existing=overwrite_existing)
+        if action == "settings":
+            return session.settings(settings_command or "read", fields=settings_fields,
+                                    values=settings_values)
+        if action == "app":
+            if not app_command:
+                raise ValidationError("app_command is required")
+            return _app_action(session.bridge, app_command, project_path=project_path,
+                               timeout_s=timeout_s, force=force)
+        if since is None:
+            raise ValidationError("since is required")
+        return session.wait_for_change(since, timeout_s=timeout_s)
     bridge = ReaperBridge(bridge_session_id=bridge_session_id)
     if action == "list_instances":
         return {"instances": bridge.discover_instances()}
@@ -1845,7 +1906,17 @@ def reaper_midi(action: str = "notes", item_guid: str | None = None,
                 factor: float = 1.0, offset: float = 0.0,
                 jitter: float = 0.0,
                 grid_s: float | None = None,
-                strength: float = 1.0) -> dict[str, Any]:
+                strength: float = 1.0,
+                pattern: list[dict[str, Any]] | None = None,
+                from_bar: int | None = None,
+                to_bar: int | None = None,
+                subdivision: int | None = None,
+                accents: dict[str, Any] | list[dict[str, Any]] | None = None,
+                humanize: float | dict[str, Any] | None = None,
+                tolerance_ms: float = 0.0,
+                bars: int | list[int] | None = None,
+                notes: list[dict[str, Any]] | None = None,
+                apply: bool = False) -> dict[str, Any]:
     """Read a MIDI take or reshape its velocities without leaving MCP.
 
     ``notes`` returns per-pitch counts and velocity ranges so a caller can see
@@ -1855,6 +1926,22 @@ def reaper_midi(action: str = "notes", item_guid: str | None = None,
     to ``grid_s`` seconds with partial ``strength`` (0-1) and keeps lengths.
     """
     _handbook_required()
+    if action in {"generate", "grid_check", "preview", "replace"}:
+        session = ProjectSession(ReaperBridge(), project_id=project_id or None)
+        service = MidiService(session, renderer=_MIDI_FRAGMENT_RENDERER)
+        if action == "generate":
+            if pattern is None or from_bar is None or to_bar is None or subdivision is None:
+                raise ValidationError(
+                    "generate needs pattern, from_bar, to_bar and subdivision")
+            return service.generate(item_guid or "", pattern, from_bar, to_bar,
+                                    subdivision, accents, humanize, apply=apply)
+        if action == "grid_check":
+            return service.grid_check(item_guid or "", tolerance_ms, subdivision)
+        if action == "preview":
+            return service.preview(item_guid or "", bars)
+        if notes is None:
+            raise ValidationError("replace needs notes")
+        return service.replace(item_guid or "", notes)
     bridge = ReaperBridge()
     health = bridge.health(timeout_s=5.0)
     project = health.get("project") or {}
@@ -3543,7 +3630,15 @@ def reaper_edit(mode: str,
                 decision_class: str | None = None,
                 basis: list[dict[str, Any]] | None = None,
                 target_sources: list[str] | None = None,
-                structural_token: str | None = None) -> dict[str, Any]:
+                structural_token: str | None = None,
+                verify: dict[str, Any] | bool | None = None,
+                receipt: str | None = None,
+                allow_overwrite: bool = False,
+                source_guid: str | None = None,
+                owner_guid: str | None = None,
+                envelope: str | None = None,
+                interval: list[float] | None = None,
+                scaling: str = "amplitude") -> dict[str, Any]:
     """Preview, apply, or undo one revision-bound batch of project edits.
 
     preview: supply operations and reason; nothing changes. apply: use the
@@ -3556,8 +3651,22 @@ def reaper_edit(mode: str,
     transaction set.
     """
     _handbook_required()
-    if mode not in {"preview", "apply", "undo"}:
-        raise ValidationError("mode must be preview, apply, or undo")
+    if mode not in {"preview", "apply", "undo", "sends", "envelope_points"}:
+        raise ValidationError("mode must be preview, apply, undo, sends or envelope_points")
+    if mode == "sends":
+        session = _session(project_id, bridge_session_id)
+        return {"ok": True, "mode": "sends", **send_list(session, source_guid=source_guid)}
+    if mode == "envelope_points":
+        from .daw.envelope import envelope_points
+        session = _session(project_id, bridge_session_id)
+        return {"ok": True, "mode": "envelope_points",
+                **envelope_points(session, owner_guid or "", envelope or "",
+                                  interval=interval, scaling=scaling)}
+    if mode == "undo" and receipt:
+        session = _session(project_id, bridge_session_id)
+        return {"ok": True, **undo_receipt(
+            session, receipt, receipt_store=_receipt_store(archive_root),
+            allow_overwrite=allow_overwrite)}
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)
     _current_context(session, expected)
@@ -3575,6 +3684,10 @@ def reaper_edit(mode: str,
             return {"mode": mode, "changed": False, "blocked": True,
                     "decision_gate": gate, "project_id": project_id,
                     "revision": expected.to_dict()}
+    if mode == "apply" and plan_id is None and isinstance(operations, list) and operations:
+        return {"ok": True, "mode": "apply", **run_edit(
+            session, operations, reason=reason or "edit",
+            receipt_store=_receipt_store(archive_root), max_rebase=2)}
     access: dict[str, Any] | None = None
     if mode != "preview":
         access = _require_structural_access(session=session, project_id=project_id,
@@ -5456,9 +5569,13 @@ def _read_capture_panorama(capture_id: str, archive_root: str,
 @_guard
 def reaper_measure(archive_root: str,
                    project_id: str | None = None,
-                   sources: list[str] | str = "all",
+                   sources: list[Any] | str = "all",
                    start_s: float | None = None,
                    end_s: float | None = None,
+                   intervals: str | list[Any] | None = None,
+                   metrics: list[str] | str | None = None,
+                   bands: str | list[Any] | None = None,
+                   auto_transport: bool = False,
                    stage: str = "via_master",
                    channels: str = "stereo",
                    sample_rate: int | None = None,
@@ -5491,6 +5608,8 @@ def reaper_measure(archive_root: str,
     before = session.snapshot(include_items=False).get("revision") or {}
     service = MeasureService(session, archive_root)
     result = service.measure(sources=sources, section=section, stage=stage,
+                             intervals=intervals, metrics=metrics, bands=bands,
+                             auto_transport=auto_transport,
                              channels=channels, sample_rate=sample_rate,
                              tail_ms=tail_ms, analysis_workers=analysis_workers,
                              step_s=step_s)

@@ -580,6 +580,7 @@ local function track_context(project, track, index, options)
     freeze_count = finite_or_zero(
       reaper.GetMediaTrackInfo_Value(track, "I_FREEZECOUNT")),
     folder_depth = reaper.GetMediaTrackInfo_Value(track, "I_FOLDERDEPTH"),
+    automation_mode = reaper.GetTrackAutomationMode(track),
     fx = fx_context(track, options.include_fx_params == true),
     sends = reaper.GetTrackNumSends(track, 0),
     receives = reaper.GetTrackNumSends(track, -1),
