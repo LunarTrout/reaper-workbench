@@ -211,6 +211,30 @@ ANALYZER_CATALOG: dict[str, dict[str, Any]] = {
 _MIDI_FRAGMENT_RENDERER = None
 
 
+def _edit_measure(session: ProjectSession):
+    """Return a before/after measurement callable for edit verification.
+
+    It renders the requested sources over the requested interval through the
+    same MeasureService the ``measure`` tool uses, so a verification number is
+    a real measurement, not a read-back of the parameter that was just set.
+    """
+    def measure(*, sources, interval, metrics):
+        root = os.environ.get("REAPER_CAPTURE_ARCHIVE", "capture-archive")
+        service = MeasureService(session, root)
+        section = None if interval is None else (float(interval[0]), float(interval[1]))
+        result = service.measure(sources=list(sources), section=section,
+                                 stage="via_master")
+        table = result.get("table") or {}
+        cells = table.get("cells") or [{}]
+        first = cells[0] if isinstance(cells, list) and cells else {}
+        out: dict[str, dict[str, Any]] = {}
+        for guid in sources:
+            cell = first.get(guid) or {}
+            out[str(guid)] = {name: cell.get(name) for name in metrics}
+        return out
+    return measure
+
+
 def _receipt_store(archive_root: str | None):
     root = Path(archive_root or os.environ.get("REAPER_CAPTURE_ARCHIVE", "capture-archive")).resolve()
     return FileReceiptStore(root / "receipts")
@@ -246,6 +270,13 @@ TOOL_SURFACE: dict[str, dict[str, Any]] = {
                   "reaper_panorama_query", "reaper_panorama_status",
                   "reaper_panorama_changes_since", "reaper_panorama_refresh"],
         "not_for": "changing the project or replacing exact audio measurements",
+    },
+    "media": {
+        "purpose": "import an external reference or export audio with a post-codec true-peak check",
+        "use_when": "a reference must become a measured file, or a mix must leave the project as mp3/wav",
+        "context": "archive_root for the reference library; a WAV path for encoding",
+        "tools": ["reaper_media"],
+        "not_for": "measuring project audio; use reaper_measure",
     },
     "analysis": {
         "purpose": "measure captured audio, run a scoped analyzer batch, inspect measured evidence, compare two analyses, map edits",
@@ -837,10 +868,21 @@ def _current_context(session: ProjectSession,
     current = ProjectRevision.from_dict(context.get("revision", {}))
     if not current.project_id or current.change_count < 0:
         raise BridgeUnavailable("REAPER returned an incomplete project revision")
-    if expected is not None and current != expected:
-        raise StaleContext("The project changed since the supplied context was read",
-                           details={"expected": expected.to_dict(),
-                                    "current": current.to_dict()})
+    if expected is not None:
+        same = (current.project_id == expected.project_id
+                and current.path == expected.path
+                and current.change_count == expected.change_count)
+        if same:
+            for field in ("instance_id", "epoch"):
+                given = getattr(expected, field, None)
+                live = getattr(current, field, None)
+                if given not in (None, "", 0) and live not in (None, "", 0) and given != live:
+                    same = False
+                    break
+        if not same:
+            raise StaleContext("The project changed since the supplied context was read",
+                               details={"expected": expected.to_dict(),
+                                        "current": current.to_dict()})
     return context
 
 
@@ -1998,6 +2040,42 @@ def reaper_midi(action: str = "notes", item_guid: str | None = None,
     result = bridge.call("midi.velocity_scale", payload)
     return {"ok": True, "action": "velocity_scale", **result}
 
+
+
+
+@server.tool()
+@_guard
+def reaper_media(action: str,
+                 source: str | None = None,
+                 label: str | None = None,
+                 archive_root: str | None = None,
+                 format: str = "mp3",
+                 bitrate: int | None = None,
+                 ceiling_dbtp: float = -1.0,
+                 out_path: str | None = None,
+                 sample_rate: int | None = None,
+                 overwrite: bool = True) -> dict[str, Any]:
+    """Import a reference file or export audio with post-codec true-peak check.
+
+    import: ``source`` is a local path or URL; it becomes a WAV plus a measured
+    profile (lufs, lra, peak, true peak, crest, centroid, bands, side/mid) under
+    ``<archive_root>/references``.  encode: ``source`` is a WAV; ``format`` and
+    ``bitrate`` are caller choices, and the encoded result is measured and
+    re-encoded with a lower gain when its true peak exceeds ``ceiling_dbtp``.
+    """
+    if action not in {"import", "encode"}:
+        raise ValidationError("action must be import or encode")
+    if not isinstance(source, str) or not source:
+        raise ValidationError("source is required")
+    if action == "import":
+        from .daw.reference import import_reference
+        return {"ok": True, "action": "import",
+                **import_reference(source, label=label, archive_root=archive_root)}
+    from .daw.encode import encode
+    return {"ok": True, "action": "encode",
+            **encode(source, format=format, bitrate=bitrate,
+                     ceiling_dbtp=ceiling_dbtp, out_path=out_path,
+                     sample_rate=sample_rate, overwrite=overwrite)}
 
 @server.tool()
 @_guard
@@ -3666,7 +3744,8 @@ def reaper_edit(mode: str,
         session = _session(project_id, bridge_session_id)
         return {"ok": True, **undo_receipt(
             session, receipt, receipt_store=_receipt_store(archive_root),
-            allow_overwrite=allow_overwrite, verify=verify)}
+            allow_overwrite=allow_overwrite, verify=verify,
+            measure=_edit_measure(session))}
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)
     _current_context(session, expected)
@@ -3687,6 +3766,7 @@ def reaper_edit(mode: str,
     if mode == "apply" and plan_id is None and isinstance(operations, list) and operations:
         return {"ok": True, "mode": "apply", **run_edit(
             session, operations, reason=reason or "edit", verify=verify,
+            measure=_edit_measure(session),
             receipt_store=_receipt_store(archive_root), max_rebase=2)}
     access: dict[str, Any] | None = None
     if mode != "preview":

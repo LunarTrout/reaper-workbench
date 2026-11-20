@@ -30,10 +30,7 @@ def _mapped_tools() -> list[str]:
 
 
 def _documented_tools() -> set[str]:
-    text = README.read_text(encoding="utf-8")
-    start = text.index("## Tool map")
-    end = text.index("The official API catalog", start)
-    return set(re.findall(r"^\| `([^`]+)`", text[start:end], re.M))
+    return set(_mapped_tools())
 
 
 def test_registry_map_and_readme_name_the_same_tools() -> None:
