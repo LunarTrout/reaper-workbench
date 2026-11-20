@@ -1,0 +1,125 @@
+{
+  "project_id": "reaper:vers1-test",
+  "path": "C:/Projects/vers1/vers1.rpp",
+  "change_count": 41,
+  "digest_version": 1,
+  "coverage": {
+    "tracks": true,
+    "items": true,
+    "takes": true,
+    "fx": true,
+    "sends": true,
+    "tempo": true,
+    "master": true,
+    "automation": true,
+    "envelopes": true,
+    "project": true,
+    "fx_state": true
+  },
+  "missing": [],
+  "fields": {
+    "tracks": [
+      {
+        "guid": "{TRACK-RHYTHM-L}",
+        "sends": [
+          {
+            "index": 0,
+            "dest_guid": "{TRACK-GTR-BUS}",
+            "dest_name": "GTR BUS",
+            "volume": 0.5011872336272722,
+            "pan": 0.0,
+            "mode": 0,
+            "mute": false,
+            "phase": false,
+            "mono": false
+          }
+        ]
+      },
+      {
+        "guid": "{TRACK-BASS}",
+        "sends": []
+      },
+      {
+        "guid": "{TRACK-VOCAL}",
+        "sends": [
+          {
+            "index": 0,
+            "dest_guid": "{TRACK-FX-BUS}",
+            "dest_name": "FX BUS",
+            "volume": 0.251188643150958,
+            "pan": -0.2,
+            "mode": 2,
+            "mute": false,
+            "phase": true,
+            "mono": false
+          }
+        ]
+      },
+      {
+        "guid": "{TRACK-ACCORDION}",
+        "sends": []
+      }
+    ],
+    "automation": {
+      "complete": true,
+      "gaps": [],
+      "tracks": [
+        {
+          "track_guid": "{TRACK-RHYTHM-L}",
+          "envelopes": [
+            {
+              "guid": "{ENV-RHYTHM-VOL}",
+              "name": "Volume",
+              "active": true,
+              "visible": false,
+              "armed": false,
+              "point_count": 3,
+              "scaling_mode": 0,
+              "automation_item_count": 0,
+              "points": [
+                {"index": 0, "time_s": 0.0, "value": 0.5},
+                {"index": 1, "time_s": 38.0, "value": 1.0},
+                {"index": 2, "time_s": 76.0, "value": 0.25}
+              ]
+            }
+          ]
+        },
+        {
+          "track_guid": "{TRACK-VOCAL}",
+          "envelopes": [
+            {
+              "guid": "{ENV-VOX-PAN}",
+              "name": "Pan",
+              "active": true,
+              "visible": true,
+              "armed": false,
+              "point_count": 2,
+              "scaling_mode": 0,
+              "automation_item_count": 0,
+              "points": [
+                {"index": 0, "time_s": 76.0, "value": -0.5},
+                {"index": 1, "time_s": 150.0, "value": 0.5}
+              ]
+            }
+          ]
+        }
+      ],
+      "master": [
+        {
+          "guid": "{ENV-MASTER-VOL}",
+          "name": "Volume",
+          "active": true,
+          "visible": false,
+          "armed": false,
+          "point_count": 2,
+          "scaling_mode": 0,
+          "automation_item_count": 0,
+          "points": [
+            {"index": 0, "time_s": 0.0, "value": 1.0},
+            {"index": 1, "time_s": 306.0, "value": 1.0}
+          ]
+        }
+      ]
+    }
+  }
+}
