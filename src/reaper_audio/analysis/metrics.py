@@ -23,7 +23,10 @@ BAND_CENTERS_HZ = (
     12500.0,
 )
 DB_FLOOR = -160.0
-ANALYSIS_VERSION = "1"
+#: Version of the measurement payload.  Bump together with any change to the
+#: metrics or curves a report carries; it is stored in every report's
+#: provenance and included in the measurement cache key.
+ANALYSIS_VERSION = "2"
 
 # A 3 s block is restored from pyloudnorm's direct sums when its prefix-sum
 # power sits inside this multiple of the forward-error bound of the running
