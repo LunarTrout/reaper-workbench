@@ -4,6 +4,11 @@ A measurement answers "how loud is this window".  A profile answers "where in th
 track is this source, how loud is each phrase, and where is it silent" — the
 view a mix decision actually needs, computed from one render instead of dozens
 of separate windows.
+
+Every threshold the segmentation uses is a keyword argument with a declared
+default, and the values actually used are returned with the profile.  Nothing
+here decides what a phrase "should" be: it reports where the level is and lets
+the caller read it.
 """
 
 from __future__ import annotations
@@ -12,8 +17,20 @@ import numpy as np
 
 from ..errors import ValidationError
 
+#: Below this share of the loudest step a run is not considered active.
 FLOOR_PERCENTILE = 20.0
+#: How far above the floor an active step must sit (relative rule).
 ACTIVE_MARGIN_DB = 6.0
+#: Absolute gate: steps quieter than this are never active.
+NOISE_GATE_DBFS = -70.0
+#: Relative gate: steps more than this below the loudest step are never active.
+RELATIVE_CEILING_DB = 50.0
+#: Shortest run the splitter may produce, in seconds.
+MIN_SEGMENT_S = 2.0
+#: Version of the profile algorithm.  It participates in the measurement cache
+#: key, so a change to the segmentation here makes old profile entries
+#: unreachable instead of silently returning a differently-shaped profile.
+PROFILE_VERSION = "1"
 
 
 def _split_run(points: list[dict], levels: np.ndarray, start: int, end: int,
@@ -52,8 +69,17 @@ def _split_run(points: list[dict], levels: np.ndarray, start: int, end: int,
 def build_profile(samples: np.ndarray, sample_rate: int, *,
                   step_s: float, offset_s: float = 0.0,
                   active_margin_db: float = ACTIVE_MARGIN_DB,
+                  floor_percentile: float = FLOOR_PERCENTILE,
+                  noise_gate_dbfs: float = NOISE_GATE_DBFS,
+                  relative_ceiling_db: float = RELATIVE_CEILING_DB,
                   split_db: float | None = None,
-                  min_segment_s: float = 2.0) -> dict:
+                  min_segment_s: float = MIN_SEGMENT_S) -> dict:
+    """Short-term levels, activity and phrase spans of one source.
+
+    The four gates are parameters with the declared defaults above: the caller
+    may override any of them, and the values used come back under ``thresholds``
+    so the segments can be read without guessing.
+    """
     if samples.ndim == 1:
         mono = samples.astype(np.float64)
     else:
@@ -73,11 +99,12 @@ def build_profile(samples: np.ndarray, sample_rate: int, *,
         points.append({"time_s": round(offset_s + start / sample_rate, 3),
                        "level_db": round(20 * np.log10(rms), 2)})
     levels = np.array([row["level_db"] for row in points])
-    floor = float(np.percentile(levels, FLOOR_PERCENTILE))
+    floor = float(np.percentile(levels, float(floor_percentile)))
     # Relative-to-floor threshold fails on continuous material: the floor is the
     # music itself, so nothing is 6 dB above it. Anchor activity to the loudest
     # step instead, with an absolute noise gate.
-    threshold = max(float(levels.max()) - 50.0, -70.0)
+    threshold = max(float(levels.max()) - float(relative_ceiling_db),
+                    float(noise_gate_dbfs))
     active = levels > max(threshold, floor + float(active_margin_db))
     segments = []
     index = 0
@@ -104,4 +131,14 @@ def build_profile(samples: np.ndarray, sample_rate: int, *,
             "active_margin_db": float(active_margin_db),
             "active_share": round(float(active.mean()), 4),
             "target_db": round(target, 2) if target is not None else None,
+            "thresholds": {
+                "floor_percentile": float(floor_percentile),
+                "active_margin_db": float(active_margin_db),
+                "noise_gate_dbfs": float(noise_gate_dbfs),
+                "relative_ceiling_db": float(relative_ceiling_db),
+                "min_segment_s": float(min_segment_s),
+                "split_db": None if split_db is None else float(split_db),
+                "activity_threshold_db": round(
+                    float(max(threshold, floor + float(active_margin_db))), 2),
+            },
             "segments": segments, "points": points}
