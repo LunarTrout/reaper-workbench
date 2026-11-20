@@ -1,0 +1,326 @@
+{
+  "revision": {
+    "project_id": "reaper:vers1-test",
+    "change_count": 41,
+    "path": "C:/Projects/vers1/vers1.rpp",
+    "instance_id": "6a0b1c2d-0001",
+    "epoch": 2
+  },
+  "path": "C:/Projects/vers1/vers1.rpp",
+  "name": "vers1",
+  "track_count": 4,
+  "length_s": 306.0,
+  "tracks": [
+    {
+      "guid": "{TRACK-RHYTHM-L}",
+      "index": 0,
+      "name": "Rhythm Gtr L",
+      "is_master": false,
+      "volume": 0.6309573444801932,
+      "pan": -0.4,
+      "mute": false,
+      "solo": 1,
+      "record_arm": 0,
+      "channel_count": 2,
+      "main_send": true,
+      "folder_depth": 0,
+      "receives": 0,
+      "hardware_sends": 0,
+      "automation_mode": 1,
+      "fx": [
+        {
+          "index": 0,
+          "guid": "{FX-EQ-RHYTHM}",
+          "name": "ReaEQ",
+          "enabled": true,
+          "offline": false,
+          "parameter_count": 12
+        },
+        {
+          "index": 1,
+          "guid": "{FX-AMP-RHYTHM}",
+          "name": "TSE X50",
+          "enabled": true,
+          "offline": false,
+          "parameter_count": 24
+        }
+      ],
+      "sends": 1,
+      "items": [
+        {
+          "guid": "{ITEM-RHYTHM-1}",
+          "position_s": 0.0,
+          "length_s": 76.0,
+          "start_offset_s": 0.25,
+          "playrate": 1.0,
+          "fade_in_s": 0.01,
+          "fade_out_s": 0.02,
+          "mute": false,
+          "selected": false,
+          "take_count": 2,
+          "source_online": true,
+          "source_length_s": 76.0,
+          "source_sample_rate": 48000,
+          "source_channels": 2,
+          "active_take": {
+            "guid": "{TAKE-RHYTHM-1}",
+            "name": "rhythm_L_take3.wav",
+            "source": "C:/Projects/vers1/audio/rhythm_L_take3.wav",
+            "is_midi": false,
+            "playrate": 1.0,
+            "volume": 1.0,
+            "pan": 0.0,
+            "pitch": 0.0
+          }
+        },
+        {
+          "guid": "{ITEM-RHYTHM-2}",
+          "position_s": 76.0,
+          "length_s": 74.0,
+          "start_offset_s": 0.0,
+          "playrate": 1.0,
+          "fade_in_s": 0.0,
+          "fade_out_s": 0.0,
+          "mute": false,
+          "selected": false,
+          "take_count": 1,
+          "source_online": true,
+          "source_length_s": 74.0,
+          "source_sample_rate": 48000,
+          "source_channels": 2,
+          "active_take": {
+            "guid": "{TAKE-RHYTHM-2}",
+            "name": "rhythm_L_take4.wav",
+            "source": "C:/Projects/vers1/audio/rhythm_L_take4.wav",
+            "is_midi": false,
+            "playrate": 1.0,
+            "volume": 1.0,
+            "pan": 0.0,
+            "pitch": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "guid": "{TRACK-BASS}",
+      "index": 1,
+      "name": "Bass DI",
+      "is_master": false,
+      "volume": 0.5011872336272722,
+      "pan": 0.0,
+      "mute": false,
+      "solo": 0,
+      "record_arm": 0,
+      "channel_count": 2,
+      "main_send": true,
+      "folder_depth": 0,
+      "receives": 0,
+      "hardware_sends": 0,
+      "automation_mode": 0,
+      "fx": [
+        {
+          "index": 0,
+          "guid": "{FX-BASS-DI}",
+          "name": "ReaComp",
+          "enabled": true,
+          "offline": false,
+          "parameter_count": 16
+        }
+      ],
+      "sends": 0,
+      "items": [
+        {
+          "guid": "{ITEM-BASS-1}",
+          "position_s": 0.0,
+          "length_s": 150.0,
+          "start_offset_s": 0.0,
+          "playrate": 1.0,
+          "fade_in_s": 0.0,
+          "fade_out_s": 0.0,
+          "mute": false,
+          "selected": false,
+          "take_count": 1,
+          "source_online": false,
+          "source_length_s": 0,
+          "source_sample_rate": 0,
+          "source_channels": 0,
+          "active_take": {
+            "guid": "{TAKE-BASS-1}",
+            "name": "bass_di.wav",
+            "source": "C:/Projects/vers1/audio/bass_di_missing.wav",
+            "is_midi": false,
+            "playrate": 1.0,
+            "volume": 1.0,
+            "pan": 0.0,
+            "pitch": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "guid": "{TRACK-VOCAL}",
+      "index": 2,
+      "name": "Scream Vox",
+      "is_master": false,
+      "volume": 0.7943282347242815,
+      "pan": 0.1,
+      "mute": false,
+      "solo": 0,
+      "record_arm": 0,
+      "channel_count": 2,
+      "main_send": true,
+      "folder_depth": 0,
+      "receives": 0,
+      "hardware_sends": 0,
+      "automation_mode": 2,
+      "fx": [
+        {
+          "index": 0,
+          "guid": "{FX-VOX-EQ}",
+          "name": "ReaEQ",
+          "enabled": false,
+          "offline": true,
+          "parameter_count": 10
+        }
+      ],
+      "sends": 1,
+      "items": [
+        {
+          "guid": "{ITEM-VOX-1}",
+          "position_s": 76.0,
+          "length_s": 74.0,
+          "start_offset_s": 2.0,
+          "playrate": 1.0,
+          "fade_in_s": 0.0,
+          "fade_out_s": 0.0,
+          "mute": false,
+          "selected": false,
+          "take_count": 1,
+          "source_online": true,
+          "source_length_s": 76.0,
+          "source_sample_rate": 48000,
+          "source_channels": 1,
+          "active_take": {
+            "guid": "{TAKE-VOX-1}",
+            "name": "scream_main.wav",
+            "source": "C:/Projects/vers1/audio/scream_main.wav",
+            "is_midi": false,
+            "playrate": 1.0,
+            "volume": 1.0,
+            "pan": 0.0,
+            "pitch": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "guid": "{TRACK-ACCORDION}",
+      "index": 3,
+      "name": "Accordion MIDI",
+      "is_master": false,
+      "volume": 0.3981071705534972,
+      "pan": 0.25,
+      "mute": false,
+      "solo": 0,
+      "record_arm": 0,
+      "channel_count": 2,
+      "main_send": true,
+      "folder_depth": 0,
+      "receives": 0,
+      "hardware_sends": 0,
+      "automation_mode": 0,
+      "fx": [],
+      "sends": 0,
+      "items": [
+        {
+          "guid": "{ITEM-ACCORDION-1}",
+          "position_s": 150.0,
+          "length_s": 60.0,
+          "start_offset_s": 0.0,
+          "playrate": 1.0,
+          "fade_in_s": 0.0,
+          "fade_out_s": 0.0,
+          "mute": false,
+          "selected": true,
+          "take_count": 1,
+          "source_online": true,
+          "source_length_s": 60.0,
+          "source_sample_rate": 48000,
+          "source_channels": 2,
+          "active_take": {
+            "guid": "{TAKE-ACCORDION-1}",
+            "name": "accordion",
+            "source": "",
+            "is_midi": true,
+            "playrate": 1.0,
+            "volume": 1.0,
+            "pan": 0.0,
+            "pitch": 0.0
+          }
+        }
+      ]
+    }
+  ],
+  "master": {
+    "guid": "{TRACK-MASTER}",
+    "index": -1,
+    "name": "MASTER",
+    "is_master": true,
+    "volume": 1.0,
+    "pan": 0.0,
+    "mute": false,
+    "solo": 0,
+    "channel_count": 2,
+    "main_send": true,
+    "folder_depth": 0,
+    "fx": [
+      {
+        "index": 0,
+        "guid": "{FX-MASTER-EQ}",
+        "name": "ReaEQ",
+        "enabled": true,
+        "offline": false,
+        "parameter_count": 12
+      },
+      {
+        "index": 1,
+        "guid": "{FX-MASTER-LIMIT}",
+        "name": "ReaLimit",
+        "enabled": true,
+        "offline": false,
+        "parameter_count": 8
+      }
+    ],
+    "sends": []
+  },
+  "transport": {
+    "play_state": 0,
+    "cursor_s": 12.5,
+    "edit_cursor_s": 12.5,
+    "play_position_s": 0.0,
+    "play_position_kind": "observed_playback_not_project_cursor"
+  },
+  "tempo": {
+    "bpm": 155.5,
+    "numerator": 4,
+    "denominator": 4,
+    "markers": [
+      {"time_s": 0.0, "measure": 0, "beat": 0, "bpm": 155.5, "numerator": 4, "denominator": 4, "linear": false},
+      {"time_s": 76.0, "measure": 32, "beat": 0, "bpm": 160.0, "numerator": 4, "denominator": 4, "linear": false},
+      {"time_s": 150.0, "measure": 64, "beat": 0, "bpm": 80.0, "numerator": 4, "denominator": 4, "linear": false},
+      {"time_s": 210.0, "measure": 96, "beat": 0, "bpm": 72.5, "numerator": 4, "denominator": 4, "linear": false},
+      {"time_s": 260.0, "measure": 128, "beat": 0, "bpm": 155.5, "numerator": 4, "denominator": 4, "linear": false}
+    ]
+  },
+  "markers": [
+    {"index": 0, "is_region": false, "position_s": 0.0, "end_s": 0.0, "name": "start", "number": 1, "color": 0}
+  ],
+  "regions": [
+    {"index": 1, "is_region": true, "position_s": 0.0, "end_s": 76.0, "name": "Intro", "number": 1, "color": 0},
+    {"index": 2, "is_region": true, "position_s": 76.0, "end_s": 150.0, "name": "Verse", "number": 2, "color": 0},
+    {"index": 3, "is_region": true, "position_s": 150.0, "end_s": 210.0, "name": "Break", "number": 3, "color": 0}
+  ],
+  "marker_count": 4,
+  "region_count": 3,
+  "selection": {"track_guids": [], "time_start_s": 0.0, "time_end_s": 0.0}
+}

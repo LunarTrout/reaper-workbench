@@ -789,9 +789,13 @@ def _require_unchanged_structure(before: Mapping[str, Any],
 
 
 class ProjectSession:
-    def __init__(self, bridge: ReaperBridge, *, project_id: str | None = None):
+    def __init__(self, bridge: ReaperBridge, *, project_id: str | None = None,
+                 archive_root: str | None = None):
         self.bridge = bridge
         self.project_id = project_id
+        # Optional archive used only by ``status`` for receipts and evidence.
+        # Reads never create it.
+        self.archive_root = archive_root
 
     def snapshot(self, *, project_id: str | None = None, include_items: bool = False,
                  include_fx_params: bool = False,
@@ -808,6 +812,62 @@ class ProjectSession:
         if not isinstance(digest, Mapping):
             raise BridgeUnavailable("REAPER returned an invalid project digest")
         return dict(digest)
+
+    def status(self, detail: str = "summary", sections: object = None, *,
+               archive_root: str | None = None,
+               include_midi_counts: bool | None = None) -> dict[str, Any]:
+        """One sectioned read of the project: runtime, transport, tracks, routing.
+
+        ``detail`` is ``summary`` (identities, counts, names) or ``full``
+        (adds sends, envelopes, items and FX rows).  ``sections`` narrows the
+        answer to the named sections.  Sends and envelopes come from the
+        project digest; when it is unavailable the answer says so in ``gaps``
+        instead of pretending there are none.
+        """
+        from .session_status import project_status
+        return project_status(self, detail=detail, sections=sections,
+                              archive_root=archive_root,
+                              include_midi_counts=include_midi_counts)
+
+    def preflight(self, *, allow_solo: object = None, check_focus: bool = False,
+                  attempt_media_repair: bool = False) -> dict[str, Any]:
+        """Name what would invalidate a capture or edit before it is attempted."""
+        from .session_status import project_preflight
+        return project_preflight(self, allow_solo=allow_solo,
+                                 check_focus=check_focus,
+                                 attempt_media_repair=attempt_media_repair)
+
+    def transport(self, action: str, position_s: float | None = None) -> dict[str, Any]:
+        """Play, stop or pause the bound project, then read the state back."""
+        from .session_control import transport_control
+        return transport_control(self, action, position_s=position_s)
+
+    def project(self, action: str, path: object = None, *,
+                overwrite_existing: bool = False) -> dict[str, Any]:
+        """Open or save a project; save-as refuses an unconfirmed overwrite."""
+        from .session_control import project_action
+        return project_action(self, action, path=path,
+                              overwrite_existing=overwrite_existing)
+
+    def settings(self, action: str = "read", *, fields: object = None,
+                 values: object = None) -> dict[str, Any]:
+        """Read or write documented project settings with a read-back proof."""
+        from .session_control import settings_action
+        return settings_action(self, action, fields=fields, values=values)
+
+    def app(self, action: str, *, project_path: object = None,
+            timeout_s: float = 30.0, force: bool = False) -> dict[str, Any]:
+        """Ensure REAPER is running, restart it, or focus its window."""
+        from .session_control import app_action
+        return app_action(self.bridge, action, project_path=project_path,
+                          timeout_s=timeout_s, force=force)
+
+    def wait_for_change(self, since: object, timeout_s: float = 30.0, *,
+                        poll_s: float = 0.25,
+                        watch: object = ("revision", "transport")) -> dict[str, Any]:
+        """Long-poll until the revision or transport differs from ``since``."""
+        from .session_control import wait_for_change
+        return wait_for_change(self, since, timeout_s, poll_s=poll_s, watch=watch)
 
     @contextmanager
     def capture_audio(
