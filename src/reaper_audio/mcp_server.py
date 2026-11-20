@@ -46,7 +46,7 @@ from .daw.session_status import merge_digest_routing
 from .context.decision_gates import evaluate
 from .context.mode import load_mode, mode_brief, set_locked, set_mode
 from .context.structural_token import mint as mint_structural_token
-from .context.structural_token import register_self_noise
+from .context.structural_token import register_self_noise, explained_by_self_noise
 from .context.structural_token import require as require_structural_token
 from .context.mutation_journal import diff_digests
 from .context.evidence import EvidenceStore
@@ -879,6 +879,9 @@ def _current_context(session: ProjectSession,
                 if given not in (None, "", 0) and live not in (None, "", 0) and given != live:
                     same = False
                     break
+        if not same and expected.project_id == current.project_id and                 explained_by_self_noise(current.project_id, expected.change_count,
+                                        current.change_count):
+            same = True
         if not same:
             raise StaleContext("The project changed since the supplied context was read",
                                details={"expected": expected.to_dict(),
@@ -5702,6 +5705,19 @@ def reaper_measure(archive_root: str,
         # Two identical calls produce identical bytes; the id keeps each
         # measurement an individually addressable fact for the client.
         result.setdefault("measurement_id", uuid.uuid4().hex)
+        before_revision = None
+        if isinstance(before, dict):
+            before_revision = before if before.get("project_id") else before.get("revision")
+        if before_revision:
+            result["revision_before"] = before_revision
+            after_count = int((after or {}).get("change_count") or 0)
+            before_count = int(before_revision.get("change_count") or 0)
+            if after_count and after_count != before_count:
+                result["self_noise"] = {
+                    "change_count_delta": after_count - before_count,
+                    "reason": "analysis render writes and restores project render settings",
+                    "tolerated": True,
+                }
     return result
 
 

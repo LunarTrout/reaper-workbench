@@ -207,3 +207,8 @@ def seconds_since_mint(token: str) -> float | None:
 
 
 __all__ = ["mint", "require", "seconds_since_mint"]
+
+
+def explained_by_self_noise(project_id: str, minted: int, current: int) -> bool:
+    """True when the counter delta is the library's own render churn."""
+    return _explained_by_self_noise(project_id, minted, current)

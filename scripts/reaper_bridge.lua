@@ -45,7 +45,7 @@ if _G.__reaper_audio_bridge_resident and not _G.__reaper_audio_bridge_reloading 
   return
 end
 _G.__reaper_audio_bridge_resident = true
-local bridge_build = "b22-2026-11-20"  -- midi.replace for bass line rewrites
+local bridge_build = "b23-2026-11-21"  -- midi.replace for bass line rewrites
 -- A second boot inside the same REAPER Lua state must supersede the first:
 -- two loops would both keep heartbeating and the client would see two live
 -- bridges. Every loop compares this token before it reschedules; the newest
@@ -1864,14 +1864,15 @@ local function project_capture_render(arguments)
   local track_count = reaper.CountTracks(project)
   local tracks, selected = {}, {}
   local capture_targets = {}
+  local changed_numeric, changed_strings = {}, {}
   local function restore()
     local failures = {}
-    for _, name in ipairs(numeric_fields) do
+    for _, name in ipairs(changed_numeric) do
       local ok, value = pcall(reaper.GetSetProjectInfo, project, name,
                               prior_numeric[name], true)
       if not ok or not finite_number(value) then failures[#failures + 1] = name end
     end
-    for _, name in ipairs(string_fields) do
+    for _, name in ipairs(changed_strings) do
       local ok, value = pcall(reaper.GetSetProjectInfo_String, project, name,
                               prior_strings[name], true)
       if not ok or value == false then failures[#failures + 1] = name end
@@ -1880,8 +1881,11 @@ local function project_capture_render(arguments)
       local ok = pcall(reaper.SetTrackSelected, tracks[index + 1], selected[index + 1])
       if not ok then failures[#failures + 1] = "track_selection:" .. tostring(index) end
     end
-    local dirty_ok, dirty_value = pcall(reaper.GetSetProjectInfo, project,
-                                        "DIRTY", prior_dirty, true)
+    local dirty_ok, dirty_value = true, prior_dirty
+    if math.abs(reaper.GetSetProjectInfo(project, "DIRTY", 0, false) - prior_dirty) > 1e-9 then
+      dirty_ok, dirty_value = pcall(reaper.GetSetProjectInfo, project,
+                                    "DIRTY", prior_dirty, true)
+    end
     local actual_dirty = reaper.GetSetProjectInfo(project, "DIRTY", 0, false)
     if not dirty_ok or not finite_number(dirty_value) or
        not finite_number(actual_dirty) or math.abs(actual_dirty - prior_dirty) > 1e-9 then
@@ -1949,6 +1953,11 @@ local function project_capture_render(arguments)
     if subset ~= nil then target_track_count = subset_count end
 
     local function set_number(name, value)
+      local current = reaper.GetSetProjectInfo(project, name, 0, false)
+      if finite_number(current) and math.abs(current - value) <= 1e-9 then
+        return -- already what the render needs; do not touch project state
+      end
+      changed_numeric[#changed_numeric + 1] = name
       local ok_set = pcall(reaper.GetSetProjectInfo, project, name, value, true)
       if not ok_set then error("REAPER rejected render setting " .. name) end
       local actual = reaper.GetSetProjectInfo(project, name, 0, false)
@@ -1957,6 +1966,11 @@ local function project_capture_render(arguments)
       end
     end
     local function set_string(name, value)
+      local _, current = reaper.GetSetProjectInfo_String(project, name, "", false)
+      if type(current) == "string" and current == value then
+        return -- identical value: leave the project untouched
+      end
+      changed_strings[#changed_strings + 1] = name
       local ok_set, result = reaper.GetSetProjectInfo_String(project, name, value, true)
       if not ok_set or result == false then
         error("REAPER rejected render setting " .. name)
