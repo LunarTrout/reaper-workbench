@@ -3666,7 +3666,7 @@ def reaper_edit(mode: str,
         session = _session(project_id, bridge_session_id)
         return {"ok": True, **undo_receipt(
             session, receipt, receipt_store=_receipt_store(archive_root),
-            allow_overwrite=allow_overwrite)}
+            allow_overwrite=allow_overwrite, verify=verify)}
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)
     _current_context(session, expected)
@@ -3686,7 +3686,7 @@ def reaper_edit(mode: str,
                     "revision": expected.to_dict()}
     if mode == "apply" and plan_id is None and isinstance(operations, list) and operations:
         return {"ok": True, "mode": "apply", **run_edit(
-            session, operations, reason=reason or "edit",
+            session, operations, reason=reason or "edit", verify=verify,
             receipt_store=_receipt_store(archive_root), max_rebase=2)}
     access: dict[str, Any] | None = None
     if mode != "preview":

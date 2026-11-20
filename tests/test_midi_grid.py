@@ -136,12 +136,14 @@ def test_tempo_map_inherits_zero_bpm_and_zero_meter_fields():
     assert tempo.points[1].numerator == 4
 
 
-def test_tempo_map_refuses_markers_that_disagree_with_music_time():
-    with pytest.raises(BridgeUnavailable, match="inconsistent"):
-        TempoMap.from_context(tempo_context([
-            marker(0.0, 0, 0.0, 120.0),
-            marker(2.0, 2, 0.0, 120.0),
-        ]))
+def test_tempo_map_reports_markers_that_disagree_with_music_time():
+    tempo = TempoMap.from_context(tempo_context([
+        marker(0.0, 0, 0.0, 120.0),
+        marker(2.0, 2, 0.0, 120.0),
+    ]))
+    assert tempo.warnings
+    assert tempo.warnings[0]["code"] == "tempo_map_measure_mismatch"
+    assert tempo.points[1].measure == 2
 
 
 def test_tempo_map_handles_a_marker_without_a_bar_position():

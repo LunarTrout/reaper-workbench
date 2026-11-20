@@ -134,6 +134,7 @@ class TempoMap:
     points: tuple[TempoPoint, ...]
     meters: tuple[_MeterSpan, ...]
     source: str
+    warnings: tuple[dict[str, Any], ...] = ()
 
     # -- construction -------------------------------------------------------
 
@@ -251,7 +252,7 @@ class TempoMap:
                                  "marker_time_s": points[0].time_s,
                                  "base_bpm": base_bpm},
                     )
-        _check_tempo_integration(points)
+        integration_warnings = _check_tempo_integration(points)
 
         meters: list[_MeterSpan] = [_MeterSpan(
             start_bar=0, start_qn=0.0, beat_qn=4.0 / base_den,
@@ -287,7 +288,8 @@ class TempoMap:
                 deduped[-1] = span
             else:
                 deduped.append(span)
-        return cls(points=tuple(points), meters=tuple(deduped), source=source)
+        return cls(points=tuple(points), meters=tuple(deduped), source=source,
+                   warnings=tuple(integration_warnings))
 
     # -- basic lookup -------------------------------------------------------
 
@@ -413,8 +415,17 @@ class TempoMap:
         return min(candidates, key=lambda candidate: abs(candidate - qn))
 
 
-def _qn_tolerance(value: float) -> float:
-    return max(1e-6, abs(value) * 1e-9)
+def _qn_tolerance(value: float, bpm: float | None = None) -> float:
+    """Float slack plus a real-world marker rounding allowance.
+
+    REAPER stores tempo-marker times rounded to the edit-cursor precision, so a
+    musically exact marker can differ by a few milliseconds. The allowance is a
+    time tolerance converted through the local tempo, not a musical constant.
+    """
+    base = max(1e-6, abs(value) * 1e-9)
+    if bpm:
+        base = max(base, 0.005 * float(bpm) / 60.0)
+    return base
 
 
 def _linear_fraction(normalized_qn: float, bpm_start: float, bpm_end: float) -> float:
@@ -434,7 +445,14 @@ def _linear_fraction(normalized_qn: float, bpm_start: float, bpm_end: float) -> 
     return min(1.0, max(0.0, root))
 
 
-def _check_tempo_integration(points: list[TempoPoint]) -> None:
+def _check_tempo_integration(points: list[TempoPoint]) -> list[dict[str, Any]]:
+    """Report positions whose measure grid disagrees with the tempo integral.
+
+    Real projects carry rounded marker times and meter edits; a disagreement is
+    a fact about the project, not a reason to refuse every MIDI operation.
+    Decreasing time order stays fatal because it cannot be interpreted.
+    """
+    warnings: list[dict[str, Any]] = []
     for index in range(len(points) - 1):
         current, nxt = points[index], points[index + 1]
         delta_t = nxt.time_s - current.time_s
@@ -455,19 +473,20 @@ def _check_tempo_integration(points: list[TempoPoint]) -> None:
         integrated_bpm = (0.5 * (current.bpm + nxt.bpm)
                           if current.linear else current.bpm)
         expected_qn = delta_t * integrated_bpm / 60.0
-        tolerance = max(_qn_tolerance(expected_qn), abs(delta_qn) * 1e-6)
+        tolerance = max(_qn_tolerance(expected_qn, integrated_bpm), abs(delta_qn) * 1e-6)
         if abs(expected_qn - delta_qn) > tolerance:
-            raise BridgeUnavailable(
-                "The tempo map is inconsistent with its measure positions",
-                details={"marker_index": index + 1,
-                         "time_s": nxt.time_s, "measure": nxt.measure,
-                         "beat": nxt.beat,
-                         "musical_delta_qn": delta_qn,
-                         "tempo_delta_qn": expected_qn,
-                         "linear": current.linear,
-                         "bpm": current.bpm,
-                         "next_bpm": nxt.bpm},
-            )
+            warnings.append({
+                "code": "tempo_map_measure_mismatch",
+                "marker_index": index + 1,
+                "time_s": nxt.time_s,
+                "measure": nxt.measure,
+                "beat": nxt.beat,
+                "musical_delta_qn": delta_qn,
+                "tempo_delta_qn": expected_qn,
+                "bpm": current.bpm,
+                "next_bpm": nxt.bpm,
+            })
+    return warnings
 
 
 # ---------------------------------------------------------------------------
@@ -581,17 +600,17 @@ class MidiItem:
         explicit_offset = item.get("take_offset_qn", item.get("start_offset_qn"))
         if explicit_offset is not None:
             take_offset_qn = _number(explicit_offset, "item.take_offset_qn")
+        elif start_offset_s > 0:
+            # REAPER already states the trim; measuring backwards from the item
+            # start is exact for the active tempo span and needs no guessing.
+            take_offset_qn = (tempo.time_to_qn(position_s)
+                              - tempo.time_to_qn(position_s - start_offset_s))
         else:
-            inferred = _infer_take_offset(raw_notes, position_s, playrate, tempo)
-            if inferred is not None:
-                take_offset_qn = inferred
-            else:
-                # No notes to prove the offset from.  A left trim removes the
-                # seconds immediately before the item's start on the project
-                # timeline, so measure the offset backwards from that start
-                # rather than from time zero (where the tempo often differs).
-                take_offset_qn = (tempo.time_to_qn(position_s)
-                                  - tempo.time_to_qn(position_s - start_offset_s))
+            # REAPER reports no trim: the take starts at the item start.  Do not
+            # reconstruct an offset from note PPQ — a note list written through
+            # midi.replace carries project seconds, and combining that with the
+            # take PPQ grid produces a false disagreement.
+            take_offset_qn = 0.0
         base = cls(guid=guid, position_s=position_s, length_s=length_s,
                    take_offset_qn=take_offset_qn, playrate=playrate,
                    tempo=tempo, notes=())
