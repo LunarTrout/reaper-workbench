@@ -106,26 +106,23 @@ def test_no_new_tool_per_metric_or_model_backend() -> None:
                                                "timeline"}, name
 
 
-def test_server_instructions_state_the_complete_panorama_and_delta_path() -> None:
+def test_server_instructions_delegate_to_the_handbook() -> None:
     text = mcp_server.server.instructions or ""
-    assert "size-independent" in text
-    assert "reaper_panorama_open()" in text
-    # A whole-project claim still needs every page; an edit does not.
-    assert "every declared page acknowledged" in text
-    assert "structural token" in text
-    assert "not a full panorama" in text
-    assert "or edit requires fetching every declared page" not in text
-    assert "work mode" in text.lower() or "work mode" in text
-    assert "page_id_pattern" in text
-    assert "manifest_sha256" in text
-    assert "status=change_page" in text
-    assert "result_page" in text
-    assert "not an automatic next step" in text
-    assert 'reaper_capabilities(mode="tools")' in text or \
-        "reaper_capabilities(mode='tools')" in text
-    assert "do not page as a normal workflow" not in text
-    assert 'Prefer reaper_panorama_open(mode="single")' not in text
-    assert "reaper://guide/model" in text
+    # The short instruction must point at the handbook and gate the work.
+    assert "reaper://handbook" in text
+    assert "HANDBOOK_REQUIRED" in text
+    assert "no invented thresholds" in text
+    assert "status" in text and "measure" in text and "edit" in text
+    assert len(text) <= 2200
+
+    # The complete protocol lives in the handbook, not in the injected text.
+    handbook = mcp_server.handbook_resource()
+    assert "size-independent" in handbook
+    assert "every declared page" in handbook
+    assert "structural token" in handbook
+    assert "work mode" in handbook.lower()
+    assert "manifest_sha256" in handbook
+    assert "anti-patterns" in handbook.lower()
 
 
 def test_model_guide_resource_carries_the_same_contract() -> None:

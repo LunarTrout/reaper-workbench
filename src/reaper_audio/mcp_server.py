@@ -80,6 +80,49 @@ from .reaper.bridge_lifecycle import (
 from .reaper.handles import ReaperHandle
 
 _LOG = logging.getLogger("reaper_audio.mcp")
+
+
+# --- handbook gate -----------------------------------------------------------
+
+_HANDBOOK_PATH = Path(__file__).resolve().parents[2] / "docs" / "HANDBOOK.md"
+_handbook_read: set[str] = set()
+_handbook_lock = threading.Lock()
+
+
+def _handbook_bytes() -> bytes:
+    return _HANDBOOK_PATH.read_bytes()
+
+
+def _handbook_sha() -> str:
+    return hashlib.sha256(_handbook_bytes()).hexdigest()
+
+
+def _handbook_text() -> str:
+    return _handbook_bytes().decode("utf-8")
+
+
+def _mark_handbook_read(digest: str | None = None) -> None:
+    with _handbook_lock:
+        _handbook_read.add(digest or _handbook_sha())
+
+
+def _handbook_required() -> None:
+    """Refuse measurement and edits until the handbook has been read."""
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("REAPER_HANDBOOK_TEST"):
+        return
+    digest = _handbook_sha()
+    with _handbook_lock:
+        if digest in _handbook_read:
+            return
+    raise ValidationError(
+        "HANDBOOK_REQUIRED: read reaper://handbook before measuring or editing",
+        details={
+            "code": "HANDBOOK_REQUIRED",
+            "hint": "read_resource('reaper://handbook')",
+            "sha256": digest,
+        },
+    )
+
 _ANALYSIS_TTL_S = 60 * 60
 _PLAN_TTL_S = 10 * 60
 _MAX_ANALYSES_PER_ROLE = 1
@@ -550,129 +593,7 @@ server = MCPServer(
                  "project panorama delivered whole when it fits or as a complete "
                  "lossless page set when it does not, exact semantic queries, and "
                  "factual change updates that are themselves pageable."),
-    instructions=(
-        "REAPER Workbench. Find the task with reaper_capabilities(mode=\"tools\") — "
-        "the surface is grouped by session, project, capture, panorama, analysis, edit, "
-        "discovery and research, not one tool per ReaScript function. " "The work mode, the stale-share threshold and the lock are set by the user at "
-        "session start. Change them only at the user's explicit request — never on your "
-        "own, not to optimise, and not to get past a gate; if the mode blocks the work, "
-        "ask instead of switching. reaper_mode reads them and, on that request, changes "
-        "them; every response repeats the current mode. Strict means the checks block, "
-        "advisory means they are reported and the action proceeds marked unverified, off "
-        "means only project/instance/revision identity is checked. An edit requires a "
-        "current structural token, not a full panorama; a full panorama is needed only "
-        "for audio claims and global verdicts. ""Establish the "
-        "project, its identity and exact revision with reaper_session and reaper_project, "
-        "then reaper_panorama_status. Start the full project context with "
-        "reaper_panorama_open() and no mode argument: the default is size-independent "
-        "auto. It returns the complete full view with its receipt and context token "
-        "in one measured result when that fits the declared budget; otherwise it returns "
-        "page 1 plus a manifest of every page. Pages are the complete path, not a legacy "
-        "fallback: a whole-project claim needs every declared page acknowledged. A "
-        "structural edit does not: it needs a current structural token from "
-        "reaper_structural_token (project, instance, epoch, revision and the project-map "
-        "digest), which costs one cheap read, no capture and no audio. Do not choose a "
-        "subset of pages, and do not ask "
-        "the model to guess single vs pages; an explicit mode=\"single\" over budget also "
-        "falls back to pages. If manifest.page_ids is present, fetch every id in order; if "
-        "it is omitted for a very large set, enumerate the declared page_id_pattern for "
-        "1..page_count. Then call reaper_panorama_ack with every page_hash in order, or "
-        "with manifest_sha256 alone, which commits to the same ordered page set. A partial "
-        "set returns the missing page ids and mints no receipt or context token. "
-        "If a page is replaced by a host spillover notice, it was not read: reopen the "
-        "same capture with smaller page sizes and fetch the full page text. A receipt "
-        "proves the server served these exact pages, not that every text was visible, "
-        "that you understood it, or that you heard audio. "
-        "The guide resource reaper://guide/model states this protocol in one place. "
-        "Bridge, evidence and MIDI helpers are first-class: reaper_bridge(action=status|cleanup|ensure) "
-        "lists live bridges, retires duplicates and starts REAPER when none answers; exactly one "
-        "resident loop survives per process. reaper_measure reopens offline media itself and returns "
-        "a unique measurement_id, so two identical windows remain two distinct facts. A value target "
-        "(\"25 ms\", \"3:1\") calibrates itself on first use and is cached. reaper_midi reads per-pitch "
-        "statistics, edits velocities and quantises note starts. reaper_evidence returns the units "
-        "behind an evidence token. A measurement no longer invalidates a structural token: its map "
-        "hash ignores render configuration and quantises positions to 0.1 s. "
-        "The panorama is a project-wide map, "
-        "not full-resolution audio evidence: temporal maps use declared aggregation, and exact series and relation rows "
-        "are fetched separately. Check coverage, point counts, resolution, aggregation, units, stage, and provenance. "
-        "Before a conclusion or edit depends on fine timing, frequency, transient, or relation evidence, fetch the exact "
-        "relevant source(s) and interval with reaper_panorama_query; narrow the interval if the result is over budget. "
-        "Never treat a missing or summarized value as proof that the event or feature is absent. A URI alone does not "
-        "mean an audio-capable client delivered sound to the model. A complete receipt unlocks analysis and exact "
-        "queries; an edit needs a structural token, and a stale revision needs either a fresh token or a new open. "
-        "Create a capture with reaper_capture_snapshot only when no capture matches the "
-        "revision. Do not interpret project audio from a partial panorama. If "
-        "reaper_capture_snapshot returns panorama_capacity_exceeded with details.capture_id "
-        "and says the canonical record remains archived, only one-shot delivery failed: do "
-        "not capture again. Open that exact capture with reaper_panorama_open using the same "
-        "project_id/archive_root, fetch every page and acknowledge all hashes, then use "
-        "archive-mode reaper_analyze for that capture and receipt. Its measurements apply "
-        "only to the archived revision. Exact "
-        "high-frequency rows "
-        "(relation edges, series cells, MIDI notes, envelope points) come from "
-        "reaper_panorama_query by semantic selection. If a query, audio comparison or scoped "
-        "analysis result is too large for one measured response, it is delivered as "
-        "complete result_page pages; fetch every page and acknowledge the hashes or "
-        "manifest hash. Result-page acknowledgement proves reconstruction only and mints "
-        "no receipt, context token or edit permission. "
-        "Use reaper_analyze with capture_id, analyzers, source_ids and intervals for one "
-        "scoped batch; the analyzer IDs, scope, prerequisites and relative cost classes are "
-        "in reaper_capabilities(mode=\"tools\"). A scoped result is not whole-project "
-        "coverage. A full panorama is not an automatic next step after edits or scoped "
-        "analysis: keep working from the acknowledged view, the change journal and local "
-        "evidence while they support the next decision; request a new full panorama only "
-        "when the next consequential global decision needs fresh whole-project evidence, "
-        "the user asks for a complete overview, or before a final whole-project conclusion. "
-        "The latest context_token is the model's current known project state. For routine "
-        "continuity, call reaper_panorama_changes_since with that token; do not restart "
-        "from the first capture. An explicitly named pair of archived captures is a "
-        "separate version comparison, not the normal current-state update. "
-        "Every successful mutation (reaper_edit apply/undo, "
-        "reaper_api_call, reaper_action, reaper_render_candidate) returns an update: the "
-        "stable ids it touched with only their new current values, the current revision "
-        "and the successor context token. Unchanged facts are not resent and no internal "
-        "mutation record is exposed. An update too large for one measured result returns "
-        "status=change_page with page 1, a manifest and a handle. Fetch every declared "
-        "change page, then acknowledge all page hashes or the manifest hash; only that "
-        "complete acknowledgement advances the token exactly once. Use the returned "
-        "context_token for the next structural edit and continue editing at the new "
-        "revision without another full capture. An update never makes stale audio "
-        "current: its audio_evidence names every invalidated source, and project-target "
-        "analysis refuses until a fresh capture is acknowledged. Updates address objects "
-        "by stable IDs and semantic paths, not array positions; a track insertion or FX "
-        "move must not be read as a change to every later object. "
-        "A measurement-heavy update may carry its exact metric ops once in "
-        "metric_table (integer-indexed columns plus exact dictionaries and a "
-        "path_pattern); expand every row and do not treat it as a summary. "
-        "Comparability is factual: if method/version, unit, stage, window or grid evidence "
-        "does not match, the comparison says unknown or incomparable and still shows each "
-        "side's exact measured values; it never emits a better/worse verdict. "
-        "Raw API calls and Actions have unknown mutation scope and invalidate project audio "
-        "conservatively. Use reaper_capabilities and reaper_api_search to discover "
-        "operations; do not assume a fixed musical workflow. Project edits are batched as "
-        "preview, then apply, then read back; every write is tied to project_id and "
-        "expected_revision. The generic API and Actions remain available for documented "
-        "REAPER functions beyond convenience edits. Audio analysis uses native REAPER render "
-        "capture; raw AudioAccessor samples are pre-FX and are not processed mix stems. "
-        "Temporary audio is outside the project and has a bounded lease. "
-        "Operational anti-patterns: keep project_id, bridge/instance identity, epoch, "
-        "change_count, capture_id and its receipt/context_token together; never combine "
-        "tokens from different identities or revisions. After a mutation, use the returned "
-        "successor token for structural work; if audio_evidence is stale, do not analyze old "
-        "audio with it. For reaper_analyze, evidence_revision binds the measured WAV; "
-        "revision_after_capture may include render-restoration counter churn and is not the "
-        "audio revision. On stale_context/audio_evidence_fresh, inspect details and "
-        "next_action, check whether an exact-revision capture already exists, then make at "
-        "most one fresh capture/open/fetch-all-pages/ack cycle and retry the refused call "
-        "once. If it still fails, stop and report the exact blocker; never loop captures or "
-        "launch duplicate synchronous analysis. render_candidate_mismatch is failed "
-        "verification: do not retry blindly or call an FX-chunk difference harmless. Read "
-        "the affected project and FX parameters through MCP; without semantic before/after "
-        "evidence, leave verification unresolved. A saved checkpoint proves persistence, "
-        "not audio quality: distinguish saved, read back, measured after the last edit, "
-        "and auditioned. Use MCP for all project reads, edits and analysis; never bypass "
-        "its gates with direct bridge calls, scripts, GUI operations or hand-edited RPP files."
-    ),
+    instructions=("REAPER Workbench — read, measure and edit a live REAPER project. BEFORE ANY MEASUREMENT OR EDIT: read the resource reaper://handbook. It is the full manual (capabilities, units, protocols, anti-patterns) and unlocks the work. Until it is read, measure/edit/midi/analyze return HANDBOOK_REQUIRED; re-read it if its sha256 changes. Start with reaper_session, then reaper_project; if runtime.stale is true, restart the app before editing. Capability map: reaper://capabilities/index. Surface is grouped in ten domains: session (status, preflight, transport, project, settings, app, wait, context, timeline, mode, release), measure (run, capture, capture_read, freshness, coverage, candidate), edit (preview, apply, undo), midi (read, velocity, quantize, replace, generate, grid_check, preview), calibrate, analyze (run, edit_map, evidence, units), action, api, flamingo, spatial. Rules: (1) order status → measure → edit(verify) → receipt; an edit without preflight returns PREFLIGHT_REQUIRED; (2) no number from memory — quote measurement_id or receipt; (3) no invented thresholds — facts and policy violations only (source='policy'); (4) do not start, stop or save REAPER unless asked; (5) measure only what the decision needs: pass intervals and metrics lists; a full render is for export or whole-track claims; (6) context: open → every page → ack; a receipt proves delivery, not understanding; a missing value is not proof of absence; (7) work modes strict/advisory/off belong to the user — never switch them to pass a gate; (8) errors carry code, hint and retryable — retry only when retryable."),
 )
 
 
@@ -1933,6 +1854,7 @@ def reaper_midi(action: str = "notes", item_guid: str | None = None,
     take; it answers with how many notes changed. ``quantize`` snaps note starts
     to ``grid_s`` seconds with partial ``strength`` (0-1) and keeps lengths.
     """
+    _handbook_required()
     bridge = ReaperBridge()
     health = bridge.health(timeout_s=5.0)
     project = health.get("project") or {}
@@ -3126,6 +3048,7 @@ def reaper_analyze(project_id: str | None = None,
     sample_rate are the render request. All three options affect only the
     project capture: reference files and reference windows are read unchanged.
     """
+    _handbook_required()
     if (start_s is None) != (end_s is None):
         raise ValidationError("start_s and end_s must be supplied together")
     section = Section(start_s, end_s) if start_s is not None else None
@@ -3632,6 +3555,7 @@ def reaper_edit(mode: str,
     generic API calls and Actions remain available for operations outside this
     transaction set.
     """
+    _handbook_required()
     if mode not in {"preview", "apply", "undo"}:
         raise ValidationError("mode must be preview, apply, or undo")
     expected = _revision(expected_revision, project_id=project_id)
@@ -4797,6 +4721,17 @@ def model_guide_resource() -> str:
     return json.dumps(MODEL_GUIDE, ensure_ascii=False, separators=(",", ":"))
 
 
+@server.resource("reaper://handbook", name="REAPER Workbench handbook",
+                 description=("Complete manual: capabilities, units, protocols and "
+                              "anti-patterns. Must be read before measuring or editing."),
+                 mime_type="text/markdown")
+def handbook_resource() -> str:
+    text = _handbook_text()
+    _mark_handbook_read(_handbook_sha())
+    return text
+
+
+
 @server.resource("reaper://capabilities/index", name="REAPER capability index",
                  description="Compact domain map for the full documented API and native library features.",
                  mime_type="application/json")
@@ -5546,6 +5481,7 @@ def reaper_measure(archive_root: str,
     produces only via-master stems and the master mix, and it never substitutes
     one stage for another.
     """
+    _handbook_required()
     if (start_s is None) != (end_s is None):
         raise ValidationError("start_s and end_s must both be provided or both be null")
     section = None

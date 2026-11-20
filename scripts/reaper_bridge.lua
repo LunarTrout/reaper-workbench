@@ -45,7 +45,7 @@ if _G.__reaper_audio_bridge_resident and not _G.__reaper_audio_bridge_reloading 
   return
 end
 _G.__reaper_audio_bridge_resident = true
-local bridge_build = "b21-2026-11-19"  -- midi.notes uses project time
+local bridge_build = "b22-2026-11-20"  -- midi.replace for bass line rewrites
 -- A second boot inside the same REAPER Lua state must supersede the first:
 -- two loops would both keep heartbeating and the client would see two live
 -- bridges. Every loop compares this token before it reschedules; the newest
@@ -2541,6 +2541,39 @@ local function midi_notes(arguments)
   return { note_count = note_count, notes = notes }
 end
 
+local function midi_replace(arguments)
+  local project = active_project()
+  local item = resolve_item(project, arguments.item_guid)
+  if not item then
+    fail("item_not_found", "The item is not in the active project",
+         { item_guid = arguments.item_guid })
+  end
+  local take = reaper.GetActiveTake(item)
+  if not take or not reaper.TakeIsMIDI(take) then
+    fail("not_midi", "The active take is not a MIDI take")
+  end
+  local notes = arguments.notes
+  if type(notes) ~= "table" or #notes > 20000 then
+    fail("validation_error", "midi.replace notes must be an array of at most 20000 events")
+  end
+  local _, note_count = reaper.MIDI_CountEvts(take)
+  for index = note_count - 1, 0, -1 do
+    reaper.MIDI_DeleteNote(take, index)
+  end
+  local inserted = 0
+  for _, note in ipairs(notes) do
+    local start_qn = reaper.MIDI_GetPPQPosFromProjTime(take, note.time_s)
+    local end_qn = reaper.MIDI_GetPPQPosFromProjTime(take, note.end_s)
+    if end_qn <= start_qn then end_qn = start_qn + 1 end
+    local ok = reaper.MIDI_InsertNote(take, false, false, start_qn, end_qn, 0,
+                                      math.floor(note.pitch + 0.5),
+                                      math.floor((note.velocity or 90) + 0.5), true)
+    if ok then inserted = inserted + 1 end
+  end
+  reaper.MIDI_Sort(take)
+  return { inserted = inserted, removed = note_count }
+end
+
 local function json_value(value, depth, seen)
   if depth > 64 then fail("api_call_failed", "API result nesting limit exceeded") end
   if value == nil or value == json.null then return json.null end
@@ -4779,6 +4812,7 @@ local operations = {
   ["midi.velocity_scale"] = midi_velocity_scale,
   ["midi.quantize"] = midi_quantize,
   ["midi.notes"] = midi_notes,
+  ["midi.replace"] = midi_replace,
   ["api.exists"] = function(arguments)
     local name = arguments.name
     if type(name) ~= "string" then error("name must be a string") end

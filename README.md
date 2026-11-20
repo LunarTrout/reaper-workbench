@@ -119,7 +119,7 @@ Project context starts with one complete panorama bound to a capture and revisio
 
 The page parameters are named `*_bytes` for compatibility, but the current implementation measures the character count of an indented JSON rendering of each result; this is not a UTF-8 wire-byte count or the complete MCP transport envelope, and host-specific limits still need validation. Defaults are 30,000 characters target and 46,000 characters maximum per page. On the archived 41-track / 42-source reference capture the full model view is 46,977 compact bytes and is delivered in 5 pages (31,691 / 27,681 / 14,266 / 38,084 / 25,890 measured characters, max 38,084); the 101-source synthetic fixture (80,717-byte view) needs 12 pages, max 45,185. There is no page-count cap. A section larger than one page is split only at list-element boundaries with its head repeated; a single element that cannot fit raises with its measured size. The view keeps every track/master and all 24 scalar metric columns with units, window, stage and method provenance; exact item/take/audio rows, series cells, relation edges, MIDI notes and envelope points stay addressable by one semantic query. Inline scalar values are explicitly rounded, and `reaper_panorama_query(data=["analysis"], objects=[...], metrics=[...])` returns the unrounded stored values.
 
-The model-facing contract is intentionally broader than preset musical workflows. Mixing, editing, arranging, MIDI authoring, and other tasks are expressed as goals assembled from project inspection, analysis, and REAPER operations; the interface does not impose genre rules or a fixed processing chain. See the [model guide](docs/MCP-README-LLM.md) for tool semantics and context handling, [architecture](docs/ARCHITECTURE.md) for current implementation details, and [historical documents](docs/OLD.md) for superseded drafts.
+The model-facing contract is intentionally broader than preset musical workflows. Mixing, editing, arranging, MIDI authoring, and other tasks are expressed as goals assembled from project inspection, analysis, and REAPER operations; the interface does not impose genre rules or a fixed processing chain. See the [model guide](docs/MCP-README-LLM.md) for tool semantics and context handling, [architecture](docs/ARCHITECTURE.md) for current implementation details, and [historical documents](docs/archive/OLD.md) for superseded drafts.
 
 ### Working principles (not a mixing pipeline)
 
@@ -199,7 +199,7 @@ See  for the index and the sync rule with the Hermes profile copy.
 - [Safety and project-state guarantees](docs/SAFETY.md)
 - [MCP guide for language models](docs/MCP-README-LLM.md)
 - [Validation status and release gates](docs/VALIDATION.md)
-- [Historical documents and superseded drafts](docs/OLD.md)
+- [Historical documents and superseded drafts](docs/archive/OLD.md)
 - [Russian documentation](README.ru.md)
 
 ## License
