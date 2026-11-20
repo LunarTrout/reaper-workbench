@@ -98,3 +98,51 @@ class RenderUnsupported(RenderCandidateRefused):
     """The installed bridge cannot provide the required master render."""
 
     code = "render_unsupported"
+
+
+class StaleAfterRetry(StaleContext):
+    """Every automatic rebase attempt hit a new revision; nothing was applied.
+
+    The edit layer retries a stale revision by re-reading the project and
+    rebuilding its operations.  When the project keeps moving for every
+    attempt, the caller must see that the retries were exhausted instead of a
+    bare ``stale_context`` that looks like the first failure.
+    """
+
+    code = "stale_after_retry"
+
+
+class EnvelopeGuardRejected(ValidationError):
+    """An envelope write would violate the caller-supplied guard."""
+
+    code = "envelope_guard_rejected"
+
+
+class SendRoutingError(ValidationError):
+    """A send cannot be addressed unambiguously by its destination."""
+
+    code = "send_routing_conflict"
+
+
+class TrackDeleteRefused(ValidationError):
+    """A track delete cannot be planned against the current project."""
+
+    code = "track_delete_refused"
+
+
+class ReceiptNotFound(ValidationError):
+    """No edit receipt with the requested identifier exists."""
+
+    code = "receipt_not_found"
+
+
+class ReceiptConflict(ValidationError):
+    """A receipt undo would overwrite a value the caller has since changed."""
+
+    code = "receipt_conflict"
+
+
+class ReceiptNotUndoable(ValidationError):
+    """A receipt describes an operation that cannot be inverted precisely."""
+
+    code = "receipt_not_undoable"
