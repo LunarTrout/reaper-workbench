@@ -636,7 +636,7 @@ server = MCPServer(
                  "project panorama delivered whole when it fits or as a complete "
                  "lossless page set when it does not, exact semantic queries, and "
                  "factual change updates that are themselves pageable."),
-    instructions=("REAPER Workbench — read, measure and edit a live REAPER project. BEFORE ANY MEASUREMENT OR EDIT: read the resource reaper://handbook. It is the full manual (capabilities, units, protocols, anti-patterns) and unlocks the work. Until it is read, measure/edit/midi/analyze return HANDBOOK_REQUIRED; re-read it if its sha256 changes. Start with reaper_session, then reaper_project; if runtime.stale is true, restart the app before editing. Capability map: reaper://capabilities/index. Surface is grouped in ten domains: session (status, preflight, transport, project, settings, app, wait, context, timeline, mode, release), measure (run, capture, capture_read, freshness, coverage, candidate), edit (preview, apply, undo), midi (read, velocity, quantize, replace, generate, grid_check, preview), calibrate, analyze (run, edit_map, evidence, units), action, api, flamingo, spatial. Rules: (1) order status → measure → edit(verify) → receipt; an edit without preflight returns PREFLIGHT_REQUIRED; (2) no number from memory — quote measurement_id or receipt; (3) no invented thresholds — facts and policy violations only (source='policy'); (4) do not start, stop or save REAPER unless asked; (5) measure only what the decision needs: pass intervals and metrics lists; a full render is for export or whole-track claims; (6) context: open → every page → ack; a receipt proves delivery, not understanding; a missing value is not proof of absence; (7) work modes strict/advisory/off belong to the user — never switch them to pass a gate; (8) errors carry code, hint and retryable — retry only when retryable."),
+    instructions=("REAPER Workbench — read, measure and edit a live REAPER project. BEFORE ANY MEASUREMENT OR EDIT: read the resource reaper://handbook. It is the full manual (capabilities, units, protocols, anti-patterns) and unlocks the work. Until it is read, measure/edit/midi/analyze return HANDBOOK_REQUIRED; re-read it if its sha256 changes. Start with reaper_session, then reaper_project; if runtime.stale is true, restart the app before editing. Capability map: reaper://capabilities/index. Surface is grouped in eleven domains: session (status, preflight, transport, project, settings, app, wait, context, timeline, mode, release), measure (run, capture, capture_read, freshness, coverage, candidate), edit (preview, apply, undo), midi (read, velocity, quantize, replace, generate, grid_check, preview), calibrate, analyze (run, edit_map, evidence, units), action, api, flamingo, spatial, media (import references, encode with true-peak check). Rules: (1) order status → measure → edit(verify) → receipt; an edit without preflight returns PREFLIGHT_REQUIRED; (2) no number from memory — quote measurement_id or receipt; (3) no invented thresholds — facts and policy violations only (source='policy'); (4) do not start, stop or save REAPER unless asked; (5) measure only what the decision needs: pass intervals and metrics lists; a full render is for export or whole-track claims; (6) context: open → every page → ack; a receipt proves delivery, not understanding; a missing value is not proof of absence; (7) work modes strict/advisory/off belong to the user — never switch them to pass a gate; (8) errors carry code, hint and retryable — retry only when retryable."),
 )
 
 
@@ -5718,6 +5718,23 @@ def reaper_measure(archive_root: str,
                     "reason": "analysis render writes and restores project render settings",
                     "tolerated": True,
                 }
+        table = result.get("table") or {}
+        columns, cells = table.get("columns") or [], table.get("cells") or []
+        silent = []
+        for column in columns:
+            source_id = column.get("source_id")
+            values = [value for row in cells
+                      for value in ((row or {}).get(source_id) or {}).values()]
+            if values and all(value is None for value in values):
+                silent.append({
+                    "source_id": source_id, "name": column.get("name"),
+                    "hint": ("the rendered stem has no measurable signal; a bus whose "
+                             "audio arrives through receives can render silent — "
+                             "measure stage=master with this source soloed, or measure "
+                             "the track that owns the items"),
+                })
+        if silent:
+            result["silent_sources"] = silent
     return result
 
 
