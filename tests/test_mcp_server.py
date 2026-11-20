@@ -149,12 +149,12 @@ def test_mcp_surface_is_bounded_and_has_discovery_resources() -> None:
 
     # 35 project tools plus lifecycle, checkpoint, bridge control, evidence,
     # calibration and MIDI helpers.
-    assert len(names) == 40
+    assert len(names) == 41
     assert {"reaper_bridge_reload", "reaper_checkpoint_save",
             "reaper_bridge", "reaper_evidence", "reaper_calibrate",
             "reaper_midi"} <= names
     assert {"reaper_measure", "reaper_freshness", "reaper_coverage",
-            "reaper_mode"} <= names
+            "reaper_mode", "reaper_media"} <= names
     assert {"reaper_capabilities", "reaper_api_search", "reaper_api_call",
             "reaper_bridge_reload", "reaper_checkpoint_save",
             "reaper_project", "reaper_analyze", "reaper_edit",
@@ -171,7 +171,7 @@ def test_mcp_surface_is_bounded_and_has_discovery_resources() -> None:
             "reaper_measure", "reaper_freshness", "reaper_coverage",
             "reaper_mode", "reaper_structural_token",
             "reaper_bridge", "reaper_evidence", "reaper_calibrate",
-            "reaper_midi"} == names
+            "reaper_midi", "reaper_media"} == names
     # The paged panorama is model-visible; the old slice/detail/delta-ack tools are not.
     for removed in ("reaper_panorama_detail", "reaper_panorama_slice",
                     "reaper_panorama_delta_ack"):
