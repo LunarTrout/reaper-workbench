@@ -1,7 +1,7 @@
 """Wave B live capture gate — skipped unless the operator arms it.
 
 Nothing in this module runs by default.  It is the code half of
-``docs/research/round-3/WAVE-B-LIVE-CHECKLIST.md`` and it never opens, saves or
+This path never opens, saves or
 closes a project on its own: the operator must already have a *disposable copy*
 of the fixture open in a dedicated REAPER instance, and must point
 ``REAPER_WORKBENCH_FIXTURE`` at that copy's absolute ``.rpp`` path.  The test
