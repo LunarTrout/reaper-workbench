@@ -31,6 +31,7 @@ from typing import Any
 
 from .. import __version__
 from ..context.evidence import EvidenceStore
+from ..context.state_reads import read_state
 from ..context.status import (PREFLIGHT_SCHEMA, build_status, envelope_rows,
                               observation_codes)
 from ..errors import BridgeUnavailable, ValidationError
@@ -407,11 +408,29 @@ def project_status(session: Any, *, detail: str = "summary", sections: object = 
         count_midi_notes(session, context)
     root = archive_root if archive_root is not None else getattr(session, "archive_root", None)
     receipts = read_receipts(root) if "receipts" in selected_set else None
-    evidence = (read_evidence(root, revision) if "evidence" in selected_set
-                else None)
+    state: dict[str, Any] | None = None
+    evidence: dict[str, Any] | None = None
+    if "evidence" in selected_set:
+        try:
+            state = read_state(root, revision.project_id)
+        except ValidationError as error:
+            # A present but unreadable state must not fall back to legacy
+            # units: that would report old evidence as if state never existed.
+            evidence = {
+                "state": "unavailable",
+                "reason": "state_unreadable",
+                "detail": f"{type(error).__name__}: {error}"[:200],
+                "units_total": 0,
+                "units_current": 0,
+                "units_stale": 0,
+                "counts": {},
+            }
+        else:
+            if state is None:
+                evidence = read_evidence(root, revision)
     result = build_status(context=context, detail=detail, sections=selected,
                           runtime=runtime, offline=offline, missing=missing,
-                          receipts=receipts, evidence=evidence)
+                          receipts=receipts, evidence=evidence, state=state)
     if gaps:
         result["gaps"] = sorted(set(gaps))
     return result

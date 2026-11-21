@@ -248,12 +248,81 @@ def passport_from_units(units: Iterable[Mapping[str, Any]], *,
                "end_s": float(interval.get("end_s", 0.0))}
         if row not in measured.setdefault(source, []):
             measured[source].append(row)
-    return build_passport(scope=scope, measured=list(measured),
-                          total=total_sources, intervals=measured,
-                          revisions=dict(wanted), gaps_declared_by="server")
+    passport = build_passport(scope=scope, measured=list(measured),
+                              total=total_sources, intervals=measured,
+                              revisions=dict(wanted), gaps_declared_by="server")
+    passport["source"] = "legacy"
+    return passport
+
+
+def passport_from_state(state: object, *, scope: str, project_id: str,
+                        total_sources: Sequence[str] | None = None) -> dict[str, Any]:
+    """Build a coverage passport from the facts stored in project state.
+
+    ``measured`` sources are those with at least one ``current`` fact carrying a
+    real window; ``total_sources`` is the caller's live source list, defaulting
+    to the sources the state objects know about.  The result is the legacy
+    passport shape plus three additive keys: ``source`` (``"state"``),
+    ``state_token`` and ``counters`` (the full :func:`state_coverage` answer).
+    A state with no facts or no objects is marked incomplete with an explicit
+    gap; it never reads as a complete passport by having nothing to check.
+    """
+    from .state_reads import state_coverage
+
+    counters = state_coverage(state)
+    intervals = {source: [dict(row) for row in rows]
+                 for source, rows in (counters.get("intervals") or {}).items()
+                 if rows}
+    measured = sorted(intervals)
+    if total_sources is not None:
+        total = sorted({str(item) for item in total_sources})
+    else:
+        total = list((counters.get("sources") or {}).get("all") or [])
+    gaps: list[dict[str, Any]] = []
+    if not counters.get("facts_total"):
+        gaps.append({"reason": "state_has_no_facts"})
+    if not total:
+        gaps.append({"reason": "state_has_no_objects"})
+    passport = build_passport(scope=scope, measured=measured, total=total,
+                              intervals=intervals,
+                              revisions={"state_token": counters.get("state_token")},
+                              gaps=gaps, gaps_declared_by="state")
+    passport["source"] = "state"
+    passport["project_id"] = str(project_id)
+    passport["state_token"] = counters.get("state_token")
+    passport["counters"] = counters
+    return passport
+
+
+def coverage_report(*, state: object = None,
+                    units: Iterable[Mapping[str, Any]] = (),
+                    scope: str = "global",
+                    project_id: str = "",
+                    total_sources: Sequence[str] | None = None,
+                    revision: Mapping[str, Any] | None = None,
+                    current_fingerprints: Mapping[str, Mapping[str, str]] | None = None
+                    ) -> dict[str, Any]:
+    """Coverage passport, preferring the project state when one exists.
+
+    With ``state`` the answer comes from stored facts and is marked
+    ``"source": "state"``.  Without it the legacy evidence-unit passport is
+    built and marked ``"source": "legacy"``.  ``units``/``revision`` are only
+    read on the legacy path; nothing is invented when both are empty (every
+    listed source becomes a named gap).
+    """
+    if state is not None:
+        return passport_from_state(state, scope=scope, project_id=project_id,
+                                   total_sources=total_sources)
+    passport = passport_from_units(units, scope=scope, project_id=project_id,
+                                   total_sources=total_sources or (),
+                                   revision=dict(revision or {}),
+                                   current_fingerprints=current_fingerprints)
+    passport["source"] = "legacy"
+    return passport
 
 
 __all__ = [
     "SPAN_EPSILON_S",
     "interval_coverage",
-    "uncovered_spans","PASSPORT_SCHEMA", "build_passport", "passport_from_units", "require_complete"]
+    "uncovered_spans", "PASSPORT_SCHEMA", "build_passport", "coverage_report",
+    "passport_from_state", "passport_from_units", "require_complete"]

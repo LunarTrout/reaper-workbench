@@ -26,6 +26,7 @@ from math import isfinite
 from typing import Any
 
 from ..errors import ValidationError
+from .state_reads import state_block, state_evidence_section
 
 STATUS_SCHEMA = "reaper-workbench.session-status/1"
 PREFLIGHT_SCHEMA = "reaper-workbench.session-preflight/1"
@@ -550,6 +551,8 @@ def build_status(
     missing: Sequence[Mapping[str, Any]] | None = None,
     receipts: Mapping[str, Any] | None = None,
     evidence: Mapping[str, Any] | None = None,
+    state: Mapping[str, Any] | None = None,
+    state_since: int | None = None,
 ) -> dict[str, Any]:
     """Shape one ``project.context`` read into the sectioned status answer.
 
@@ -557,6 +560,14 @@ def build_status(
     digest rows, ``track["envelopes"]`` / ``master["envelopes"]`` as digest
     automation rows, and ``item["midi_note_count"]`` where it was countable.
     Missing enrichment degrades to counts, never to invented values.
+
+    ``state`` is the project's state document when one exists.  It then answers
+    the ``evidence`` section from stored facts and adds an additive top-level
+    ``state`` block (``state_token``/``facts``/``current``/``stale``/
+    ``superseded``, plus ``changes_since`` when ``state_since`` is supplied).
+    Without state the section is the caller-supplied legacy evidence answer.
+    The block is top-level because ``evidence["state"]`` already carries the
+    evidence verdict string; nesting it there would replace that field.
     """
     detail, selected = normalize_status_request(detail=detail, sections=sections)
     tracks = [track for track in context.get("tracks") or []
@@ -607,7 +618,11 @@ def build_status(
     if "receipts" in selected:
         result["receipts"] = _receipts_section(receipts, detail=detail)
     if "evidence" in selected:
-        result["evidence"] = _evidence_section(evidence, detail=detail)
+        if state is not None:
+            result["evidence"] = state_evidence_section(state, detail=detail)
+            result["state"] = state_block(state, since=state_since)
+        else:
+            result["evidence"] = _evidence_section(evidence, detail=detail)
     return result
 
 

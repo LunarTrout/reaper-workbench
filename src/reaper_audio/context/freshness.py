@@ -32,6 +32,9 @@ STAGE_PREMASTER = "premaster"
 STAGE_VIA_MASTER = "via_master"
 STAGES = (STAGE_PREMASTER, STAGE_VIA_MASTER)
 
+#: Schema id of the freshness answer (legacy and state-backed alike).
+FRESHNESS_SCHEMA = "reaper-workbench.freshness/1"
+
 STATE_CURRENT = "current"
 STATE_STALE = "stale"
 STATE_UNKNOWN = "unknown"
@@ -75,18 +78,46 @@ def stage_of(row: Mapping[str, Any]) -> str:
     return STAGE_VIA_MASTER
 
 
-def build_freshness(record: Mapping[str, Any], *,
-                    current_fingerprints: Mapping[str, Mapping[str, str]] | None,
+def build_freshness(record: Mapping[str, Any] | None = None, *,
+                    current_fingerprints: Mapping[str, Mapping[str, str]] | None = None,
                     revision: Mapping[str, Any] | None = None,
                     capture_id: str | None = None,
                     intervals: Mapping[str, Sequence[Mapping[str, float]]] | None = None,
+                    state: object = None,
+                    live_fingerprints: Mapping[str, Any] | None = None,
                     ) -> dict[str, Any]:
-    """Build the per-source, per-stage freshness map for one capture.
+    """Build the per-source, per-stage freshness map.
+
+    Two answer paths, both marked by the top-level ``source`` key:
+
+    * ``state`` — when a project state document is supplied, the stored fact
+      fingerprints are compared with ``live_fingerprints`` by
+      :func:`reaper_audio.context.state_reads.state_freshness`.  ``record`` is
+      then unused.
+    * ``legacy`` — without state, the capture record's render manifest is
+      compared with ``current_fingerprints`` as before.
 
     ``current_fingerprints`` is ``{source_id: {stage: render_key}}`` computed
     from the *current* project digest.  ``None`` means the current state could
-    not be read at all: every source becomes ``unknown``.
+    not be read at all: every source becomes ``unknown``.  With neither a state
+    nor a record the answer is an explicit empty ``legacy`` report with reason
+    ``no_capture_record`` — never a silent "clean" result.
     """
+    if state is not None:
+        from .state_reads import state_freshness
+
+        return state_freshness(state, live_fingerprints)
+    if record is None:
+        return {
+            "schema": FRESHNESS_SCHEMA,
+            "source": "legacy",
+            "capture_id": None,
+            "revision": {},
+            "stages": list(STAGES),
+            "sources": {},
+            "summary": summarise({}),
+            "reason": "no_capture_record",
+        }
     capture_id = capture_id or str(record.get("capture_id") or "")
     revision_row = dict(revision or record.get("revision_after") or {})
     recorded = {row.get("source_id"): row for row in _sources_from_manifest(record)
@@ -124,7 +155,8 @@ def build_freshness(record: Mapping[str, Any], *,
         sources[source_id] = {stage: entry}
 
     return {
-        "schema": "reaper-workbench.freshness/1",
+        "schema": FRESHNESS_SCHEMA,
+        "source": "legacy",
         "capture_id": capture_id,
         "revision": revision_row,
         "stages": list(STAGES),
@@ -185,6 +217,7 @@ def current_sources(freshness: Mapping[str, Any], *, stage: str | None = None) -
 
 
 __all__ = [
+    "FRESHNESS_SCHEMA",
     "STAGES",
     "STAGE_PREMASTER",
     "STAGE_VIA_MASTER",
