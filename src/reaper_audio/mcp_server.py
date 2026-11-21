@@ -3791,6 +3791,38 @@ def _undo_operation_facts(plan: EditPlan) -> list[dict[str, Any]]:
 
 @server.tool()
 @_guard
+def _append_journal(archive_root, project_id, result, operations, *,
+                    journal, why, kind="apply", undoes=None) -> None:
+    """Append one decision entry; never propagate a journaling failure.
+
+    The edit is already committed when this runs; a broken journal must not
+    turn a successful apply into an error response.
+    """
+    try:
+        root = archive_root or os.environ.get("REAPER_CAPTURE_ARCHIVE")
+        if not root:
+            return
+        record = result.get("receipt_record") if isinstance(result, dict) else None
+        if not isinstance(record, dict):
+            record = {}
+        reason = (journal or {}).get("why") if isinstance(journal, dict) else None
+        text = reason or why or record.get("reason") or kind
+        store = JournalStore(root)
+        store.append(make_entry(
+            project_id=project_id,
+            receipt=(result.get("receipt") if isinstance(result, dict) else None),
+            operations=list(operations or []), why=str(text),
+            basis=(journal or {}).get("basis") if isinstance(journal, dict) else None,
+            expected=(journal or {}).get("expected") if isinstance(journal, dict) else None,
+            readback=result.get("readback") if isinstance(result, dict) else None,
+            verify=result.get("verify") if isinstance(result, dict) else None,
+            revision_before=record.get("revision_before"),
+            revision_after=record.get("revision_after"),
+            kind=kind, undoes=undoes))
+    except Exception:
+        return
+
+
 def reaper_edit(mode: str,
                 project_id: str,
                 expected_revision: dict[str, Any],

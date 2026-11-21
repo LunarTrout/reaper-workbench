@@ -50,8 +50,13 @@ def _focus_window(project_path: str | None) -> str | None:
     if not windows:
         return None
     wanted = (project_path or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
-    chosen = next(((hwnd, title) for hwnd, title in windows
-                   if wanted and wanted in title.lower()), windows[0])
+    stem = wanted.rsplit(".", 1)[0]
+    reaper_only = [(hwnd, title) for hwnd, title in windows
+                   if "chrome" not in title.lower() and "firefox" not in title.lower()]
+    pool = reaper_only or windows
+    chosen = next(((hwnd, title) for hwnd, title in pool
+                   if (wanted and wanted in title.lower()) or
+                      (stem and stem in title.lower())), pool[0])
     hwnd, title = chosen
     user32 = ctypes.windll.user32
     user32.ShowWindow(hwnd, SW_RESTORE)
