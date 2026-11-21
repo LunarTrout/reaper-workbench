@@ -53,3 +53,5 @@ Thumbs.db
 /index.jsonl
 /work-cache-manifest-*.txt
 /work-cache-scripts-*.tar.gz
+
+.pytest-tmp/
