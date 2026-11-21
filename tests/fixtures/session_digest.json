@@ -1,6 +1,6 @@
 {
-  "project_id": "reaper:vers1-test",
-  "path": "C:/Projects/vers1/vers1.rpp",
+  "project_id": "reaper:demo-test",
+  "path": "C:/Projects/demo/demo.rpp",
   "change_count": 41,
   "digest_version": 1,
   "coverage": {

@@ -256,7 +256,7 @@ def test_settings_read_returns_the_documented_fields() -> None:
 
     assert result["action"] == "read"
     assert result["settings"] == {"RENDER_TAILMS": 0.0, "PROJECT_SRATE": 48000.0}
-    assert result["revision"]["project_id"] == "reaper:vers1-test"
+    assert result["revision"]["project_id"] == "reaper:demo-test"
 
 
 def test_settings_write_reports_before_and_after_with_a_match() -> None:
@@ -352,7 +352,7 @@ class AppBridge:
         self.running = running
         self.session = "session-1"
         self.dirty = dirty
-        self.path = "C:/Projects/vers1/vers1.rpp"
+        self.path = "C:/Projects/demo/demo.rpp"
         self.terminated = False
         self.launch_paths: list[str | None] = []
 
@@ -361,7 +361,7 @@ class AppBridge:
             return None
         return {"bridge_session": self.session, "bridge_build": "b1",
                 "reaper_version": "7.85",
-                "project": {"project_id": "reaper:vers1-test",
+                "project": {"project_id": "reaper:demo-test",
                             "change_count": 7, "path": self.path}}
 
     def health(self, timeout_s: float = 1.0):
@@ -374,7 +374,7 @@ class AppBridge:
              timeout_s: float = 10.0):
         if operation == "project.render_settings.read":
             return {"dirty": self.dirty,
-                    "revision": {"project_id": "reaper:vers1-test",
+                    "revision": {"project_id": "reaper:demo-test",
                                  "change_count": 7, "path": self.path}}
         raise AssertionError(operation)
 
@@ -392,14 +392,14 @@ def test_app_ensure_launches_reaper_when_no_bridge_answers() -> None:
     clock = FakeClock()
     bridge = AppBridge(running=False)
 
-    result = app_action(bridge, "ensure", project_path="C:/Projects/vers1/vers1.rpp",
+    result = app_action(bridge, "ensure", project_path="C:/Projects/demo/demo.rpp",
                         timeout_s=2.0, health=bridge.probe, launch=bridge.launch,
                         clock=clock.monotonic, sleep=clock.sleep, poll_s=0.5)
 
     assert result["ok"] is True
     assert result["started"] is True
     assert result["bridge_session_id"] == "session-2"
-    assert bridge.launch_paths == ["C:/Projects/vers1/vers1.rpp"]
+    assert bridge.launch_paths == ["C:/Projects/demo/demo.rpp"]
 
 
 def test_app_ensure_reports_an_already_running_bridge() -> None:

@@ -1,13 +1,13 @@
 {
   "revision": {
-    "project_id": "reaper:vers1-test",
+    "project_id": "reaper:demo-test",
     "change_count": 41,
-    "path": "C:/Projects/vers1/vers1.rpp",
+    "path": "C:/Projects/demo/demo.rpp",
     "instance_id": "6a0b1c2d-0001",
     "epoch": 2
   },
-  "path": "C:/Projects/vers1/vers1.rpp",
-  "name": "vers1",
+  "path": "C:/Projects/demo/demo.rpp",
+  "name": "demo",
   "track_count": 4,
   "length_s": 306.0,
   "tracks": [
@@ -65,7 +65,7 @@
           "active_take": {
             "guid": "{TAKE-RHYTHM-1}",
             "name": "rhythm_L_take3.wav",
-            "source": "C:/Projects/vers1/audio/rhythm_L_take3.wav",
+            "source": "C:/Projects/demo/audio/rhythm_L_take3.wav",
             "is_midi": false,
             "playrate": 1.0,
             "volume": 1.0,
@@ -91,7 +91,7 @@
           "active_take": {
             "guid": "{TAKE-RHYTHM-2}",
             "name": "rhythm_L_take4.wav",
-            "source": "C:/Projects/vers1/audio/rhythm_L_take4.wav",
+            "source": "C:/Projects/demo/audio/rhythm_L_take4.wav",
             "is_midi": false,
             "playrate": 1.0,
             "volume": 1.0,
@@ -147,7 +147,7 @@
           "active_take": {
             "guid": "{TAKE-BASS-1}",
             "name": "bass_di.wav",
-            "source": "C:/Projects/vers1/audio/bass_di_missing.wav",
+            "source": "C:/Projects/demo/audio/bass_di_missing.wav",
             "is_midi": false,
             "playrate": 1.0,
             "volume": 1.0,
@@ -203,7 +203,7 @@
           "active_take": {
             "guid": "{TAKE-VOX-1}",
             "name": "scream_main.wav",
-            "source": "C:/Projects/vers1/audio/scream_main.wav",
+            "source": "C:/Projects/demo/audio/scream_main.wav",
             "is_midi": false,
             "playrate": 1.0,
             "volume": 1.0,

@@ -25,8 +25,8 @@ from reaper_audio.errors import MediaUnresolved, ValidationError
 from reaper_audio.models import AudioBuffer, Section
 
 SR = 48000
-PROJECT_ID = "proj-vers1"
-PROJECT_PATH = "C:/fake/vers1.rpp"
+PROJECT_ID = "proj-demo"
+PROJECT_PATH = "C:/fake/demo.rpp"
 INSTANCE_ID = "inst-1"
 EPOCH = 4
 G1 = "{TRACK-G1}"

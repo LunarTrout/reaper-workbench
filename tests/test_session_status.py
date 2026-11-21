@@ -40,16 +40,16 @@ class RecordedBridge:
             "bridge_session": "6a0b1c2d-0001",
             "bridge_build": "test-build",
             "reaper_version": "7.85",
-            "project": {"project_id": "reaper:vers1-test",
+            "project": {"project_id": "reaper:demo-test",
                         "change_count": 41,
-                        "path": "C:/Projects/vers1/vers1.rpp"},
+                        "path": "C:/Projects/demo/demo.rpp"},
         }
         self.instance_rows = list(instances or [])
         self.midi_counts = midi_counts if midi_counts is not None else {
             "{TAKE-ACCORDION-1}": 128}
         self.calls: list[tuple[str, dict]] = []
         self.api_calls: list[tuple[str, tuple]] = []
-        self.project_id = "reaper:vers1-test"
+        self.project_id = "reaper:demo-test"
 
     def project_context(self, project_id=None, **options):
         self.calls.append(("project.context", {"project_id": project_id, **options}))
@@ -79,7 +79,7 @@ class RecordedBridge:
 
 
 def _session(bridge: RecordedBridge) -> ProjectSession:
-    return ProjectSession(bridge, project_id="reaper:vers1-test")
+    return ProjectSession(bridge, project_id="reaper:demo-test")
 
 
 def test_status_summary_is_smaller_than_full_and_keeps_the_same_identity() -> None:
@@ -92,7 +92,7 @@ def test_status_summary_is_smaller_than_full_and_keeps_the_same_identity() -> No
     assert summary["detail"] == "summary"
     assert full["detail"] == "full"
     assert summary["revision"] == full["revision"]
-    assert summary["project"]["project_id"] == "reaper:vers1-test"
+    assert summary["project"]["project_id"] == "reaper:demo-test"
     assert summary["soloed"] == ["Rhythm Gtr L"]
     assert summary["muted"] == []
     assert len(json.dumps(summary)) < len(json.dumps(full))
@@ -176,7 +176,7 @@ def test_status_media_reports_offline_and_missing_separately() -> None:
     assert media["offline_count"] == 1
     assert media["missing_count"] == 1
     assert media["missing_sources"] == [
-        "C:/Projects/vers1/audio/bass_di_missing.wav"]
+        "C:/Projects/demo/audio/bass_di_missing.wav"]
 
     offline, missing = media_report(bridge.context["tracks"])
     assert offline[0]["track_name"] == "Bass DI"
@@ -195,14 +195,14 @@ def test_preflight_catches_solo_and_offline_media_by_name() -> None:
     assert solo["names"] == ["Rhythm Gtr L"]
     offline = next(row for row in result["blockers"] if row["code"] == "media_offline")
     assert offline["names"] == ["Bass DI"]
-    assert "C:/Projects/vers1/audio/bass_di_missing.wav" in offline["sources"]
+    assert "C:/Projects/demo/audio/bass_di_missing.wav" in offline["sources"]
 
     # The same observations are also available as flat, judgement-free facts.
     assert result["soloed"] == ["Rhythm Gtr L"]
     assert result["muted"] == []
     assert result["offline"] == ["Bass DI"]
     assert result["missing_sources"] == [
-        "C:/Projects/vers1/audio/bass_di_missing.wav"]
+        "C:/Projects/demo/audio/bass_di_missing.wav"]
     assert result["transport"]["playing"] is False
     assert result["runtime"]["state"] in {"current", "stale_runtime", "unknown"}
 
@@ -328,8 +328,8 @@ def test_status_runtime_section_contains_the_version_and_freshness(tmp_path) -> 
 
 def _unit(change_count: int, metric: str) -> dict:
     return {
-        "project_id": "reaper:vers1-test",
-        "revision": {"project_id": "reaper:vers1-test", "change_count": change_count},
+        "project_id": "reaper:demo-test",
+        "revision": {"project_id": "reaper:demo-test", "change_count": change_count},
         "source_id": "track:{TRACK-RHYTHM-L}",
         "interval": {"start_s": 0.0, "end_s": 76.0},
         "metric": metric,
