@@ -430,8 +430,12 @@ def test_panorama_is_self_contained_with_complete_domains_and_crosslinks(tmp_pat
     assert required <= set(panorama)
     assert len(panorama["tracks"]) == 2
     assert panorama["master"]["is_master"] is True
-    assert len(panorama["items"]) == 2
-    assert len(panorama["takes"]) == 2
+    assert panorama["items"]["representation"] == "per_track_summary"
+    assert panorama["items"]["count"] == 2
+    assert panorama["takes"]["representation"] == "per_track_summary"
+    assert panorama["takes"]["count"] == 2
+    assert len(panorama["items"]["rows"]) == 3  # two tracks plus master
+    assert len(panorama["takes"]["rows"]) == 3
     assert len(panorama["audio"]) == 3
     assert len(panorama["analysis"]) == 3
     assert panorama["crosslinks"]
@@ -486,11 +490,19 @@ def test_panorama_lengths_windows_tail_and_file_mapping(tmp_path: Path) -> None:
     assert mapping["tail_start_s"] == 12.0
     assert mapping["tail_end_s"] == 13.0
     assert mapping["tail_maps_to_project"] is False
-    item = next(row for row in panorama["items"] if row["guid"] == ITEM_A)
-    assert item["length_s"] == 3.0
-    assert item["item_duration_s"] == 3.0
-    assert item["interval"]["start_s"] == 10.0
-    assert item["interval"]["end_s"] == 13.0
+    item_row = next(row for row in panorama["items"]["rows"]
+                    if row[0] == "track:" + TRACK_A)
+    # track_id, items_count, timed_count, start_min, start_max, end_min, end_max
+    assert item_row[1] == 1
+    assert item_row[2] == 1
+    assert item_row[3] == 10.0 and item_row[4] == 10.0
+    assert item_row[5] == 13.0 and item_row[6] == 13.0
+    assert item_row[8] == ["item:" + ITEM_A]
+    take_row = next(row for row in panorama["takes"]["rows"]
+                    if row[0] == "track:" + TRACK_A)
+    assert take_row[1] == 1
+    assert take_row[2] == ["Take A"]
+    assert take_row[3] == "all"
     # Notes are linked exactly, not reprinted; the summary still carries the
     # population, occupied interval and truncation state.
     midi = panorama["midi"][0]

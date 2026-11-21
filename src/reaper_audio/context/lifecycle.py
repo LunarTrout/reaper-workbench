@@ -38,7 +38,7 @@ from .identity import (identity_from_mapping, normalize_project_id,
 from .details import DEFAULT_DETAIL_BYTES, resolve_details
 from .panorama import (PANORAMA_SCHEMA_VERSION, build_panorama, load_panorama,
                        panorama_path_for_record)
-from .query import run_query
+from .query import exact_item_take_rows, run_query
 from .panorama_view import (DEFAULT_RESPONSE_BYTES, LEAN_OVERVIEW_BYTES, budget_report,
                             build_minimum_view, build_view_memoized,
                             canonical as view_canonical, view_bytes,
@@ -3489,7 +3489,8 @@ class PanoramaLifecycle:
         needed = (data if isinstance(data, list)
                   else ([data] if isinstance(data, str) else ["all"]))
         needs_record = ("all" in needed or any(
-            family in {"series", "midi_notes", "envelope_points"} for family in needed))
+            family in {"series", "midi_notes", "envelope_points", "items", "takes", "fx"}
+            for family in needed))
         record = self._record(str(state["capture_id"])) if needs_record else None
         budget = int(max_response_bytes or DEFAULT_RESPONSE_BYTES)
         result = run_query(document, record, data=data, objects=objects, interval=interval,
@@ -4407,7 +4408,15 @@ class PanoramaLifecycle:
         )
         structural = {key: document.get(key) for key in structural_keys if key in document}
         evidence_items = []
-        for item in document.get("items") or []:
+        items_value = document.get("items")
+        if isinstance(items_value, (list, tuple)):
+            item_rows = [row for row in items_value if isinstance(row, Mapping)]
+        else:
+            # A per-track summary is not a row list; the interval slice must
+            # return real item geometry, so read it from the bound record.
+            item_rows, _take_rows = exact_item_take_rows(
+                document, self._record(str(state["capture_id"])))
+        for item in item_rows:
             if not isinstance(item, Mapping):
                 continue
             interval = item.get("interval")

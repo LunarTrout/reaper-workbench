@@ -287,7 +287,7 @@ def test_archive_catalog_measures_every_family(tmp_path: Path) -> None:
     for row in rows:
         assert isinstance(row[1], int) and row[1] >= 0
         assert isinstance(row[3], int) and row[3] >= 0
-        assert row[4] in {"measured", "estimate_from_cell_counts",
+        assert row[4] in {"measured", "summary", "estimate_from_cell_counts",
                           "estimate_from_note_count", "estimate_from_point_count"}
         assert isinstance(row[5], list)
         if row[0] != "project_summary":
@@ -337,7 +337,8 @@ def test_catalog_row_counts_name_what_they_count(tmp_path: Path) -> None:
     assert catalog["columns"] == ["family", "rows", "row_unit", "bytes", "bytes_method",
                                   "selectors"]
     rows = {row[0]: row for row in catalog["rows"]}
-    assert rows["items"][2] == "rows"
+    assert rows["items"][2] == "items"
+    assert rows["takes"][2] == "takes"
     assert rows["relations"][2] == "edges+pairs+unavailable"
     assert rows["midi_notes"][2] == "notes"
     assert rows["envelope_points"][2] == "points"

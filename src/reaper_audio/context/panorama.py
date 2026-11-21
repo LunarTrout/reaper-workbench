@@ -38,14 +38,16 @@ from .details import (
     series_entry,
     series_reference,
 )
+from .item_summary import item_summary, take_summary
 from .relations import RelationBinding, RelationWindow, build_relation_set
 from .identity import identity_from_mapping
 from .render_dependencies import project_render_manifest
 
-PANORAMA_SCHEMA_VERSION = "reaper-workbench.capture-panorama/2"
+PANORAMA_SCHEMA_VERSION = "reaper-workbench.capture-panorama/3"
 # Captures written before the detail-reference representation keep their sealed
 # sidecar untouched; readers upgrade them in memory from the canonical record.
-PANORAMA_LEGACY_SCHEMA_VERSIONS = frozenset({"reaper-workbench.capture-panorama/1"})
+PANORAMA_LEGACY_SCHEMA_VERSIONS = frozenset({"reaper-workbench.capture-panorama/1",
+                                             "reaper-workbench.capture-panorama/2"})
 PANORAMA_FILE_NAME = "panorama.json"
 # One-shot model context budget.  The canonical record remains complete on
 # disk; this is the bounded derived projection returned to the model.
@@ -256,6 +258,7 @@ def _item_views(data: Mapping[str, Any], project_map: Mapping[str, Any]) -> list
         view = {
             "item_id": item_id,
             "guid": guid,
+            "name": raw.get("name"),
             "track_id": _stable("track", track_guid) if track_guid else None,
             "position_s": position,
             "length_s": length,
@@ -447,16 +450,11 @@ def _fx_views(tracks: Sequence[Mapping[str, Any]],
             pointer = (f"#/project_map/tracks/{owner_index}/fx/{slot}/parameters"
                        if not is_master else
                        f"#/project_map/master/fx/{slot}/parameters")
-            parameter_rows = []
-            for param in params:
-                if not isinstance(param, Mapping):
-                    continue
-                parameter_rows.append({
-                    "index": _integer(param.get("index")),
-                    "name": param.get("name"),
-                    "normalized": _number(param.get("normalized")),
-                    "formatted": param.get("formatted"),
-                })
+            # Parameter values belong to the exact query path, not the map:
+            # a 33-track song carries hundreds of FX units and thousands of
+            # parameter rows, while a map only needs names, order and state.
+            # raw_parameters_pointer is the canonical-record address of the
+            # exact list; reaper_panorama_query data=['fx'] returns it.
             rows.append({
                 "fx_id": fx_id,
                 "owner_id": owner_id,
@@ -468,7 +466,6 @@ def _fx_views(tracks: Sequence[Mapping[str, Any]],
                 "enabled": bool(raw.get("enabled")),
                 "offline": bool(raw.get("offline")),
                 "parameter_count": _integer(raw.get("parameter_count")) or len(params),
-                "parameters": parameter_rows,
                 "raw_parameters_pointer": pointer,
             })
 
@@ -1647,10 +1644,14 @@ def build_panorama(record: Any, *, record_path: str | Path | None = None,
     """Build a deterministic, bounded, self-describing capture panorama.
 
     Shared semantics, units, method, caveats, window and set-level provenance
-    appear once (per kind, per domain or per capture).  Every row keeps its own
-    exact values, endpoints, coverage and stable id.  MIDI notes, envelope
-    points and exact time-series cells stay in the canonical record and are
-    addressed by typed entries in ``details``.
+    appear once (per kind, per domain or per capture).  Every measurement row
+    keeps its own exact values, endpoints, coverage and stable id; project item
+    and take rows are represented by one per-track inventory carrying counts,
+    time extrema, short names and stable item ids, and FX rows keep name, order
+    and state without parameter values.  Exact item/take rows, FX parameter
+    rows, MIDI notes, envelope points and time-series cells stay in the
+    canonical record and are addressed by typed entries in ``details`` or a
+    section ``detail_index``.
     """
     data = _record_dict(record)
     project_map = _project_map(data)
@@ -1750,6 +1751,14 @@ def build_panorama(record: Any, *, record_path: str | Path | None = None,
     envelope_rows = _envelope_rows(project_map.get("envelopes"), "envelope",
                                    track_shells, master_id, master_guid,
                                    detail_ctx=detail_ctx, domain_key="envelopes")
+    # The map keeps one inventory row per track instead of every item/take row.
+    # Exact rows stay in the canonical record and are addressed by these stable
+    # ids through reaper_panorama_query.
+    summary_track_ids = [str(shell["stable_id"]) for shell in track_shells] + [master_id]
+    item_section = item_summary(items, summary_track_ids,
+                                record_path=relative_record_path)
+    take_section = take_summary(items, takes, summary_track_ids,
+                                record_path=relative_record_path)
     project_extent = _project_extent(project_map)
     content_extent = _content_extent(project_map)
     time_window = data.get("time_window") if isinstance(data.get("time_window"), Mapping) else {}
@@ -1892,14 +1901,8 @@ def build_panorama(record: Any, *, record_path: str | Path | None = None,
             break
     # Complete track/master views with links and exact source slots.
     tracks: list[dict[str, Any]] = []
-    for shell, raw in zip(track_shells, tracks_raw):
+    for shell in track_shells:
         guid = str(shell.get("guid") or "")
-        item_views = [item for item in items if item.get("track_id") == shell["stable_id"]]
-        item_ids = [item["item_id"] for item in item_views]
-        take_ids = [take["take_id"] for take in takes
-                    if take.get("track_id") == shell["stable_id"]]
-        midi_ids = [row["midi_id"] for row in midi
-                    if row.get("item_id") in set(item_ids)]
         audio = audio_by_source.get(guid)
         analysis = analysis_views.get(guid)
         tracks.append({
@@ -1911,14 +1914,7 @@ def build_panorama(record: Any, *, record_path: str | Path | None = None,
             "mixer": shell["facts"],
             "audio_id": audio.get("audio_id") if audio else None,
             "analysis_id": analysis.get("analysis_id") if analysis else None,
-            "item_ids": item_ids,
-            "take_ids": take_ids,
-            "midi_ids": midi_ids,
         })
-    master_item_ids = [item["item_id"] for item in items
-                       if item.get("track_guid") == str(master_guid)]
-    master_take_ids = [take["take_id"] for take in takes
-                       if take.get("track_id") == master_id]
     master_audio = audio_by_source.get(str(master_guid))
     master_analysis = analysis_views.get(str(master_guid))
     master_view = {
@@ -1932,8 +1928,6 @@ def build_panorama(record: Any, *, record_path: str | Path | None = None,
         "mixer": master_shell["facts"],
         "audio_id": master_audio.get("audio_id") if master_audio else None,
         "analysis_id": master_analysis.get("analysis_id") if master_analysis else None,
-        "item_ids": master_item_ids,
-        "take_ids": master_take_ids,
     }
     # Cross-links over every included object, with named relation kinds.
     project_full_id = project_key
@@ -1945,15 +1939,10 @@ def build_panorama(record: Any, *, record_path: str | Path | None = None,
     for track in tracks:
         _crosslink(links, project_id, "contains_track", track["stable_id"])
     _crosslink(links, project_id, "contains_master", master_id)
-    for item in items:
-        if item.get("track_id"):
-            _crosslink(links, item["track_id"], "contains_item", item["item_id"])
-        if item.get("active_take_id"):
-            _crosslink(links, item["item_id"], "has_active_take",
-                       item["active_take_id"])
-    for take in takes:
-        if take.get("item_id"):
-            _crosslink(links, take["item_id"], "has_take", take["take_id"])
+    # Items and takes are represented by their per-track summary (the track_id
+    # column is the link); their per-object edges would re-create the map rows
+    # that the summary exists to avoid.  MIDI, FX, routes, envelopes, audio and
+    # analysis objects keep one link each.
     for midi_row in midi:
         _crosslink(links, midi_row["take_id"], "has_midi", midi_row["midi_id"])
     for row in fx:
@@ -2223,22 +2212,30 @@ def build_panorama(record: Any, *, record_path: str | Path | None = None,
             "raw_capture_is_authoritative": True,
             "raw_record_reprinted": False,
             "inline": (
-                "project map, tracks, master, items, takes, FX, routes, tempo, "
-                "markers, regions, audio identity, per-source measurements, "
-                "automation summaries, MIDI summaries, relation kinds and rows, "
-                "the activity grid and the detail manifest"
+                "project map, tracks, master, per-track item/take summaries with "
+                "stable item ids, FX names/order/state and parameter counts, "
+                "routes, tempo, markers, regions, audio identity, per-source "
+                "measurements, automation summaries, MIDI summaries, relation "
+                "kinds and rows, the activity grid and the detail manifest"
             ),
             "linked_exact": (
-                "MIDI notes, envelope/automation points, per-cell analysis series "
-                "(rms, band levels, temporal profile) and the render-dependency "
-                "component map; each is addressed by a typed entry in details and "
-                "fetched with reaper_panorama_query"
+                "exact item and take rows, FX parameter rows, MIDI notes, "
+                "envelope/automation points, per-cell analysis series (rms, band "
+                "levels, temporal profile) and the render-dependency component "
+                "map; each is addressed by a typed entry in details or a "
+                "detail_index section and fetched with reaper_panorama_query"
             ),
             "truly_lossy": (
-                "nothing in this document drops a measured value. Inline temporal "
-                "buckets are a declared aggregation of exact cells (aggregation, "
-                "width, anchor and count are stated per level); exact cells remain "
-                "retrievable at any resolution through the series reference"
+                "nothing in this document drops a measured value. Project item "
+                "and take rows are represented by one summary row per track "
+                "(counts, time extrema, short names, stable item ids, take names "
+                "and the active-take alignment); FX rows keep name, order and "
+                "state but not parameter values. Every exact row remains in the "
+                "canonical record and is returned whole by reaper_panorama_query. "
+                "Inline temporal buckets are a declared aggregation of exact "
+                "cells (aggregation, width, anchor and count are stated per "
+                "level); exact cells remain retrievable at any resolution "
+                "through the series reference"
             ),
             "response_budget": {
                 "max_tokens": max_tokens,
@@ -2307,8 +2304,8 @@ def build_panorama(record: Any, *, record_path: str | Path | None = None,
         "time_map": time_map,
         "tracks": tracks,
         "master": master_view,
-        "items": items,
-        "takes": takes,
+        "items": item_section,
+        "takes": take_section,
         "midi": midi,
         "fx": fx,
         "routes": routes,
@@ -2432,6 +2429,10 @@ def build_panorama(record: Any, *, record_path: str | Path | None = None,
             "relation_names": "relation is the literal link kind; no positional legend",
             "ids": "every from/to is a stable object ID documented by legend.stable_ids",
             "qualifiers": "optional object only where slot or send context is material",
+            "item_take_links": (
+                "items and takes are per-track summaries; the items.rows[].track_id "
+                "and takes.rows[].track_id columns are their crosslink, and the "
+                "stable item ids in items.rows[].item_ids address exact rows"),
             "complete": True,
         },
         "audio_time_contract": {
