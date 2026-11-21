@@ -721,10 +721,22 @@ def _compact_map(tracks, master, routing) -> dict:
             "fx_names": [str(fx.get("name")) for fx in (master.get("fx") or [])
                          if isinstance(fx, Mapping)],
         }
+    edges = []
+    for row in tracks:
+        for send in (row.get("sends") or []) if isinstance(row.get("sends"), list) else []:
+            if not isinstance(send, Mapping):
+                continue
+            edges.append({
+                "source_guid": row.get("guid"),
+                "destination_guid": send.get("destination_guid") or send.get("dest_guid"),
+                "volume": send.get("volume"),
+                "pan": send.get("pan"),
+                "mode": send.get("mode"),
+            })
     return {
         "tracks": [track(row) for row in tracks],
         "master": master_row,
-        "routes": list(routing or []),
+        "routes": edges,
     }
 
 def fill_state_from_capture(

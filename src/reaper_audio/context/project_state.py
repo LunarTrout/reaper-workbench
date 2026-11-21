@@ -954,6 +954,31 @@ class ProjectState:
         metrics and fingerprints are the bulk of the document.  Status, key,
         revision, timestamps and who replaced it stay, so the lineage is intact.
         """
+        # A map written by an older capture could carry whole track rows with
+        # FX parameters under routes; keep only routing edges.
+        mapping = self._state.get("map")
+        if isinstance(mapping, dict):
+            routes = mapping.get("routes")
+            if isinstance(routes, list):
+                edges = []
+                for row in routes:
+                    if not isinstance(row, dict):
+                        continue
+                    if "sends" in row and isinstance(row.get("sends"), list):
+                        for send in row["sends"]:
+                            if isinstance(send, dict):
+                                edges.append({"source_guid": row.get("guid"),
+                                              "destination_guid": send.get("destination_guid")
+                                              or send.get("dest_guid"),
+                                              "volume": send.get("volume"),
+                                              "pan": send.get("pan")})
+                    elif row.get("source_guid") and row.get("destination_guid"):
+                        edges.append(row)
+                mapping["routes"] = edges
+        for key in ("changes", "history"):
+            entries = self._state.get(key)
+            if isinstance(entries, list) and len(entries) > 200:
+                self._state[key] = entries[-200:]
         removed = 0
         for fact in self._state.get("facts", {}).values():
             if fact.get("status") != STATUS_SUPERSEDED:
