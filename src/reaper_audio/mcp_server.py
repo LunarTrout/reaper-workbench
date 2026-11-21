@@ -52,6 +52,7 @@ from .context.state_diff import state_changes as live_state_changes
 from .daw.midi import MidiService
 from .daw.edit import run_edit, send_list, undo_receipt
 from .daw.receipt import FileReceiptStore
+from .daw.reference import cached_reference_report
 from .daw.session_control import app_action as _app_action
 from .daw.session_status import merge_digest_routing
 from .context.decision_gates import evaluate
@@ -2772,6 +2773,7 @@ def _analyze_archived_capture(*, capture_id: str, project_id: str | None,
 
     reference_audio: dict[str, AudioBuffer] = {}
     reference_sections: dict[str, Section] = {}
+    reference_paths: dict[str, str] = {}
     reference_inputs: list[dict[str, Any]] = []
     reference_fingerprints: list[dict[str, Any]] = []
     reference_hashes: dict[str, dict[str, Any]] = {}
@@ -2789,6 +2791,7 @@ def _analyze_archived_capture(*, capture_id: str, project_id: str | None,
             key = f"{key_base}_{suffix}"
             suffix += 1
         reference_audio[key] = loaded
+        reference_paths[key] = str(request["path"])
         if reference_section is not None:
             reference_sections[key] = reference_section
         window = None if reference_section is None else {
@@ -2899,10 +2902,16 @@ def _analyze_archived_capture(*, capture_id: str, project_id: str | None,
             if guid in raw_source_ids:
                 raw_buffers[guid] = audio_buffer
 
+    reference_reports = {
+        key: cached_reference_report(audio, reference_paths[key],
+                                     reference_sections.get(key), archive_root)
+        for key, audio in reference_audio.items()
+    }
     report = analyze_bundle(
         {guid: raw_buffers[guid] for guid in assets_by_guid},
         references=reference_audio or None,
         reference_sections=reference_sections or None,
+        reference_reports=reference_reports or None,
         include_pairwise=include_pairwise,
         phase_pairs=phase_pairs,
         anchor_key=master_id,
@@ -3456,6 +3465,7 @@ def reaper_analyze(project_id: str | None = None,
     )
     references: dict[str, Any] = {}
     reference_sections: dict[str, Section] = {}
+    reference_paths: dict[str, str] = {}
     reference_inputs: list[dict[str, Any]] = []
     reference_fingerprints: list[dict[str, Any]] = []
     reference_hashes: dict[str, dict[str, Any]] = {}
@@ -3474,6 +3484,7 @@ def reaper_analyze(project_id: str | None = None,
             key = f"{key_base}_{suffix}"
             suffix += 1
         references[key] = reference_audio
+        reference_paths[key] = str(path)
         if reference_section is not None:
             reference_sections[key] = reference_section
         window = None if reference_section is None else {
@@ -3491,9 +3502,15 @@ def reaper_analyze(project_id: str | None = None,
             "window": window,
             **file_fingerprint,
         })
+    reference_reports = {
+        key: cached_reference_report(audio, reference_paths[key],
+                                     reference_sections.get(key), archive_root)
+        for key, audio in references.items()
+    }
     report = session.analyze(
         str(_AUDIO_ROOT), section=section, references=references or None,
         reference_sections=reference_sections or None,
+        reference_reports=reference_reports or None,
         include_pairwise=include_pairwise, phase_pairs=phase_pairs,
         parallel=parallel, include_partial_loudness=include_partial_loudness,
         capture_mode="render", retain_audio=True, timeout_s=1800.0,

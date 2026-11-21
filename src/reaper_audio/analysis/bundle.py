@@ -128,6 +128,7 @@ def analyze_bundle(
     phase_pairs: list[tuple[str, str]] | Literal["all"] | None = None,
     phase_max_lag_ms: float = 10.0,
     precomputed_reports: Mapping[str, object] | None = None,
+    reference_reports: Mapping[str, object] | None = None,
 ) -> dict:
     """Analyze every source and compare it with supplied references in one call.
 
@@ -223,10 +224,13 @@ def analyze_bundle(
     # A project section and a reference-file section live on different
     # timelines. References default to their full audio; compare a selected
     # musical region only when its reference-local window is supplied.
-    reference_reports = {
-        key: measure_audio(audio, section=reference_sections.get(key))
-        for key, audio in references.items()
-    }
+    if reference_reports is None:
+        reference_reports = {
+            key: measure_audio(audio, section=reference_sections.get(key))
+            for key, audio in references.items()
+        }
+    elif set(reference_reports) != set(references):
+        raise ValidationError("precomputed reference reports must match supplied references")
 
     ref_comparisons = {
         source_id: {

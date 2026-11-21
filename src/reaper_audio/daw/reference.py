@@ -141,6 +141,39 @@ def _probe_audio(path: Path, *, role: str) -> Any:
     return info
 
 
+def cached_reference_report(audio, path: str | os.PathLike[str], section,
+                            archive_root: str | os.PathLike[str] | None) -> dict[str, Any]:
+    """Measure one reference through the content-addressed measurement cache.
+
+    The key covers the file bytes, window, analyzer version and options, so a
+    changed reference or a code change misses.  When ``archive_root`` is None
+    the report is measured without caching.
+    """
+    from ..analysis.metrics import measure_audio
+    from ..context.measurement_cache import MeasurementCache, sha256_file
+    from ..models import MeasurementReport, MetricValue
+
+    if archive_root is None:
+        return measure_audio(audio, section=section)
+    cache = MeasurementCache(archive_root, section=None if section is None else {
+        "start_s": section.start_s, "end_s": section.end_s,
+    }, options={"kind": "reference"})
+    digest = sha256_file(path)
+    key, hit = cache.lookup(path, stage="reference_file", fingerprint=digest)
+    if hit is not None:
+        stored = dict(hit["report"])
+        stored["metrics"] = {
+            name: MetricValue(**cell) if isinstance(cell, dict) else cell
+            for name, cell in (stored.get("metrics") or {}).items()
+        }
+        return MeasurementReport(**stored)
+    report = measure_audio(audio, section=section)
+    cache.remember(key, stage="reference_file",
+                   result={"analysis": report.to_dict(), "dsp_s": None, "decode_s": None},
+                   path=path)
+    return report
+
+
 def _newest_download(directory: Path) -> Path | None:
     candidates = [path for path in directory.rglob("*")
                   if path.is_file() and not path.name.endswith(".part")
