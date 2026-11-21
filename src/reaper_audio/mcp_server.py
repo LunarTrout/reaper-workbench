@@ -223,14 +223,19 @@ def _edit_measure(session: ProjectSession):
         service = MeasureService(session, root)
         section = None if interval is None else (float(interval[0]), float(interval[1]))
         result = service.measure(sources=list(sources), section=section,
-                                 stage="via_master")
+                                 metrics=list(metrics), stage="via_master")
         table = result.get("table") or {}
         cells = table.get("cells") or [{}]
         first = cells[0] if isinstance(cells, list) and cells else {}
+        selection = table.get("metric_selection") or {}
+        requested = selection.get("requested") or list(metrics)
+        keys = selection.get("keys") or list(metrics)
+        canonical = dict(zip(requested, keys))
         out: dict[str, dict[str, Any]] = {}
         for guid in sources:
             cell = first.get(guid) or {}
-            out[str(guid)] = {name: cell.get(name) for name in metrics}
+            out[str(guid)] = {name: cell.get(canonical.get(name, name))
+                              for name in metrics}
         return out
     return measure
 
