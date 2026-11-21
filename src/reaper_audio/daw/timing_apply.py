@@ -284,12 +284,15 @@ def normalize_clips(blocks: Sequence[BlockInput], *,
                 details={"code": "timing_source_duplicate", "block_index": index,
                          "source_start_s": _round(current.source_start_s),
                          "position_s": _round(current.position_s)})
-        if current.source_start_s < previous.source_end_s - COVERAGE_ATOL:
+        source_overlap = previous.source_end_s - current.source_start_s
+        if source_overlap > MAX_SEAM_OVERLAP_S + GEOMETRY_ATOL:
             raise ValidationError(
-                "Two timing blocks read overlapping source material",
+                "Two timing blocks read overlapping source material by more than a seam",
                 details={"code": "timing_source_overlap", "block_index": index,
                          "previous_source_end_s": _round(previous.source_end_s),
-                         "source_start_s": _round(current.source_start_s)})
+                         "source_start_s": _round(current.source_start_s),
+                         "overlap_s": _round(source_overlap),
+                         "limit_s": MAX_SEAM_OVERLAP_S})
         if current.position_s < previous.position_s - GEOMETRY_ATOL:
             raise ValidationError(
                 "The plan would reorder the clips on the timeline",
@@ -341,22 +344,44 @@ def check_source_handles(clips: Sequence[TimingClip], item: Mapping[str, Any]) -
             "source_length_s": _round(source_length)}
 
 
-def check_coverage(clips: Sequence[TimingClip], item: Mapping[str, Any]) -> dict[str, Any]:
-    """Require the plan to cover the item's whole source window without gaps.
+def check_coverage(clips: Sequence[TimingClip], item: Mapping[str, Any], *,
+                   crossfade: bool = False) -> dict[str, Any]:
+    """Check source extent and continuity before sending native clips to REAPER.
 
-    A gap would drop source material; a plan wider than the item would add
-    audio the item never played.  Both are refused before anything mutates.
+    The legacy planner cannot skip source samples. The crossfade planner may
+    skip a bounded segment between two measured seam handles, while requiring
+    both fades to meet exactly over a gap-free project timeline.
     """
     offset = float(item.get("start_offset_s") or 0.0)
     length = float(item.get("length_s") or 0.0)
     window_end = offset + length
+    from ..analysis.timing_seams import MAX_SOURCE_SKIP
     gaps: list[dict[str, Any]] = []
+    source_skips = []
+    if crossfade:
+        if (abs(clips[0].position_s-item["position_s"]) > COVERAGE_ATOL or
+                abs(clips[-1].end_s-item["position_s"]-length) > COVERAGE_ATOL):
+            gaps.append({"kind": "target_extent"})
+        if any(c.source_start_s < offset-COVERAGE_ATOL or
+               c.source_end_s > window_end+COVERAGE_ATOL for c in clips):
+            gaps.append({"kind": "source_extent"})
     if abs(clips[0].source_start_s - offset) > COVERAGE_ATOL:
         gaps.append({"at_s": _round(clips[0].source_start_s),
                      "expected_s": _round(offset), "kind": "head"})
     for previous, current in zip(clips, clips[1:]):
         gap = current.source_start_s - previous.source_end_s
-        if abs(gap) > COVERAGE_ATOL:
+        # A negative gap is a deliberate handle overlap at the seam, used to
+        # fill a target gap with real source material.  A positive gap is a
+        # hole and is still refused.
+        if crossfade:
+            overlap = previous.end_s - current.position_s
+            if (overlap <= 0 or abs(overlap-previous.fade_out_s) > COVERAGE_ATOL
+                    or abs(overlap-current.fade_in_s) > COVERAGE_ATOL):
+                gaps.append({"kind": "target_seam", "overlap_s": _round(overlap)})
+            if gap > COVERAGE_ATOL:
+                source_skips.append([_round(previous.source_end_s), _round(current.source_start_s)])
+        limit = MAX_SOURCE_SKIP + COVERAGE_ATOL if crossfade else COVERAGE_ATOL
+        if gap > limit or gap < -MAX_SEAM_OVERLAP_S - GEOMETRY_ATOL:
             gaps.append({"at_s": _round(previous.source_end_s),
                          "expected_s": _round(current.source_start_s),
                          "gap_s": _round(gap), "kind": "gap"})
@@ -371,7 +396,10 @@ def check_coverage(clips: Sequence[TimingClip], item: Mapping[str, Any]) -> dict
                      "gaps": gaps[:8],
                      "next_action": ("re-plan over the whole item, or trim the item "
                                      "to the analysed range first")})
-    return {"source_window_s": [_round(offset), _round(window_end)]}
+    report = {"source_window_s": [_round(offset), _round(window_end)]}
+    if crossfade:
+        report.update({"target_gap_count": 0, "source_seam_skips_s": source_skips})
+    return report
 
 
 def _protected_window(row: Mapping[str, Any], item: Mapping[str, Any],
@@ -567,6 +595,8 @@ def _require_applyable_item(item: Mapping[str, Any]) -> dict[str, Any]:
         "source_length_s": float(item.get("source_length_s") or 0.0),
         "source_length_is_qn": bool(item.get("source_length_is_qn")),
         "source_online": item.get("source_online"),
+        "take_count": item.get("take_count", 1),
+        "take_fx_count": take.get("fx_count", 0),
     }
 
 
@@ -795,9 +825,26 @@ def apply_timing_plan(
                      "current": revision.to_dict(),
                      "next_action": "re-plan against the current revision"})
 
+    crossfade = plan_doc.get("method") == "crossfade"
+    if crossfade:
+        from .timing_service import _file_fingerprint
+        from pathlib import Path
+        if item["take_count"] != 1 or item["take_fx_count"]:
+            raise ValidationError("Crossfade replacement requires a single take without take FX")
+        if (plan_doc.get("project_id") != revision.project_id or
+                plan_doc.get("take_guid") != item["take_guid"] or
+                Path(plan_doc["source_path"]) != Path(item["source_path"]) or
+                any(abs(float(plan_doc[key])-item[field]) > COVERAGE_ATOL for key, field in (
+                    ("item_position_s", "position_s"), ("source_offset_s", "start_offset_s"),
+                    ("item_length_s", "length_s"))) or
+                plan_doc.get("source_fingerprint") != list(_file_fingerprint(Path(item["source_path"])))):
+            raise StaleContext("Source geometry or audio changed since timing analysis")
+        if plan_doc.get("tempo_context") != before["snapshot"].get("tempo"):
+            raise StaleContext("Project tempo changed since timing planning")
+        protected_ranges = [*plan_doc.get("protected_ranges", ()), *protected_ranges]
     project_start_s = item["position_s"] - item["start_offset_s"]
     clips = normalize_clips(blocks, project_start_s=project_start_s)
-    coverage = check_coverage(clips, item)
+    coverage = check_coverage(clips, item, crossfade=crossfade)
     handles = check_source_handles(clips, item)
     protected = check_protected_ranges(clips, item, protected_ranges,
                                        project_start_s=project_start_s)

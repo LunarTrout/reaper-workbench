@@ -156,6 +156,8 @@ end_s, max_duration_s=120)` рендерит мастер применённог
 
 **inspect** — `reaper_evidence` цитирует единицы по evidence-токену; `reaper_calibrate`
 записывает карту параметра плагина; `reaper_midi` читает и правит MIDI-тейки.
+`reaper_timing` измеряет клик и атаки, строит карту ритма и проверяет монтаж
+из айтемов на скорости 1×. См. [Тайминг аудио](TIMING.ru.md).
 
 **discovery** — `reaper_capabilities` перечисляет инструменты и анализаторы;
 `reaper_api_search` + `reaper_api_call` дают доступ к каталогу REAPER API; `reaper_action`

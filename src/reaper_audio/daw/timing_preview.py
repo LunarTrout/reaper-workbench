@@ -21,13 +21,14 @@ from ..errors import ValidationError
 PREVIEW_SCHEMA = "reaper-workbench.timing-preview/1"
 
 
-def _fade(length: int, seconds: float, rate: int) -> np.ndarray:
+def _fade(length: int, fade_in: float, fade_out: float, rate: int) -> np.ndarray:
     window = np.ones(length, dtype=np.float64)
-    edge = min(max(0, int(round(seconds * rate))), length // 2)
-    if edge:
-        ramp = np.linspace(0.0, 1.0, edge, endpoint=False)
-        window[:edge] *= ramp
-        window[-edge:] *= ramp[::-1]
+    head = min(length, max(0, round(fade_in * rate)))
+    tail = min(length, max(0, round(fade_out * rate)))
+    if head:
+        window[:head] *= np.arange(head) / head
+    if tail:
+        window[-tail:] *= 1 - np.arange(tail) / tail
     return window
 
 
@@ -49,9 +50,8 @@ def _render_aligned(source: np.ndarray, rate: int, blocks: list[Mapping[str, Any
         if b <= a or a >= len(samples):
             continue
         piece = samples[a:b].copy()
-        fade = max(float(block.get("fade_in_s", 0.0)),
-                   float(block.get("fade_out_s", 0.0)))
-        piece *= _fade(len(piece), fade, rate)[:, None]
+        piece *= _fade(len(piece), float(block.get("fade_in_s", 0.0)),
+                       float(block.get("fade_out_s", 0.0)), rate)[:, None]
         target = int(round(float(block.get("target_start_s", start)) * rate))
         # Keep a negative target inside the output; the bridge's preflight
         # rejects those before a real apply, so this is preview-only clipping.
@@ -97,7 +97,18 @@ def render_timing_preview(plan: Mapping[str, Any], *, out_dir: str | Path,
     if samples.ndim == 1:
         samples = samples[:, None]
     duration = float(plan.get("duration_s") or len(samples) / rate)
-    aligned, geometry = _render_aligned(samples, rate, plan["blocks"], duration)
+    blocks = plan["blocks"]
+    project_start = 0.
+    if plan.get("method") == "crossfade":
+        project_start = float(plan["item_position_s"])
+        offset = float(plan["source_offset_s"])
+        duration = float(plan["item_length_s"])
+        begin = round(offset * rate)
+        samples = samples[begin:begin + round(duration * rate)]
+        blocks = [{**b, "start_s": b["source_start_s"]-offset,
+                   "end_s": b["source_start_s"]-offset+b["length_s"],
+                   "target_start_s": b["position_s"]-project_start} for b in blocks]
+    aligned, geometry = _render_aligned(samples, rate, blocks, duration)
     root = Path(out_dir)
     root.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(
@@ -113,8 +124,9 @@ def render_timing_preview(plan: Mapping[str, Any], *, out_dir: str | Path,
         total = max(len(samples), len(aligned))
         click_samples = np.zeros((total, 2), dtype=np.float64)
         period = 60.0 / float(bpm)
-        t = 0.0
-        index = 0
+        phase = float(plan.get("grid_phase_s", 0.))
+        index = int(np.ceil((project_start-phase)/period-1e-9))
+        t = max(0., phase+index*period-project_start)
         while t < len(click_samples) / rate:
             at = int(round(t * rate))
             length = max(1, int(0.025 * rate))

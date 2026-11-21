@@ -771,7 +771,6 @@ def test_a_plan_from_build_timing_plan_applies_without_translation() -> None:
 def test_bridge_declares_and_applies_the_typed_operation() -> None:
     script = Path(__file__).resolve().parents[1] / "scripts" / "reaper_bridge.lua"
     text = script.read_text(encoding="utf-8", errors="replace")
-    assert 'bridge_build = "b27-2026-11-21"' in text
     assert "local function validate_item_timing_values" in text
     assert 'elseif kind == "item.timing_apply" then' in text
     assert '"item.timing_apply",' in text  # listed in supported operations

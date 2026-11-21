@@ -283,7 +283,7 @@ Safe consolidations already made or kept deliberately:
 | `reaper_panorama_changes_since` | Token-relative: `not_modified` when the token is current; otherwise only the net values after it (newest wins). Reuses the proven sealed successor token when the update fits inline; otherwise `token_advanced: false` + `advance_refused`. `stale_base` for a broken chain or a live revision ahead of the archive. Without a token, an explicit `change_set` comparison. |
 | `reaper_panorama_refresh` | Re-deliver the current view after loss, staleness or context compaction. |
 
-### Analysis and measured evidence (5)
+### Analysis and measured evidence
 
 | Tool | Use |
 |---|---|
@@ -292,6 +292,7 @@ Safe consolidations already made or kept deliberately:
 | `reaper_edit_map` | Build cut and seam evidence from an existing analysis; it does not edit the project. |
 | `reaper_render_candidate` | Render one applied plan's processed master output through the native REAPER path, for one exact interval, with verified settings restoration, explicit post-render revision, stage/FX/routing provenance, SHA-256 and a leased audio resource. |
 | `reaper_release` | Release one analysis or candidate report and its temporary WAV files now. |
+| `reaper_timing` | Analyze clean source attacks, rank local rhythm interpretations with `rhythm`, inspect pages by `rhythm_id`, and carry chosen targets into a native 1x crossfade plan. See [Audio timing](TIMING.md). |
 
 ### Measurement by interval (3)
 
@@ -326,8 +327,8 @@ For bridge maintenance, `reaper_bridge_reload` is an in-place activation for a
 bridge that already implements the lifecycle contract. It proves one new
 session, the expected build, and the unchanged project identity. A legacy bridge
 returns `bootstrap_required`; do not try to invoke Actions or start a duplicate
-loop through MCP. Follow [the bridge lifecycle procedure](bridge-lifecycle.md)
-for the operator-managed cold start or legacy upgrade.
+loop through MCP. Follow [the bridge startup instructions](INSTALLATION.md#3-start-the-resident-bridge-in-reaper)
+for an operator-managed restart or legacy upgrade.
 
 ## Find an API capability
 
@@ -374,7 +375,13 @@ When the target instance or project is unclear, call
 instances are active, carry the selected `bridge_session_id` through later
 calls. Do not choose a project from its name alone when the target is ambiguous.
 
-Read the current project with `reaper_project`. Its `revision` contains
+For orientation, start with `reaper_session(action="context")`. Use its compact
+project map and health summary, and read only the tracks or items needed
+for the task. Use `since=<state_token>` for later context deltas or
+`pages=true` for a large context document.
+
+Read the current project with `reaper_project` when exact object data is needed.
+Its `revision` contains
 `project_id`, `change_count`, `path`, and — from a bridge that proves them —
 `instance_id` and `epoch`. Treat the revision as the exact address of a project
 state: `project_id` names the project, `instance_id` names the running REAPER
@@ -1203,7 +1210,10 @@ For `stale_context`, refresh and replan. If the error details say
 `audio_state="stale"` or the gate is `audio_evidence_fresh`, the structural
 context may still be correct but project audio is not: create a new capture and
 acknowledge its panorama before interpreting audio. For `bridge_timeout`,
-inspect state before retrying. For `api_unavailable`, check the REAPER version
+inspect state before retrying. If a write status and revision disagree,
+read the affected objects by GUID and resolve the actual result before
+retrying. This matters for non-idempotent writes such as creating or
+duplicating items. For `api_unavailable`, check the REAPER version
 and discover an alternative. For `validation_error`, correct the field in
 `details`. A tool result does not prove that the user's musical goal is
 complete: report what was read back, measured, and actually heard, and identify

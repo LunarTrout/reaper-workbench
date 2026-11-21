@@ -2223,7 +2223,7 @@ def reaper_media(action: str,
 
 @server.tool()
 @_guard
-def reaper_timing(action: Literal["analyze", "plan", "inspect", "preview", "apply", "undo"],
+def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "inspect", "preview", "apply", "undo"],
                   project_id: str | None = None,
                   track_guid: str | None = None,
                   item_guid: str | None = None,
@@ -2245,29 +2245,81 @@ def reaper_timing(action: Literal["analyze", "plan", "inspect", "preview", "appl
                   dry_run: bool = False,
                   reason: str | None = None,
                   archive_root: str | None = None,
-                  bpm: float | None = None) -> dict[str, Any]:
+                  bpm: float | None = None,
+                  method: Literal["crossfade", "legacy"] = "crossfade",
+                  grid_phase_s: float | None = None,
+                  bridge_session_id: str | None = None,
+                  rhythm_id: str | None = None,
+                  rhythm_choices: dict[str, str] | None = None,
+                  context_analysis_ids: list[str] | None = None,
+                  rhythm_offset: int = 0,
+                  rhythm_limit: int = 8) -> dict[str, Any]:
     """Analyze audio timing against the project grid and build a 1x clip plan.
 
-    analyze resolves one file-backed audio item, detects attacks and returns an
-    ``analysis_id``; plan matches them monotonically to the tempo grid and
-    returns a ``plan_id`` with source/project geometry; inspect returns a stored
-    analysis or plan.  apply replaces the source item with the plan's clips in
-    one revision-bound transaction; undo removes those clips and restores the
-    original item through the same transaction receipt.
+    Analyze a clean, file-backed take with an explicit item GUID. Clock verifies
+    a dedicated click item against the project beat grid. Rhythm ranks local
+    rhythm interpretations with attack and release evidence. Read more with
+    inspect(rhythm_id, rhythm_offset, rhythm_limit). Plan with the rhythm_id
+    and optional rhythm_choices mapping segment IDs to option IDs or "keep".
+    Without a rhythm map, plan accepts a single subdivision or explicit
+    reference_events with event_id and target_s or qn. Inspect anchors and
+    seam scores before apply.
+    Apply creates native items and reads their geometry back. Use preview for
+    a dry A/B and undo with the transaction ID returned by apply.
     """
+    from .daw.timing_service import (
+        validate_rhythm_analysis, build_timing_rhythm, measure_timing_clock,
+        plan_timing_crossfades, read_timing_rhythm,
+    )
+    if action in {"analyze", "clock", "rhythm", "plan", "preview", "apply", "undo"}:
+        _handbook_required()
+    if action == "clock":
+        if not item_guid:
+            raise ValidationError("item_guid is required for clock measurement")
+        return {"ok": True, "action": action, **measure_timing_clock(
+            _session(project_id, bridge_session_id), project_id=project_id,
+            item_guid=item_guid, start_s=start_s, end_s=end_s)}
     if action == "analyze":
-        session = _session(project_id)
+        session = _session(project_id, bridge_session_id)
         result = analyze_timing(session, project_id=project_id,
                                 track_guid=track_guid, item_guid=item_guid,
                                 start_s=start_s, end_s=end_s, profile=profile,
-                                sensitivity=sensitivity, min_gap_s=min_gap_s)
+                                sensitivity=sensitivity, min_gap_s=min_gap_s, method=method)
         return {"ok": True, "action": action, **result}
+    if action == "rhythm":
+        if method != "crossfade" or not analysis_id:
+            raise ValidationError("Rhythm requires analysis_id from method=crossfade")
+        session = _session(project_id, bridge_session_id)
+        snapshot = session.snapshot(project_id=project_id, include_items=True)
+        rhythm_key = build_timing_rhythm(
+            analysis_id, snapshot=snapshot, subdivisions=subdivisions,
+            tolerance_s=tolerance_s, grid_phase_s=grid_phase_s or 0.,
+            context_analysis_ids=context_analysis_ids or ())
+        return {"ok": True, "action": action, **read_timing_rhythm(
+            rhythm_key, offset=rhythm_offset, limit=rhythm_limit)}
     if action == "plan":
         if not isinstance(analysis_id, str) or not analysis_id:
             raise ValidationError("analysis_id is required for plan")
-        session = _session(project_id)
-        snapshot = session.snapshot(project_id=project_id)
+        session = _session(project_id, bridge_session_id)
+        explicit = rhythm_id is not None or reference_events is not None
+        snapshot = session.snapshot(project_id=project_id,
+                                    include_items=method == "crossfade" and explicit)
         tempo = snapshot.get("tempo")
+        if method == "crossfade":
+            if (explicit and subdivisions is not None) or (
+                    not explicit and subdivisions is not None and len(subdivisions) != 1):
+                raise ValidationError("Choose one subdivision, a rhythm map, or explicit targets")
+            if explicit:
+                validate_rhythm_analysis(analysis_id, snapshot)
+            result = plan_timing_crossfades(
+                analysis_id, tempo_context=tempo, subdivision=(subdivisions or [4])[0],
+                strength=strength, tolerance_s=tolerance_s, grid_phase_s=grid_phase_s,
+                protected_ranges=protected_ranges or (), project_id=project_id,
+                rhythm_id=rhythm_id, rhythm_choices=rhythm_choices,
+                reference_events=reference_events)
+            return {"ok": True, "action": action, **result}
+        if rhythm_id or rhythm_choices:
+            raise ValidationError("Rhythm maps require the crossfade method")
         result = plan_timing(analysis_id, tempo_context=tempo,
                              subdivisions=subdivisions or (4, 3, 6, 8),
                              tolerance_s=tolerance_s, strength=strength,
@@ -2277,6 +2329,11 @@ def reaper_timing(action: Literal["analyze", "plan", "inspect", "preview", "appl
                              reference_events=reference_events)
         return {"ok": True, "action": action, **result}
     if action == "inspect":
+        if rhythm_id:
+            if analysis_id or plan_id:
+                raise ValidationError("Inspect one analysis, plan or rhythm map at a time")
+            return {"ok": True, "action": action,
+                    **read_timing_rhythm(rhythm_id, offset=rhythm_offset, limit=rhythm_limit)}
         return {"ok": True, "action": action,
                 **inspect_timing(analysis_id=analysis_id, plan_id=plan_id)}
     if action == "preview":
@@ -2302,7 +2359,7 @@ def reaper_timing(action: Literal["analyze", "plan", "inspect", "preview", "appl
             raise ValidationError("expected_revision is required for apply")
         if not isinstance(reason, str) or not reason.strip():
             raise ValidationError("reason is required for apply")
-        session = _session(project_id)
+        session = _session(project_id, bridge_session_id)
         return {"ok": True, "action": action, **apply_timing_plan(
             session, plan_id, project_id=project_id,
             protected_ranges=protected_ranges or (),
@@ -2314,10 +2371,10 @@ def reaper_timing(action: Literal["analyze", "plan", "inspect", "preview", "appl
             raise ValidationError("plan_id is required for undo")
         if not isinstance(reason, str) or not reason.strip():
             raise ValidationError("reason is required for undo")
-        session = _session(project_id)
+        session = _session(project_id, bridge_session_id)
         return {"ok": True, "action": action, **undo_timing_apply(
             session, plan_id, project_id=project_id, reason=reason)}
-    raise ValidationError("action must be analyze, plan, inspect, preview, apply or undo")
+    raise ValidationError("action must be analyze, clock, rhythm, plan, inspect, preview, apply or undo")
 
 
 @server.tool()

@@ -29,15 +29,17 @@ Python-библиотека и локальный MCP-сервер для жив
   айтемов, тейков, FX, сендов, огибающих, MIDI, маркеров, регионов и темпа.
   Каждый батч несёт receipt, readback и ревизию; apply/undo требуют
   `journal.why` и пишут append-only журнал с basis.
+- **Тайминг аудио.** `reaper_timing` анализирует чистые атаки, предлагает
+  трактовки ритма по долям и создаёт нативные айтемы на скорости 1×
+  с проверяемыми перекрытиями. Спорные места можно оставить на месте.
 - **Асинхронный capture.** Задания по источникам сообщают прогресс и не
   блокируют канал управления; offline-медиа будится перед рендером.
 - **Доставка.** `reaper_media` импортирует референсы или кодирует аудио с
   проверкой true peak после кодека.
 
-MCP-поверхность сгруппирована: **42 инструмента в 11 группах** (`session`,
-`measure`, `edit`, `midi`, `calibrate`, `analyze`, `action`, `api`, `flamingo`,
-`spatial`, `media`). Актуальный список — `reaper_capabilities(mode="tools")`;
-схемы — `tools/list`.
+В Workbench **42 инструмента в 11 группах**.
+`reaper_capabilities(mode="tools")` возвращает текущие группы инструментов,
+а `tools/list` — точные схемы аргументов.
 
 ## Установка
 
@@ -78,7 +80,7 @@ measure/edit/midi/analyze отказывают с `HANDBOOK_REQUIRED`, пока 
 - [Установка](docs/INSTALLATION.ru.md) · [English](docs/INSTALLATION.md)
 - [Политика](docs/POLICY.md) — пороги задаёт владелец
 - [Безопасность](docs/SAFETY.ru.md) — границы доверия и гарантии состояния
-- [Тайминг и планирование по сетке](docs/TIMING.md)
+- [Тайминг аудио и карта ритма](docs/TIMING.ru.md) · [English](docs/TIMING.md)
 - [Partial loudness](docs/PARTIAL-LOUDNESS-GATE.md) — гейт и метод остатка
 - [Flamingo](docs/flamingo.md), [Ossicle](docs/ossicle.md) — опциональные слуховые бэкенды
 

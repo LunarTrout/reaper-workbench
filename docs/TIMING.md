@@ -1,90 +1,111 @@
-# Timing analysis and grid planning
+# Timing audio in REAPER
 
-`reaper_timing` measures a file-backed audio take against the project grid and
-returns a 1x clip plan. `apply` replaces the source item with those clips in one
-revision-bound transaction; the analysis actions themselves do not edit.
+[Русский](TIMING.ru.md) · [Handbook](HANDBOOK.md)
 
-## Actions
+`reaper_timing` analyzes a file-backed take before track FX. The default
+`method="crossfade"` creates real REAPER media items at 1x with individual
+crossfades. Use a clean DI take for guitars. A separate amplifier on the
+track can remain active for playback.
 
-```text
-reaper_timing(action="analyze", project_id=..., track_guid=..., item_guid=...,
-              start_s=None, end_s=None, profile="auto",
-              sensitivity=1.8, min_gap_s=0.03)
-```
+## MCP workflow
 
-Resolves the active file take, detects attack candidates, refines each to the
-first rise of its attack in the sample domain, and maps source time to project
-time using the item position and `start_offset_s`. Returns `analysis_id`,
-`source_path`, `project_window`, `events[]` with `source_s`, `project_s`,
-`sample`, `kind`, `confidence`, and `event_count`. Only 1x takes are accepted;
-MIDI items and changed playrates are refused with a typed error.
+1. Read the handbook and project context. Resolve the actual track and item
+   GUIDs. For A/B, copy the unedited items to a separate track and edit the copy.
+2. If the project has a dedicated click item, call
+   `reaper_timing(action="clock", item_guid=..., start_s=0, end_s=8)`.
+   It reports measured click fronts and their deviations from the quarter-note
+   grid. Inspect the tempo and beat phase before adopting the click as a target.
+3. Call `reaper_timing(action="analyze", item_guid=..., profile="picked")`.
+   Analyze the whole item before replacing it. The response includes the
+   observed attack front, peak, novelty, prominence, energy change and
+   confidence. A detected front is a candidate.
+4. Call `reaper_timing(action="plan", analysis_id=..., subdivisions=[4],
+   tolerance_s=0.046, strength=1.0)` when the intended rhythm uses
+   sixteenth notes. Choose the musical subdivision from the performance,
+   including a different division for triplets. The argument is subdivisions
+   per quarter note. `grid_phase_s` defaults to zero and is an explicit offset
+   from the tempo map. Set `protected_ranges` to pin time windows that must
+   stay in place. Inspect the chosen `anchors`, `seams`, and `diagnostics`.
+5. Use `preview` for a dry A/B of the item window. Use
+   `reaper_timing(action="apply", plan_id=..., expected_revision=...,
+   reason=..., dry_run=true)` to check the plan against REAPER and the file.
+   Then apply with `dry_run=false`. Require `readback.matched`, save the
+   project and audition both versions through the same signal chain. The
+   apply result gives the transaction ID and revision for undo.
 
-```text
-reaper_timing(action="plan", analysis_id=...,
-              subdivisions=[4,3,6,8] | None,
-              tolerance_s=0.08, strength=0.85,
-              group_gap_s=0.25, group_shift_s=0.012,
-              protected_ranges=[{"start_s":27.0,"end_s":27.2}],
-              reference_events=[{"target_s":...} | {"qn":...}])
-```
+## Infer a mixed rhythm before editing
 
-Matches events monotonically to the tempo grid (or to explicit reference
-targets), groups events whose required shifts agree, and returns `plan_id`,
-`blocks[]`, `issues[]`, `alternatives[]`, and the median error before/after.
-A block carries source start/end, target start/end, `shift_s`, source offset,
-rate 1.0 and fade lengths. No event is assigned twice and no attack is cut by a
-block boundary. `adjacent_shift_jump` is reported when neighbouring blocks
-differ by 30 ms or more, including a jump across a protected pause.
-
-`reference_events` is an ordered list of project targets. The same measured
-events therefore produce different plans for different rhythmic references;
-when the caller supplies two candidates that are close, both belong in
-`alternatives` and one anchor can be pinned to recalculate only its phrase.
+Use this flow when one subdivision does not describe the entire performance:
 
 ```text
-reaper_timing(action="inspect", analysis_id=... | plan_id=...)
+reaper_timing(action="analyze", item_guid=..., profile="picked")
+reaper_timing(action="rhythm", analysis_id=..., tolerance_s=0.046)
+reaper_timing(action="inspect", rhythm_id=..., rhythm_offset=8, rhythm_limit=8)
+reaper_timing(action="plan", analysis_id=..., rhythm_id=..., tolerance_s=0.046,
+              rhythm_choices={"bar_2_beat_3": "option_2", "bar_2_beat_4": "keep"})
 ```
 
-Returns the stored analysis or plan. `plan` already carries project positions
-for every block (`project_target_start_s`, `project_target_end_s`).
+The analysis ID and rhythm ID belong to the same MCP server session.
+`rhythm` reads the current tempo and meter. It ranks ordered, one-to-one
+assignments by beat, tests regular and tuplet subdivisions, and returns up to
+three distinct assignments per beat. Its slots use divisions per meter beat.
+For example, in 4/4, a division of 4 is a sixteenth-note grid. The optional
+`subdivisions` list controls what families to consider for this action.
 
-```text
-reaper_timing(action="apply", project_id=..., plan_id=..., reason=...,
-              expected_revision=..., dry_run=False)
-reaper_timing(action="undo", project_id=..., plan_id=..., reason=...)
-```
+- Each option contains measured event IDs, candidate project targets in
+  seconds and quarter notes, the distance to the next assigned attack
+  within the beat, unmatched fronts, and observations behind the choice.
+- The observations report the gap to the next candidate separately from
+  measured release, when detectable. Vocal and sustained profiles also show
+  early and late periodic pitch cues where available. These readings can be
+  missing or unreliable in overlapping voices or heavily reverberant audio.
+- `context_analysis_ids` can supply separately analyzed takes such as drums.
+  A nearby contextual attack is supporting evidence. Relative grid patterns
+  elsewhere in the item are also listed for comparison.
+- `supported` means the observed fronts favor one assignment under this
+  scoring model. The raw costs and margins are ranking scores. An
+  `ambiguous` or `unresolved` beat defaults to `keep`, preserving its
+  project timing. Choose a displayed option explicitly to resolve it.
+- For a score, manually chosen grid goals, or targeted overrides, crossfade
+  `plan` accepts `reference_events=[{"event_id":"evt_00012","qn":4.5}]`
+  or a `target_s` instead of `qn`. Supply explicit references as a separate
+  planning mode. Assignments must preserve attack order and stay within the
+  tolerance. Use `protected_ranges` to pin disputed windows in this mode.
 
-`apply` checks the item is a file-backed 1x take without stretch markers, the
-plan covers the item's source window, every clip stays inside the source file
-and no protected range is cut or moved. It then sends exactly one
-`item.timing_apply` operation, reads every created clip back (position, source
-offset, length, playrate, fades, duplicates, leftovers) and returns the
-post-apply revision plus the undo contract. `undo` uses that revision-bound
-receipt and verifies the original item geometry is restored. The bridge build
-is `b27`; the transaction is atomic and does not create a second edit engine.
+The selected map feeds explicit event targets into the native crossfade
+planner. The result includes selected options, achieved shifts, coverage
+checks, and checks that kept intervals stay in place. Validate the plan
+before applying it. Timing inference can preserve an undecided passage rather
+than force the grid, and note-level transcription of overlapping voices is
+outside this tool's current scope.
 
-## Evaluation
 
-`benchmarks/timing/` holds the protocol, real audio-pair manifest, exact-truth
-synthetic generator, baselines and reports. The real-pair report labels
-cross-correlation estimates as measured shifts, never as human ground truth;
-real audio is downloaded locally and is not committed.
 
-## Coordinates and units
+## Plan decisions
 
-- `source_s` — seconds in the take's WAV, independent of the item position.
-- `project_s` — seconds on the project timeline.
-- `qn` — quarter notes on the REAPER tempo map; the grid is built through
-  `TempoMap`, not from a constant BPM.
-- Times in plans and issues are seconds unless a field says `_ms`.
+- Attack evidence combines spectral novelty with low, mid, and high band
+  rises. Nearby strong evidence estimates local timing drift to choose the
+  most plausible grid cell. The correction is measured against the actual
+  grid, not the drift estimate.
+- Several nearby hits can move rigidly together. A new cut has a cost. If
+  a feasible seam cannot be found, the affected groups are combined and
+  the retained timing error is reported.
+- A seam must avoid the neighboring fronts and other credible attacks.
+  Candidate locations and fade widths are scored by the energy change in
+  the blend, waveform correlation, excess high frequency change and local
+  level. Both overlapping clips keep reading their own offset of the source.
+- The plan keeps the existing item extent, preserves the outside fade
+  lengths, and covers the project timeline continuously with paired fades.
+  A small portion of source material can be skipped between seam handles
+  when closing a timing gap. The apply receipt enumerates these source
+  intervals. Source file bounds and pinned material are checked before apply.
+- Before and after error figures are for the selected attacks and the
+  resulting edit geometry. They do not quantify unselected note timing or
+  establish whether the seam sounds transparent.
 
-## Current limits
-
-The plan is the reviewed artifact. `apply` is implemented and unit-tested
-against a fake bridge, but native A/B on a live REAPER project has not yet been
-run in this repository. A 1x edit cannot preserve a take FX chain or take
-envelopes; the operation reports that limitation instead of copying them.
-The detector is signal-driven; the `profile` selects event naming, not a
-musical genre or a fixed threshold. Protected ranges and anchors are caller
-inputs. The real holdout currently has nine downloaded pairs; the remaining
-manifest entries need their local audio before they can be scored.
+The `legacy` method retains the older analysis/plan surface for callers
+that explicitly need it. Profiles set attack detection spacing and protection
+for different sources. Validate vocals and sustained sources with their own
+material and rhythm. This path edits a file-backed 1x item, and does not
+reconstruct stretch markers, layered takes, or per-take processing. Prefer
+track FX when retaining the same processing across an A/B.

@@ -328,8 +328,26 @@ def build_timing_plan(events: Sequence[Mapping[str, Any]],
             left["source_offset_s"] = left["start_s"]
             left["target_end_s"] = round(left["target_start_s"] +
                                          (right["start_s"] - left["start_s"]), 7)
+    for block in blocks:
+        block["ideal_shift_s"] = block["shift_s"]
+    # A 1x edit cannot both keep every ideal target and avoid a hole when
+    # neighbouring shifts differ.  Never duplicate source material to fill a
+    # target gap (that creates a phaser): pull the later block forward to butt
+    # against its predecessor.  Existing ideal overlaps are kept, so the seam
+    # still has real material on both sides.
     for left, right in zip(blocks, blocks[1:]):
-        delta = float(right["shift_s"]) - float(left["shift_s"])
+        previous_end = float(left["target_end_s"])
+        if float(right["target_start_s"]) > previous_end:
+            right["target_start_s"] = round(previous_end, 7)
+        right["target_end_s"] = round(float(right["target_start_s"]) +
+                                      (float(right["end_s"]) - float(right["start_s"])), 7)
+    # Geometry is a 1x clip: target length must equal source length exactly.
+    for block in blocks:
+        block["target_end_s"] = round(float(block["target_start_s"]) +
+                                      (float(block["end_s"]) - float(block["start_s"])), 7)
+        block["shift_s"] = round(float(block["target_start_s"]) - float(block["start_s"]), 7)
+    for left, right in zip(blocks, blocks[1:]):
+        delta = float(right["ideal_shift_s"]) - float(left["ideal_shift_s"])
         if abs(delta) >= 0.030:
             issues.append({"code": "adjacent_shift_jump",
                            "left": left["event_ids"][-1],
@@ -337,11 +355,12 @@ def build_timing_plan(events: Sequence[Mapping[str, Any]],
                            "delta_s": round(delta, 7),
                            "next_action": "audition this seam or protect the pause"})
     matched_offsets = [abs(float(row["offset_s"])) for _, row in matched]
-    residual = []
-    for index, assignment in matched:
-        shift = float(assignment["offset_s"]) * strength
-        residual.append(abs(float(ordered[index]["source_s"]) + shift -
-                            float(assignment["target_s"])))
+    residual = [
+        abs(float(ordered[index]["source_s"]) + float(block["shift_s"]) -
+            float(assignment["target_s"]))
+        for block, group in zip(blocks, groups, strict=True)
+        for index, assignment in group
+    ]
     return {
         "schema": PLAN_SCHEMA,
         "analysis_id": analysis_id,

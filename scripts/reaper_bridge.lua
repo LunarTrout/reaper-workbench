@@ -45,7 +45,7 @@ if _G.__reaper_audio_bridge_resident and not _G.__reaper_audio_bridge_reloading 
   return
 end
 _G.__reaper_audio_bridge_resident = true
-local bridge_build = "b30-2026-11-21"  -- typed item.timing_apply block geometry; loop-source setter
+local bridge_build = "b36-2026-11-21"  -- typed item.timing_apply handle overlap and pre-roll
 -- A second boot inside the same REAPER Lua state must supersede the first:
 -- two loops would both keep heartbeating and the client would see two live
 -- bridges. Every loop compares this token before it reschedules; the newest
@@ -460,7 +460,7 @@ local function item_context(project, track, item_index, options)
     entry.playrate = finite_or_zero(
       reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE"))
     entry.loop_source = flag_true(
-      reaper.GetMediaItemTakeInfo_Value(take, "B_LOOPSRC"))
+      reaper.GetMediaItemInfo_Value(item, "B_LOOPSRC"))
     entry.channel_mode = finite_or_zero(
       reaper.GetMediaItemTakeInfo_Value(take, "I_CHANMODE"))
     entry.group_id = item and finite_or_zero(
@@ -3467,7 +3467,7 @@ local function validate_item_values(values)
   local allowed = { position_s = true, length_s = true, mute = true,
                     stretch_ratio = true, preserve_pitch = true,
                     stretch_markers = true, beat_attachmode = true,
-                    auto_stretch = true }
+                    auto_stretch = true, fade_in_s = true, fade_out_s = true }
   require_object_values(values, allowed)
   if values.position_s ~= nil and not finite_number(values.position_s) then
     fail("validation_error", "item position_s must be finite")
@@ -3478,6 +3478,12 @@ local function validate_item_values(values)
   end
   if values.mute ~= nil and type(values.mute) ~= "boolean" then
     fail("validation_error", "item mute must be a boolean")
+  end
+  for _, key in ipairs({ "fade_in_s", "fade_out_s" }) do
+    if values[key] ~= nil and
+       (not finite_number(values[key]) or values[key] < 0) then
+      fail("validation_error", "item " .. key .. " must be finite and non-negative")
+    end
   end
   if values.stretch_ratio ~= nil and
      (not finite_number(values.stretch_ratio) or values.stretch_ratio < 0.5 or
@@ -3829,10 +3835,11 @@ local function validate_item_timing_values(values)
              limit_s = max_timing_seam_overlap_s })
     end
     if previous_source_end ~= nil and
-       block.source_start_s < previous_source_end - timing_geometry_tolerance_s then
-      fail("validation_error", "Timing blocks reuse or reorder source material",
+       block.source_start_s < previous_source_end - max_timing_seam_overlap_s - timing_geometry_tolerance_s then
+      fail("validation_error", "Timing blocks reuse source material beyond a seam crossfade",
            { block_index = block_index, source_start_s = block.source_start_s,
-             previous_source_end_s = previous_source_end })
+             previous_source_end_s = previous_source_end,
+             limit_s = max_timing_seam_overlap_s })
     end
     previous_position, previous_end, previous_source_end =
       block.position_s, block_end, source_end
@@ -4220,7 +4227,8 @@ local function read_edit_state(project, operation)
     end
   elseif kind == "item.set" then
     local fields = { position_s = "D_POSITION", length_s = "D_LENGTH", mute = "B_MUTE",
-                     beat_attachmode = "C_BEATATTACHMODE", auto_stretch = "C_AUTOSTRETCH" }
+                     beat_attachmode = "C_BEATATTACHMODE", auto_stretch = "C_AUTOSTRETCH",
+                     fade_in_s = "D_FADEINLEN", fade_out_s = "D_FADEOUTLEN" }
     local take = reaper.GetActiveTake(target)
     for key in pairs(values) do
       if key == "stretch_ratio" then
@@ -4642,7 +4650,8 @@ local function apply_edit(project, inspected)
     end
   elseif kind == "item.set" then
     local fields = { position_s = "D_POSITION", length_s = "D_LENGTH", mute = "B_MUTE",
-                     beat_attachmode = "C_BEATATTACHMODE", auto_stretch = "C_AUTOSTRETCH" }
+                     beat_attachmode = "C_BEATATTACHMODE", auto_stretch = "C_AUTOSTRETCH",
+                     fade_in_s = "D_FADEINLEN", fade_out_s = "D_FADEOUTLEN" }
     local take = reaper.GetActiveTake(target)
     local stretch = values.stretch_ratio
     if stretch ~= nil then
@@ -4679,7 +4688,13 @@ local function apply_edit(project, inspected)
       if key ~= "stretch_ratio" and key ~= "preserve_pitch" and
          key ~= "stretch_markers" then
         local numeric = type(value) == "boolean" and (value and 1 or 0) or value
-        checked_call(reaper.SetMediaItemInfo_Value, target, fields[key], numeric)
+        if key == "fade_in_s" or key == "fade_out_s" then
+          -- REAPER returns no value for these setters; the readback below is
+          -- the proof, not a Lua return code.
+          reaper.SetMediaItemInfo_Value(target, fields[key], numeric)
+        else
+          checked_call(reaper.SetMediaItemInfo_Value, target, fields[key], numeric)
+        end
       end
     end
     reaper.UpdateItemInProject(target)
@@ -5037,6 +5052,7 @@ local function apply_edit(project, inspected)
     end
     local name_ok, take_name = reaper.GetSetMediaItemTakeInfo_String(
       take, "P_NAME", "", false)
+    local item_volume = reaper.GetMediaItemInfo_Value(target, "D_VOL")
     local take_volume = reaper.GetMediaItemTakeInfo_Value(take, "D_VOL")
     local take_pan = reaper.GetMediaItemTakeInfo_Value(take, "D_PAN")
     local take_pitch = reaper.GetMediaItemTakeInfo_Value(take, "D_PITCH")
@@ -5066,10 +5082,11 @@ local function apply_edit(project, inspected)
       checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "D_STARTOFFS",
                    block.source_start_s)
       checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "D_PLAYRATE", 1.0)
-      -- B_LOOPSRC is a boolean take attribute whose setter returns false for
-      -- some newly created takes; the default is already non-looping and the
-      -- geometry read-back verifies the actual state.
-      reaper.SetMediaItemTakeInfo_Value(new_take, "B_LOOPSRC", 0)
+      -- Fades on both sides of a seam must play together. Set the item mix
+      -- override so the project's general overlap preference cannot mask a side.
+      checked_call(reaper.SetMediaItemInfo_Value, item, "B_LOOPSRC", 0)
+      checked_call(reaper.SetMediaItemInfo_Value, item, "D_VOL", item_volume)
+      checked_call(reaper.SetMediaItemInfo_Value, item, "I_MIXFLAG", 1)
       checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "B_PPITCH",
                    take_ppitch)
       checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "I_CHANMODE",
@@ -5095,6 +5112,8 @@ local function apply_edit(project, inspected)
       checked_call(reaper.SetMediaItemInfo_Value, item, "D_POSITION",
                    block.position_s)
       checked_call(reaper.SetMediaItemInfo_Value, item, "D_LENGTH", block.length_s)
+      checked_call(reaper.SetMediaItemInfo_Value, item, "C_FADEINSHAPE", 0)
+      checked_call(reaper.SetMediaItemInfo_Value, item, "C_FADEOUTSHAPE", 0)
       checked_call(reaper.SetMediaItemInfo_Value, item, "D_FADEINLEN",
                    block.fade_in_s)
       checked_call(reaper.SetMediaItemInfo_Value, item, "D_FADEOUTLEN",

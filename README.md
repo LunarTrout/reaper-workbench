@@ -28,15 +28,17 @@ bridge over a local file mailbox; REAPER can stay in the background.
   take, FX, send, envelope, MIDI, marker, region and tempo changes. Every edit
   batch carries a receipt, readback and revision; apply/undo require a
   `journal.why`, stored append-only with its basis.
+- **Audio timing.** `reaper_timing` measures clean attack fronts, compares
+  local rhythm interpretations, and creates native 1x items with verified
+  crossfade geometry. Ambiguous passages can stay in place.
 - **Async capture.** Per-source capture jobs report progress instead of
   blocking the control channel; offline media is woken before a render.
 - **Delivery.** `reaper_media` imports references or encodes audio with a
   post-codec true-peak check.
 
-The MCP surface is deliberately grouped: **42 tools in 11 groups** (`session`,
-`measure`, `edit`, `midi`, `calibrate`, `analyze`, `action`, `api`, `flamingo`,
-`spatial`, `media`). Call `reaper_capabilities(mode="tools")` for the current
-list; `tools/list` is authoritative for schemas.
+Workbench exposes **42 tools in 11 groups**. Call
+Call `reaper_capabilities(mode="tools")` for the current tool groups and
+`tools/list` for exact argument schemas.
 
 ## Install
 
@@ -78,7 +80,7 @@ until it is read.
 - [Installation](docs/INSTALLATION.md) · [Russian](docs/INSTALLATION.ru.md)
 - [Policy](docs/POLICY.md) — thresholds belong to the owner
 - [Safety](docs/SAFETY.md) — trust boundary and state guarantees
-- [Timing and grid planning](docs/TIMING.md)
+- [Audio timing and rhythm maps](docs/TIMING.md) · [Russian](docs/TIMING.ru.md)
 - [Partial loudness](docs/PARTIAL-LOUDNESS-GATE.md) — gate and residual method
 - [Flamingo](docs/flamingo.md), [Ossicle](docs/ossicle.md) — optional listening backends
 
