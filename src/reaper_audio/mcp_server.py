@@ -2223,7 +2223,8 @@ def reaper_media(action: str,
 
 @server.tool()
 @_guard
-def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review", "refine", "inspect", "preview", "apply", "undo"],
+def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review", "window", "verify",
+                                  "refine", "inspect", "preview", "apply", "undo"],
                   project_id: str | None = None,
                   track_guid: str | None = None,
                   item_guid: str | None = None,
@@ -2257,7 +2258,14 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review"
                   detail: Literal["summary", "full"] | None = None,
                   review_kind: Literal["all", "residual", "unassigned"] = "all",
                   review_offset: int = 0,
-                  review_limit: int = 12) -> dict[str, Any]:
+                  review_limit: int = 12,
+                  refine_action: Literal["pin", "manual", "exclude", "rhythm",
+                                          "protect", "seam"] | None = None,
+                  event_id: str | None = None,
+                  source_s: float | None = None,
+                  seam_index: int | None = None,
+                  max_shift_s: float = 0.04,
+                  refine_reason: str | None = None) -> dict[str, Any]:
     """Analyze audio timing against the project grid and build a 1x clip plan.
 
     Analyze a clean, file-backed take with an explicit item GUID. Clock verifies
@@ -2273,10 +2281,11 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review"
     Apply verifies native item geometry. Use preview for a dry A/B and undo
     with the transaction ID returned by apply.
     """
+    from .daw import timing_service as _timing
     from .daw.timing_service import (
         build_timing_rhythm, crossfade_plan_view, inspect_timing_review,
         measure_timing_clock, plan_timing_crossfades, read_timing_rhythm,
-        refine_timing, validate_rhythm_analysis,
+        refine_timing, review_window, validate_rhythm_analysis,
     )
     if action in {"analyze", "clock", "rhythm", "plan", "refine", "preview", "apply", "undo"}:
         _handbook_required()
@@ -2342,9 +2351,93 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review"
                              reference_events=reference_events)
         return {"ok": True, "action": action, **result}
     if action == "review":
+        if start_s is not None and end_s is not None:
+            plan = _timing.PLANS.get(plan_id or "")
+            if not plan:
+                raise ValidationError("Window review needs a live crossfade plan_id")
+            data = review_window(plan, start_s=start_s, end_s=end_s)
+            from .daw.timing_verify import conflict_report
+            data["conflicts"] = conflict_report(plan, float(plan.get("duration_s") or 0.0))
+            if detail == "full" and plan.get("source_path"):
+                try:
+                    import librosa
+                    from .daw.timing_verify import verify_plan
+                    audio, rate = librosa.load(plan["source_path"], sr=44100, mono=True)
+                    data["signal"] = verify_plan(plan, audio, sample_rate=rate)["summary"]
+                except Exception as error:
+                    data["signal_unavailable"] = str(error)[:200]
+            return {"ok": True, "action": "review", "mode": "window", **data}
         return {"ok": True, "action": action, **inspect_timing_review(
             plan_id, kind=review_kind, start_s=start_s, end_s=end_s,
             offset=review_offset, limit=review_limit)}
+    if action == "window":
+        plan = _timing.PLANS.get(plan_id or "")
+        if not plan:
+            raise ValidationError("Window review needs a live crossfade plan_id")
+        if start_s is None or end_s is None:
+            raise ValidationError("Window review needs start_s and end_s")
+        data = review_window(plan, start_s=start_s, end_s=end_s)
+        from .daw.timing_verify import conflict_report
+        data["conflicts"] = conflict_report(plan, float(plan.get("duration_s") or 0.0))
+        if detail == "full" and plan.get("source_path"):
+            try:
+                import librosa
+                from .daw.timing_verify import verify_plan
+                audio, rate = librosa.load(plan["source_path"], sr=44100, mono=True)
+                data["signal"] = verify_plan(plan, audio, sample_rate=rate)["summary"]
+            except Exception as error:  # audio optional: geometry still answers
+                data["signal_unavailable"] = str(error)[:200]
+        return {"ok": True, "action": action, **data}
+    if action == "verify":
+        plan = _timing.PLANS.get(plan_id or "")
+        if not plan:
+            raise ValidationError("Verify needs a live crossfade plan_id")
+        from .daw.timing_verify import conflict_report, verify_plan
+        report = conflict_report(plan, float(plan.get("duration_s") or 0.0))
+        payload = {"ok": True, "action": action, "conflicts": report}
+        if plan.get("source_path"):
+            import librosa
+            audio, rate = librosa.load(plan["source_path"], sr=44100, mono=True)
+            payload["result"] = verify_plan(plan, audio, sample_rate=rate)
+        return payload
+    if action == "refine" and refine_action:
+        plan = _timing.PLANS.get(plan_id or "")
+        if not plan:
+            raise ValidationError("Refine needs a live crossfade plan_id")
+        from .daw import timing_refine_actions as acts
+        if refine_action == "pin":
+            child, changes = acts.pin_attack(plan, event_id)
+        elif refine_action == "manual":
+            if source_s is None or start_s is None:
+                raise ValidationError("manual refine needs source_s and start_s (project time)")
+            child, changes = acts.manual_attack(plan, source_s=source_s,
+                                               project_s=start_s, event_id=event_id)
+        elif refine_action == "exclude":
+            child, changes = acts.exclude_candidate(plan, event_id,
+                                                   reason=refine_reason or "agent_excluded")
+        elif refine_action == "rhythm":
+            if not rhythm_choices:
+                raise ValidationError("rhythm refine needs rhythm_choices={segment_id: option_id}")
+            child, changes = plan, {"note": "no changes"}
+            for segment, option in rhythm_choices.items():
+                child, changes = acts.choose_rhythm_option(child, segment_id=segment,
+                                                          option_id=option)
+        elif refine_action == "protect":
+            if start_s is None or end_s is None:
+                raise ValidationError("protect refine needs start_s and end_s")
+            child, changes = acts.protect_interval(plan, start_s=start_s, end_s=end_s)
+        elif seam_index is not None:
+            child, changes = acts.recompute_seam(plan, seam_index=seam_index,
+                                                 max_shift_s=max_shift_s)
+        elif event_id:
+            child, changes = acts.insert_seam(plan, event_id=event_id,
+                                              max_shift_s=max_shift_s)
+        else:
+            raise ValidationError("seam refine needs seam_index or event_id")
+        _timing.PLANS[child["plan_id"]] = child
+        return {"ok": True, "action": action, "refine_action": refine_action,
+                "parent_plan_id": plan.get("plan_id"), **crossfade_plan_view(child, detail=detail or "summary"),
+                "changes": changes}
     if action == "refine":
         if method != "crossfade" or not plan_id:
             raise ValidationError("Refine requires a crossfade timing plan_id")
