@@ -1,5 +1,7 @@
 # REAPER Workbench
 
+[English](README.md) · [Русский](README.ru.md)
+
 Python-библиотека и локальный MCP-сервер для живого проекта REAPER: читать
 проект, измерять реально отрендеренный звук, править типизированными батчами и
 держать один документ состояния, который говорит агенту, что известно, а что
@@ -71,7 +73,8 @@ measure/edit/midi/analyze отказывают с `HANDBOOK_REQUIRED`, пока 
 
 ## Документация
 
-- [Руководство](docs/HANDBOOK.md) — текущий рабочий контракт
+- [Руководство](docs/HANDBOOK.ru.md) — текущий рабочий контракт
+- [Handbook (English)](docs/HANDBOOK.md)
 - [Установка](docs/INSTALLATION.ru.md) · [English](docs/INSTALLATION.md)
 - [Политика](docs/POLICY.md) — пороги задаёт владелец
 - [Безопасность](docs/SAFETY.ru.md) — границы доверия и гарантии состояния

@@ -32,7 +32,7 @@ reaper_structural_token(project_id=...)            # before any mutation
 
 ## 3. Task groups
 
-Eleven groups: `session`, `measure`, `edit`, `midi`, `calibrate`, `analyze`, `action`, `api`, `flamingo`, `spatial`, `media`. `reaper_capabilities(mode="tools")` lists each group's tools and required context.
+Eleven groups: `session`, `project`, `capture`, `panorama`, `media`, `analysis`, `measure`, `inspect`, `edit`, `discovery`, `research`. `reaper_capabilities(mode="tools")` lists each group's tools and required context.
 
 **session** — `reaper_session` (`action`: `health`, `status`, `context`, `state`, `preflight`, `transport`, `project`, `settings`, `app`, `wait_for_change`, `list_instances`, `list_projects`, `dirty`), `reaper_checkpoint_save`, `reaper_bridge_reload`, `reaper_bridge`, `reaper_mode`, `reaper_structural_token`.
 
@@ -41,6 +41,12 @@ Eleven groups: `session`, `measure`, `edit`, `midi`, `calibrate`, `analyze`, `ac
 - `transport`: `transport_action="play|stop|pause"`, `position_s`; `app`: `app_command="ensure|restart|focus"`; `wait_for_change`: `since={"revision"|"transport": ...}`, `timeout_s`.
 - `project`: `project_command="open|save|save_as"`, `path`, `overwrite_existing`; `settings`: `settings_command="read|write"`.
 - `reaper_checkpoint_save` writes a new file only; `reaper_save(mode="save_current|save_as", ...)`; `reaper_mode` is the user's decision; `reaper_structural_token(project_id)` is one digest read, no render.
+
+**project** — `reaper_project` reads the full project document; `reaper_timeline_context` returns tempo/markers/regions; `reaper_save` writes the current project or a new file.
+
+**capture** — `reaper_capture_snapshot` materializes one immutable, revision-bound audio capture; `reaper_capture_read` returns its record. Captures back archived analysis and exact rows; for orientation prefer `session(context)`.
+
+**panorama** — `reaper_panorama_open/page/ack` deliver the whole-project view of one capture, `reaper_panorama_query` returns exact rows by meaning, `reaper_panorama_changes_since` and `reaper_panorama_refresh` handle updates. A panorama receipt proves delivery of those pages, not understanding or listening.
 
 **measure** — `reaper_measure`, `reaper_freshness`, `reaper_coverage`:
 
@@ -87,13 +93,13 @@ reaper_edit(mode="preview", project_id=..., expected_revision=..., reason="...",
 - `import`: a local path or URL becomes a WAV under `<archive_root>/references` plus a measured profile (LUFS, LRA, peak, true peak, crest, centroid, bands, side/mid). `label` names it; `sha256` identifies the exact file.
 - `encode`: a WAV becomes `format`/`bitrate` (mp3 320 by default), and the encoded file is measured; if its true peak exceeds `ceiling_dbtp`, the gain is lowered and it is encoded again (bounded iterations). Answer includes `true_peak`, `lufs`, `iterations`.
 
-**other groups**
+**analysis** — `reaper_analyze` runs analyzers over a capture or the live project; `reaper_mix_evidence` returns mix evidence; `reaper_edit_map` maps editable targets; `reaper_render_candidate(plan_id, project_id, revision_after, start_s, end_s, max_duration_s=120)` renders an applied plan's master; `reaper_release` frees a leased artifact.
 
-- `reaper_calibrate` sweeps a plug-in parameter, records displayed values and restores the original; later `target` values resolve exactly.
-- `reaper_analyze` — track/master analysis plus evidence tokens; `reaper_render_candidate(plan_id, project_id, revision_after, start_s, end_s, max_duration_s=120)` renders an applied plan's master.
-- `reaper_action`, `reaper_api_search` + `reaper_api_call` — low level, no preview/undo guarantee.
-- `reaper_flamingo_*` and `reaper_spatial_*` are optional listening backends; they report model status and are not required for measurement or editing.
-- `reaper_media` is covered above; the remaining group names in `reaper_capabilities` match these tools.
+**inspect** — `reaper_evidence` quotes units behind an evidence token; `reaper_calibrate` records a plug-in parameter map; `reaper_midi` reads and edits MIDI takes.
+
+**discovery** — `reaper_capabilities` lists tools and analyzers; `reaper_api_search` + `reaper_api_call` reach the REAPER API catalog; `reaper_action` invokes native Actions.
+
+**research** — `reaper_flamingo_*` and `reaper_spatial_*` are optional listening/spatial backends. They report status and are not required for measurement or editing.
 
 ## 4. Units
 

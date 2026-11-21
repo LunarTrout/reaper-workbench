@@ -1,5 +1,7 @@
 # REAPER Workbench
 
+[English](README.md) · [Русский](README.ru.md)
+
 Python library and local MCP server for a live REAPER project: read the project,
 measure real rendered audio, edit through typed batches, and keep one state
 document that tells an agent what is known and what has gone stale.
@@ -71,7 +73,8 @@ until it is read.
 
 ## Documentation
 
-- [Handbook](docs/HANDBOOK.md) — the current operating contract
+- [Handbook](docs/HANDBOOK.md) — the current operating contract · [Russian](docs/HANDBOOK.ru.md)
+- [MCP guide for models](docs/MCP-README-LLM.md)
 - [Installation](docs/INSTALLATION.md) · [Russian](docs/INSTALLATION.ru.md)
 - [Policy](docs/POLICY.md) — thresholds belong to the owner
 - [Safety](docs/SAFETY.md) — trust boundary and state guarantees
