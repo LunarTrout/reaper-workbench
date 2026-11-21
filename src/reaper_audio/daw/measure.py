@@ -51,6 +51,9 @@ from ..analysis.metrics import ANALYSIS_VERSION
 from ..context import contract_v2
 from ..context.evidence import EvidenceStore
 from ..context.measurement_cache import MeasurementCache
+from ..context.project_state import (ProjectState, StateStore, fingerprint_master,
+                                     fingerprint_routing, fingerprint_track)
+from ..context.state_diff import state_changes
 from ..errors import BridgeUnavailable, MediaUnresolved, ValidationError
 from ..models import Section
 from .analysis_cache_stage import merge as merge_cached_results
@@ -137,6 +140,123 @@ def cache_options(selection: MetricSelection, band_plan: BandPlan) -> dict[str, 
     }
 
 
+# --------------------------------------------------------------------------- #
+# project state: one digest read -> object fingerprints
+# --------------------------------------------------------------------------- #
+
+#: Structural keys a table cell uses for the band array and its aggregate.
+#: They are part of the table contract (``daw.measure_table.build_cell``), not a
+#: metric vocabulary: the scalar metrics come from the request itself.
+BAND_CELL_KEYS: tuple[str, ...] = (BANDS_KEY, "band_aggregate")
+
+#: ``ProjectState.mark_stale`` keys a master change under this name, not a GUID
+#: (see ``context.project_state.MASTER_STAGE_PREFIX``).
+MASTER_CHANGE_KEY = "master"
+
+
+def _digest_fields(digest: object) -> Mapping[str, Any]:
+    """The ``fields`` block of a project digest, or an empty mapping."""
+    if not isinstance(digest, Mapping):
+        return {}
+    fields = digest.get("fields")
+    return fields if isinstance(fields, Mapping) else {}
+
+
+def _digest_track_rows(digest: object) -> dict[str, dict[str, Any]]:
+    """Fingerprint-ready track rows from one digest read.
+
+    A digest keeps tracks, automation and items in three sections.  A track
+    fingerprint is only as rich as the row it is built from, so the sections are
+    joined here by GUID: ``envelopes`` comes from the automation section and
+    ``items`` from the item section.  A section the digest did not carry leaves
+    its field absent (and therefore ``null`` in the fingerprint) instead of
+    claiming that the track has no automation and no items.
+    """
+    fields = _digest_fields(digest)
+    rows: dict[str, dict[str, Any]] = {}
+    raw_tracks = fields.get("tracks")
+    for row in raw_tracks if isinstance(raw_tracks, list) else []:
+        if not isinstance(row, Mapping):
+            continue
+        guid = row.get("guid")
+        if isinstance(guid, str) and guid:
+            rows[guid] = dict(row)
+    automation = fields.get("automation")
+    envelope_rows = automation.get("tracks") if isinstance(automation, Mapping) else None
+    if isinstance(envelope_rows, list):
+        for row in envelope_rows:
+            if not isinstance(row, Mapping):
+                continue
+            guid = row.get("track_guid")
+            if isinstance(guid, str) and guid in rows:
+                rows[guid]["envelopes"] = list(row.get("envelopes") or [])
+    item_rows = fields.get("items")
+    if isinstance(item_rows, list):
+        grouped: dict[str, list[Mapping[str, Any]]] = {}
+        for item in item_rows:
+            if not isinstance(item, Mapping):
+                continue
+            guid = item.get("track_guid")
+            if isinstance(guid, str) and guid:
+                grouped.setdefault(guid, []).append(item)
+        for guid, row in rows.items():
+            row["items"] = list(grouped.get(guid, ()))
+    return rows
+
+
+def _digest_master_row(digest: object) -> Mapping[str, Any] | None:
+    """The digest's master row, or ``None`` when it was not read."""
+    master = _digest_fields(digest).get("master")
+    return master if isinstance(master, Mapping) and master else None
+
+
+def _routing_rows(track_rows: Mapping[str, Mapping[str, Any]],
+                  master_row: Mapping[str, Any] | None) -> list[Mapping[str, Any]] | None:
+    """Owner rows that carry a ``sends`` list, or ``None`` when routing is unread.
+
+    A routing fingerprint may only be built from rows that actually enumerate
+    sends: one row without a ``sends`` list is missing evidence, and an empty
+    edge list would wrongly claim "nothing is routed".
+    """
+    rows = list(track_rows.values()) + ([master_row] if master_row is not None else [])
+    if not rows or any(not isinstance(row.get("sends"), list) for row in rows):
+        return None
+    return rows
+
+
+def _fingerprint_fields(fingerprint: object) -> dict[str, Any]:
+    """The field map of a stored fingerprint, or an empty mapping."""
+    if isinstance(fingerprint, Mapping):
+        fields = fingerprint.get("fields")
+        if isinstance(fields, Mapping):
+            return dict(fields)
+        return dict(fingerprint)
+    return {}
+
+
+def _stored_object_view(objects: Mapping[str, Any]) -> dict[str, Any]:
+    """``ProjectState.objects`` as the plain fingerprint maps ``state_diff`` compares.
+
+    The state store keeps ``{guid: {"guid", "fingerprint"}}`` records; the diff
+    layer compares object field maps.  Unwrapping here keeps both modules
+    independent of each other's storage shape.
+    """
+    tracks: dict[str, dict[str, Any]] = {}
+    stored_tracks = objects.get("tracks")
+    if isinstance(stored_tracks, Mapping):
+        for guid, record in stored_tracks.items():
+            if isinstance(record, Mapping):
+                tracks[str(guid)] = _fingerprint_fields(record.get("fingerprint"))
+    view: dict[str, Any] = {"tracks": tracks}
+    master = objects.get("master")
+    if isinstance(master, Mapping):
+        view["master"] = _fingerprint_fields(master.get("fingerprint"))
+    routing = objects.get("routing")
+    if isinstance(routing, Mapping):
+        view["routing"] = _fingerprint_fields(routing.get("fingerprint"))
+    return view
+
+
 @dataclass(frozen=True, slots=True)
 class _Selection:
     """Project sources to render plus external files to read in place."""
@@ -172,7 +292,199 @@ class _Asset:
 
 
 class MeasureService(FullCaptureService):
-    """Narrow measurement service built on the capture render primitives."""
+    """Narrow measurement service built on the capture render primitives.
+
+    A measurement is also the write that keeps a project's state current: after
+    the table is built, every cell is upserted into the project state as a fact
+    carrying the object fingerprints read for that measurement, and objects
+    whose fingerprint moved since the stored one are marked stale first.  The
+    state writer is resolved lazily from the archive root; a service built
+    without one is pure analysis and writes no state.
+    """
+
+    def __init__(self, session: Any, archive_root: Any, *,
+                 state_writer: Any = None) -> None:
+        """Bind the session and the archive; optionally inject a state writer.
+
+        ``state_writer`` (tests, or a caller that already owns a
+        :class:`~reaper_audio.context.project_state.ProjectState`) must expose
+        ``objects``, ``state_token``, ``mark_stale``, ``upsert_objects``,
+        ``upsert_fact`` and ``save``.  When it is omitted, one ``StateStore`` is
+        created for the archive root and a fresh ``ProjectState`` is loaded per
+        measurement, so a state file written by another writer is picked up.
+
+        A falsy ``archive_root`` disables state recording entirely.  It keeps
+        the inherited root at the working directory, exactly as an empty string
+        always did, so existing analysis-only callers keep their behaviour.
+        """
+        self._state_enabled = bool(archive_root)
+        self._state_writer = state_writer
+        self._state_store: StateStore | None = None
+        super().__init__(session, archive_root if archive_root else "")
+
+    # ------------------------------------------------------------------ #
+    # project state
+    # ------------------------------------------------------------------ #
+    def _project_state(self, project_id: str) -> Any:
+        """The state writer for this measurement, or ``None`` when disabled."""
+        if not self._state_enabled:
+            return None
+        if self._state_writer is not None:
+            return self._state_writer
+        if self._state_store is None:
+            self._state_store = StateStore(self.archive_root)
+        return ProjectState(self._state_store, project_id)
+
+    def _state_digest(self, digest: object, project_id: str) -> Mapping[str, Any]:
+        """The one digest read the state write derives its fingerprints from.
+
+        ``measure`` already reads the digest for every measurement that renders
+        project sources and hands it in, so this normally reuses that read and
+        adds no bridge call.  Only a caller that supplies no digest at all (a
+        direct ``_record_state`` call, or a future call site) triggers one read
+        here; a bridge that cannot answer leaves the fingerprints unknown
+        rather than failing a measurement whose audio is already analysed.
+        """
+        if isinstance(digest, Mapping) and isinstance(_digest_fields(digest).get("tracks"), list):
+            return digest
+        reader = getattr(self.bridge, "project_digest", None)
+        if not callable(reader):
+            return {}
+        try:
+            answer = reader(project_id)
+        except BridgeUnavailable:
+            return {}
+        return answer if isinstance(answer, Mapping) else {}
+
+    def _record_state(self, *, project_id: str, revision: Mapping[str, Any],
+                      table: Mapping[str, Any], digest: object) -> dict[str, Any]:
+        """Upsert one measurement's cells into the project state.
+
+        For every row (interval) × column (source) × scalar metric one fact is
+        written; the band array and its aggregate travel together as the single
+        metric ``bands``.  Each fact carries the source, master and routing
+        fingerprints of the one digest read for this measurement (external
+        files have none), so a later change can prove exactly which
+        measurements it invalidated.
+
+        Before any fact is written, the stored object fingerprints are compared
+        with the current ones and :meth:`ProjectState.mark_stale` is called for
+        every changed track, the master and routing.  The new fingerprints are
+        then stored, so the next measurement compares against what it measured.
+
+        Returns the additive ``state`` block of the measure result:
+        ``{"state_token", "facts_written", "changes"}``.
+        """
+        disabled = {"state_token": 0, "facts_written": 0, "changes": {}}
+        state = self._project_state(project_id)
+        if state is None:
+            return disabled
+
+        digest = self._state_digest(digest, project_id)
+        track_rows = _digest_track_rows(digest)
+        master_row = _digest_master_row(digest)
+        routing_rows = _routing_rows(track_rows, master_row)
+
+        track_fingerprints = {guid: fingerprint_track(row)
+                              for guid, row in track_rows.items()}
+        master_fingerprint = (fingerprint_master(master_row)
+                              if master_row is not None else None)
+        routing_fingerprint = (fingerprint_routing(routing_rows)
+                               if routing_rows is not None else None)
+
+        stored_view = _stored_object_view(state.objects)
+        current_view: dict[str, Any] = {
+            "tracks": {guid: _fingerprint_fields(fingerprint)
+                       for guid, fingerprint in track_fingerprints.items()},
+        }
+        comparable_stored: dict[str, Any] = {"tracks": dict(stored_view["tracks"])}
+        if master_fingerprint is not None:
+            current_view["master"] = _fingerprint_fields(master_fingerprint)
+            comparable_stored["master"] = stored_view.get("master", {})
+        if routing_fingerprint is not None:
+            current_view["routing"] = _fingerprint_fields(routing_fingerprint)
+            comparable_stored["routing"] = stored_view.get("routing", {})
+        changes = state_changes(comparable_stored, current_view)
+        objects_block = changes.get("objects") or {}
+        changed: dict[str, list[str]] = {}
+        for guid, section in (objects_block.get("tracks") or {}).items():
+            if isinstance(section, Mapping):
+                changed[str(guid)] = [str(field) for field in section.get("fields") or []]
+        master_fields = (objects_block.get("master") or {}).get("fields") or []
+        if master_fields:
+            changed[MASTER_CHANGE_KEY] = [str(field) for field in master_fields]
+        routing_changed = bool((objects_block.get("routing") or {}).get("changed"))
+
+        stale = state.mark_stale(changed, routing_changed=routing_changed)
+
+        if track_rows or master_row is not None or routing_rows is not None:
+            state.upsert_objects(
+                tracks=track_rows or None,
+                master=master_row,
+                routing=routing_rows,
+            )
+
+        def facts_for(source_id: str, stage: str, kind: str) -> dict[str, Any] | None:
+            """The three fingerprints a fact of this source depends on."""
+            if stage == EXTERNAL_SIGNAL_STAGE:
+                return None
+            if kind == "master" or stage == MASTER_SIGNAL_STAGE:
+                source = master_fingerprint
+            else:
+                source = track_fingerprints.get(source_id)
+            return {"source": source, "master": master_fingerprint,
+                    "routing": routing_fingerprint}
+
+        rows = table.get("rows") or []
+        columns = table.get("columns") or []
+        cells = table.get("cells") or []
+        metric_selection = table.get("metric_selection") or {}
+        metric_keys = [str(key) for key in (metric_selection.get("keys") or [])]
+        written = 0
+        for index, row in enumerate(rows):
+            if not isinstance(row, Mapping):
+                continue
+            window = [_number(row.get("start_s"), "interval.start_s"),
+                      _number(row.get("end_s"), "interval.end_s")]
+            cell_row = cells[index] if index < len(cells) else {}
+            if not isinstance(cell_row, Mapping):
+                continue
+            for column in columns:
+                if not isinstance(column, Mapping):
+                    continue
+                source_id = str(column.get("source_id") or "")
+                stage = str(column.get("stage") or "")
+                cell = cell_row.get(source_id)
+                if not source_id or not isinstance(cell, Mapping):
+                    continue
+                fingerprints = facts_for(source_id, stage, str(column.get("kind") or ""))
+                for metric in metric_keys:
+                    if metric not in cell:
+                        continue
+                    state.upsert_fact(source_id=source_id, stage=stage, window=window,
+                                      metrics={metric: cell[metric]},
+                                      fingerprints=fingerprints, revision=dict(revision))
+                    written += 1
+                bands = {key: cell[key] for key in BAND_CELL_KEYS if key in cell}
+                if bands:
+                    state.upsert_fact(source_id=source_id, stage=stage, window=window,
+                                      metrics={"bands": bands},
+                                      fingerprints=fingerprints, revision=dict(revision))
+                    written += 1
+
+        state.save()
+        return {
+            "state_token": int(state.state_token),
+            "facts_written": written,
+            "changes": {
+                "objects_changed": bool(changes.get("changed")),
+                "changed": changed,
+                "routing_changed": routing_changed,
+                "stale_facts": sorted(stale),
+                "added_tracks": list(objects_block.get("added_tracks") or []),
+                "removed_tracks": list(objects_block.get("removed_tracks") or []),
+            },
+        }
 
     def measure(self, *,
                 sources: Sequence[str | Mapping[str, Any]] | str = "all",
@@ -396,6 +708,7 @@ class MeasureService(FullCaptureService):
                            "cell is cut from its own window; the shared audio is "
                            "measured once per interval that contains it"),
             })
+        revision_dict = current.to_dict()
         result: dict[str, Any] = {
             "ok": True,
             "operation": "measure",
@@ -409,7 +722,7 @@ class MeasureService(FullCaptureService):
                          "token_kind": token["kind"]},
             "analysis_cache": cache_stats,
             "analysis_workers": worker_rows,
-            "revision": current.to_dict(),
+            "revision": revision_dict,
             "timings": {"render_s": round(render_s, 3),
                         "analysis_s": round(analysis_s, 3),
                         "total_s": round(time.perf_counter() - started, 3)},
@@ -427,6 +740,12 @@ class MeasureService(FullCaptureService):
                     details={"interval": result["interval"],
                              "sources": [asset.source_id for asset in assets]})
             result["profile"] = profile
+        # Measurements are the writes that keep the project state current.  This
+        # runs after every check that can refuse the call, so a refused measure
+        # never leaves facts behind, and it never rewrites the table above.
+        result["state"] = self._record_state(
+            project_id=revision.project_id, revision=revision_dict,
+            table=table, digest=digest)
         return result
 
     # ------------------------------------------------------------------ #
