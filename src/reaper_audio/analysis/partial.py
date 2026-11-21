@@ -618,8 +618,16 @@ def attribute_partial_loudness(
         source_levels = source_levels_raw[source_id] + offset_db
         source_power = 10.0 ** (source_levels / 10.0)
         source_sones, source_specific, _ = _model_series(source_levels, model)
-        rest_power = np.maximum(mix_power - source_power, 10.0 ** (DB_FLOOR / 10.0))
-        rest_levels = 10.0 * np.log10(np.maximum(rest_power, 1e-30))
+        # Residual at a linear summing point is the difference of the signals,
+        # not of their band powers: two identical in-phase sources cancel
+        # exactly, while power subtraction reports a third of the mix (4.77 dB
+        # too high).  Subtract samples first, then analyse the residual.
+        rest_samples = measured_mix.samples - source.samples
+        rest_levels_raw, rest_times = _source_levels(rest_samples, fs, hop_s, model)
+        if len(rest_levels_raw) != len(times) or not np.allclose(rest_times, times):
+            raise ValidationError("Residual and mix analysis frames do not align",
+                                  details={"source_id": source_id})
+        rest_levels = rest_levels_raw + offset_db
         rest_sones, rest_specific, _ = _model_series(rest_levels, model)
         partial_sones = np.maximum(mix_sones - rest_sones, 0.0)
         plus_power = mix_power + source_power * (10.0 ** (sensitivity_step_db / 10.0) - 1.0)

@@ -83,3 +83,4 @@ def test_partial_loudness_withholds_values_for_unaligned_sources() -> None:
     assert result["reason"] == "timeline_mismatch"
     assert result["sources"] == {}
     assert result["gate"]["result"] is None
+
