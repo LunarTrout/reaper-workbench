@@ -993,8 +993,8 @@ class ProjectState:
                 mapping["routes"] = edges
         for key in ("changes", "history"):
             entries = self._state.get(key)
-            if isinstance(entries, list) and len(entries) > 50:
-                self._state[key] = entries[-50:]
+            if isinstance(entries, list) and len(entries) > 20:
+                self._state[key] = entries[-20:]
         # One copy of each fingerprint, facts hold refs.
         table = self._state.setdefault("fingerprints", {})
         for fact in self._state.get("facts", {}).values():
@@ -1021,8 +1021,6 @@ class ProjectState:
                 "source_id": fact.get("source_id"),
                 "stage": fact.get("stage"),
                 "window": fact.get("window"),
-                "metrics": {},
-                "fingerprints": {},
                 "key_sha256": fact.get("key_sha256"),
                 "measured_at": fact.get("measured_at"),
                 "superseded_by": fact.get("superseded_by"),
