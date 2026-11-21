@@ -38,6 +38,7 @@ from .daw.leveling import plan_curve
 from .daw.session import EditOperation, EditPlan, ProjectRevision, ProjectSession
 from .daw.full_capture import FullCaptureService
 from .daw.measure import MeasureService
+from .daw.media_wake import ensure_media_online
 from .daw.midi import MidiService
 from .daw.edit import run_edit, send_list, undo_receipt
 from .daw.receipt import FileReceiptStore
@@ -2464,6 +2465,7 @@ def reaper_project(project_id: str | None = None,
     filters trim returned tracks/items; the master is always included.
     """
     session = _session(project_id, bridge_session_id)
+    ensure_media_online(session)
     expected = (_revision(expected_revision, project_id=project_id)
                 if expected_revision is not None else None)
     context = session.snapshot(include_items=include_items,
@@ -4137,6 +4139,7 @@ def reaper_render_candidate(
     if plan is None or getattr(plan, "plan_id", None) != plan_id:
         raise ValidationError("The cached candidate plan is invalid")
     session = _session(project_id, bridge_session_id)
+    ensure_media_online(session)
     _current_context(session, requested)
     _prune_analysis_state()
     result = session.render_candidate(
@@ -5497,14 +5500,41 @@ def reaper_capture_snapshot(project_id: str,
     _focus_reaper_window()
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)
+    ensure_media_online(session)
     _current_context(session, expected)
     if (start_s is None) != (end_s is None):
         raise ValidationError("start_s and end_s must both be provided or both be null")
     section = None if start_s is None else (float(start_s), float(end_s))
     service = FullCaptureService(session, archive_root)
-    result = service.capture(section=section, channels=channels,
-                             sample_rate=sample_rate, tail_ms=tail_ms,
-                             analysis_workers=analysis_workers)
+    try:
+        result = service.capture(section=section, channels=channels,
+                                 sample_rate=sample_rate, tail_ms=tail_ms,
+                                 analysis_workers=analysis_workers)
+    except PanoramaCapacityError as exc:
+        # The canonical record is already archived; only the one-shot view did
+        # not fit.  Capture succeeded, so return its identity and point at the
+        # paginated reader instead of reporting a failed capture.
+        details = dict(exc.details or {})
+        capture_id = details.get("capture_id")
+        return {
+            "ok": True,
+            "capture_id": capture_id,
+            "canonical_archived": True,
+            "panorama_delivery": {
+                "view_delivered": False,
+                "reason": "capacity_exceeded",
+                "budget": details,
+                "next_action": {
+                    "tool": "reaper_panorama_open",
+                    "project_id": project_id,
+                    "archive_root": archive_root,
+                    "capture_id": capture_id,
+                    "returns": ["page_1", "manifest"],
+                    "then": ("fetch every page_id with reaper_panorama_page, then call "
+                             "reaper_panorama_ack with every page_hash in order"),
+                },
+            },
+        }
     serialization_start = time.perf_counter()
     safe = _jsonable(result)
     # The bootstrap capture creates the document, but it must not become a
@@ -5693,6 +5723,7 @@ def reaper_measure(archive_root: str,
     if start_s is not None and end_s is not None:
         section = (float(start_s), float(end_s))
     session = _session(project_id, bridge_session_id)
+    wake = ensure_media_online(session)
     before = session.snapshot(include_items=False).get("revision") or {}
     service = MeasureService(session, archive_root)
     result = service.measure(sources=sources, section=section, stage=stage,
