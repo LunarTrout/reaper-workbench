@@ -33,7 +33,7 @@ bridge over a local file mailbox; REAPER can stay in the background.
 - **Delivery.** `reaper_media` imports references or encodes audio with a
   post-codec true-peak check.
 
-The MCP surface is deliberately grouped: **41 tools in 11 groups** (`session`,
+The MCP surface is deliberately grouped: **42 tools in 11 groups** (`session`,
 `measure`, `edit`, `midi`, `calibrate`, `analyze`, `action`, `api`, `flamingo`,
 `spatial`, `media`). Call `reaper_capabilities(mode="tools")` for the current
 list; `tools/list` is authoritative for schemas.

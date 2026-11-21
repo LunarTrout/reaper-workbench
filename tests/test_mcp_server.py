@@ -149,13 +149,13 @@ def test_mcp_surface_is_bounded_and_has_discovery_resources() -> None:
 
     # 35 project tools plus lifecycle, checkpoint, bridge control, evidence,
     # calibration and MIDI helpers.
-    assert len(names) == 41
+    assert len(names) == 42
     assert {"reaper_bridge_reload", "reaper_checkpoint_save",
             "reaper_bridge", "reaper_evidence", "reaper_calibrate",
             "reaper_midi"} <= names
     assert {"reaper_measure", "reaper_freshness", "reaper_coverage",
             "reaper_mode", "reaper_media"} <= names
-    assert {"reaper_capabilities", "reaper_api_search", "reaper_api_call",
+    assert {"reaper_capabilities", "reaper_api_search", "reaper_api_call", "reaper_timing",
             "reaper_bridge_reload", "reaper_checkpoint_save",
             "reaper_project", "reaper_analyze", "reaper_edit",
             "reaper_render_candidate", "reaper_edit_map", "reaper_mix_evidence",
