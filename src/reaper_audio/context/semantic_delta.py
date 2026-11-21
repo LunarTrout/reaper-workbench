@@ -167,8 +167,8 @@ def _table_rows(value: Mapping[str, Any]) -> tuple[list[str], list[list[Any]]] |
 
 def _table_key(columns: Sequence[str], row: Sequence[Any]) -> str | None:
     names = {name: index for index, name in enumerate(columns)}
-    for candidate in (("source", "metric"), ("from_id", "to_id"), ("source",),
-                      ("ref",), ("id",), ("relation_id",)):
+    for candidate in (("source", "metric"), ("from_id", "to_id"), ("track_id",),
+                      ("source",), ("ref",), ("id",), ("relation_id",)):
         if all(name in names for name in candidate):
             return "|".join(str(row[names[name]]) for name in candidate)
     return None

@@ -14,13 +14,16 @@ single ordinary MCP tool result:
   contracts, stage tables, measurement windows and the time axis;
 * object identities live in one ``entities`` dictionary, so a GUID appears once
   in the whole response instead of once per row and per reference.  Stable ids
-  stay derivable (``track:{guid}``, ``analysis:{source_guid}``) and remain the
-  currency of ``reaper_panorama_query``;
+  stay derivable (``track:{guid}``, ``item:{guid}``, ``analysis:{source_guid}``)
+  and remain the currency of ``reaper_panorama_query``;
 * high-frequency exact data (relation edges and pairs, exact series cells, MIDI
-  notes, envelope points, the raw project map, exact unrounded measurements) is
-  neither averaged away nor inlined: it stays in the sealed archive, is
-  catalogued with its measured byte size, and is returned whole by one generic
-  semantic query;
+  notes, envelope points, exact item/take rows, FX parameter rows, the raw
+  project map, exact unrounded measurements) is neither averaged away nor
+  inlined: it stays in the sealed archive, is catalogued with its measured byte
+  size, and is returned whole by one generic semantic query.  The inline
+  ``items``/``takes`` tables are per-track inventories (counts, time extrema,
+  short names, stable item ids, take names, active-take alignment) and ``fx``
+  keeps name, slot order, enabled/offline and the captured parameter count;
 * nothing is invented: the view adds no role, genre, quality or cause.
 
 Field-level precision is declared, never implicit: inline metric values are
@@ -45,9 +48,11 @@ from typing import Any, Mapping, Sequence
 
 from reaper_audio.errors import ValidationError
 from . import contract_v2
+from .item_summary import (exact_rows, item_summary, summary_count,
+                           summary_entries, take_summary)
 from .relations import RELATION_KINDS
 
-VIEW_SCHEMA = "reaper-workbench.panorama-view/2"
+VIEW_SCHEMA = "reaper-workbench.panorama-view/3"
 
 #: Conservative size of one standard MCP tool result, in bytes of UTF-8 JSON.
 #: Basis: below the Hermes 50,000-char inline/spill threshold and within the
@@ -263,14 +268,36 @@ def section_bytes(value: Any) -> int:
 # --------------------------------------------------------------------------
 
 class Entities:
-    """One place where every object GUID and name appears."""
+    """One place where every object GUID and name appears.
+
+    Tracks (and the master) are always inline.  Items and takes are summarised
+    per track, so only the takes referenced by a MIDI summary get an entity row:
+    that is the only remaining inline table that addresses a take by index.
+    """
 
     def __init__(self, document: Mapping[str, Any]) -> None:
         self.tracks = [row for row in document.get("tracks") or [] if isinstance(row, Mapping)]
         master = document.get("master")
         self.master = master if isinstance(master, Mapping) else None
-        self.items = [row for row in document.get("items") or [] if isinstance(row, Mapping)]
-        self.takes = [row for row in document.get("takes") or [] if isinstance(row, Mapping)]
+        self.items = exact_rows(document.get("items")) or []
+        self.takes = exact_rows(document.get("takes")) or []
+        self.item_count = summary_count(document.get("items")) or len(self.items)
+        self.take_count = summary_count(document.get("takes")) or len(self.takes)
+        if not self.takes:
+            # Summary documents do not carry take rows.  A MIDI summary still
+            # names its take; keep exactly those entities so midi.take remains
+            # an honest index instead of a dangling -1.
+            shells: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+            for row in document.get("midi") or []:
+                if not isinstance(row, Mapping):
+                    continue
+                take_id = row.get("take_id")
+                if not take_id:
+                    continue
+                text = str(take_id)
+                guid = text.split(":", 1)[1] if text.startswith("take:") else None
+                shells.setdefault(text, {"take_id": text, "guid": guid, "name": None})
+            self.takes = list(shells.values())
         self.audio = [row for row in document.get("audio") or [] if isinstance(row, Mapping)]
         self.analysis = [row for row in document.get("analysis") or [] if isinstance(row, Mapping)]
         self.track_index: dict[str, int] = {
@@ -313,14 +340,26 @@ class Entities:
     def payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "track": [[row.get("guid"), row.get("name")] for row in self.tracks],
-            "item": [[row.get("guid")] for row in self.items],
-            "take": [[row.get("guid"), row.get("name")] for row in self.takes],
             "note": ("row i of a table uses entity i of its kind; tracks and master are one "
                      "list (master is the last row of tracks); analysis.source and "
-                     "audio.source index that list; stable id = '<kind>:<guid>'"),
+                     "audio.source index that list; stable id = '<kind>:<guid>'. "
+                     "Items and takes are not entity rows in this map: their stable "
+                     "ids are in items/takes rows and exact rows come from "
+                     "reaper_panorama_query"),
+            "items_count": self.item_count,
+            "takes_count": self.take_count,
+            "item_take_detail": {
+                "items": "query data=['items'] objects=[track id or item id]",
+                "takes": "query data=['takes'] objects=[track id, item id or take id]",
+            },
         }
         if self.master:
             payload["master"] = [self.master.get("guid"), self.master.get("name")]
+        if self.takes:
+            payload["take"] = [[row.get("guid"), row.get("name")] for row in self.takes]
+            payload["take_note"] = ("only takes referenced by a MIDI summary; the full "
+                                    "take inventory is in the takes table and its exact "
+                                    "rows come from reaper_panorama_query")
         return payload
 
 
@@ -346,7 +385,7 @@ def _tracks(document: Mapping[str, Any], entities: Entities) -> dict[str, Any]:
             "recv_n": mixer.get("receive_count"),
             "hw_n": mixer.get("hardware_send_count"),
             "fx_n": mixer.get("fx_count"),
-            "item_n": mixer.get("item_count", len(row.get("item_ids") or [])),
+            "item_n": mixer.get("item_count"),
             "audio_i": entities.audio_index.get(str(row.get("audio_id")), -1),
             "analysis_i": entities.analysis_index.get(str(row.get("analysis_id")), -1),
             "role": row.get("semantic_role"),
@@ -359,53 +398,74 @@ def _tracks(document: Mapping[str, Any], entities: Entities) -> dict[str, Any]:
                        "REAPER mixer values, not a gain in dB; role is never inferred"))
 
 
+def _track_order(entities: Entities) -> list[str]:
+    order = [str(row.get("stable_id")) for row in entities.tracks]
+    if entities.master and entities.master.get("stable_id"):
+        order.append(str(entities.master.get("stable_id")))
+    return order
+
+
+def _summary_entries(document: Mapping[str, Any], key: str,
+                     entities: Entities) -> list[dict[str, Any]]:
+    """Rows of a new summary section, or a read-time projection of an old list."""
+    value = document.get(key)
+    entries = summary_entries(value)
+    if entries is not None:
+        return entries
+    rows = exact_rows(value) or []
+    order = _track_order(entities)
+    section = (item_summary(rows, order) if key == "items"
+               else take_summary(exact_rows(document.get("items")) or [], rows, order))
+    return summary_entries(section) or []
+
+
 def _items(document: Mapping[str, Any], entities: Entities) -> dict[str, Any]:
+    """Per-track item inventory: counts, time extrema and stable ids."""
     rows = []
-    for row in entities.items:
-        interval = row.get("interval") if isinstance(row.get("interval"), Mapping) else {}
+    for entry in _summary_entries(document, "items", entities):
+        names = entry.get("item_names")
         rows.append({
-            "track": entities.track_index.get(str(row.get("track_id")), -1),
-            "start_s": interval.get("start_s", row.get("position_s")),
-            "end_s": interval.get("end_s"),
-            "pos_s": row.get("position_s"),
-            "len_s": row.get("length_s"),
-            "off_s": row.get("start_offset_s"),
-            "rate": row.get("playrate"),
-            "mute": 1 if row.get("mute") else 0,
-            "loop": 1 if row.get("loop_source") else 0,
-            "fade_in": row.get("fade_in_s"),
-            "fade_out": row.get("fade_out_s"),
-            "ch_mode": row.get("channel_mode"),
-            "take_n": row.get("take_count"),
-            "take": entities.take_index.get(str(row.get("active_take_id")), -1),
+            "source": entities.track_index.get(str(entry.get("track_id")), -1),
+            "item_n": entry.get("items_count"),
+            "timed_n": entry.get("timed_count"),
+            "start_min_s": entry.get("start_min_s"),
+            "start_max_s": entry.get("start_max_s"),
+            "end_min_s": entry.get("end_min_s"),
+            "end_max_s": entry.get("end_max_s"),
+            "item_names": list(names) if isinstance(names, (list, tuple)) else None,
+            "item_ids": list(entry.get("item_ids") or []) or None,
+            "ids_omitted": entry.get("item_ids_omitted"),
         })
-    return table(rows, ["track", "start_s", "end_s", "pos_s", "len_s", "off_s", "rate",
-                        "mute", "loop", "fade_in", "fade_out", "ch_mode", "take_n", "take"],
-                 decimals={"start_s": 6, "end_s": 6, "pos_s": 6, "len_s": 6, "off_s": 6,
-                           "rate": 6, "fade_in": 6, "fade_out": 6},
-                 note="row order matches entities.item; time is project seconds, [start,end)")
+    return table(rows, ["source", "item_n", "timed_n", "start_min_s", "start_max_s",
+                        "end_min_s", "end_max_s", "item_names", "item_ids",
+                        "ids_omitted"],
+                 decimals={"start_min_s": 6, "start_max_s": 6, "end_min_s": 6,
+                           "end_max_s": 6},
+                 note=("one row per track/master; time extrema are over the timed_n items "
+                       "that carry an interval, each half-open [start_s,end_s); item_ids "
+                       "are stable 'item:<guid>' addresses; item_names is positional with "
+                       "item_ids (null = no short captured name); ids_omitted counts ids "
+                       "kept out of the line and available whole by query data=['items'] "
+                       "objects=[track id]"))
 
 
 def _takes(document: Mapping[str, Any], entities: Entities) -> dict[str, Any]:
+    """Per-track take inventory: names and the active-take relation."""
     rows = []
-    for row in entities.takes:
+    for entry in _summary_entries(document, "takes", entities):
+        names = entry.get("take_names")
         rows.append({
-            "item": entities.item_index.get(str(row.get("item_id")), -1),
-            "track": entities.track_index.get(str(row.get("track_id")), -1),
-            "midi": 1 if row.get("is_midi") else 0,
-            "rate": row.get("playrate"),
-            "pitch": 1 if row.get("preserve_pitch") else 0,
-            "stretch_n": row.get("stretch_marker_count"),
-            "fx_n": row.get("fx_count"),
-            "ch_mode": row.get("channel_mode"),
-            "group": row.get("group_id"),
+            "source": entities.track_index.get(str(entry.get("track_id")), -1),
+            "take_n": entry.get("takes_count"),
+            "take_names": list(names) if isinstance(names, (list, tuple)) else None,
+            "active_takes": entry.get("active_takes"),
         })
-    return table(rows, ["item", "track", "midi", "rate", "pitch", "stretch_n", "fx_n",
-                        "ch_mode", "group"],
-                 decimals={"rate": 6},
-                 note=("row order matches entities.take; rate/pitch/stretch_n/fx_n/ch_mode/"
-                       "group are captured values, not inferred; the source media path and "
-                       "takes with no captured field stay in archive family takes"))
+    return table(rows, ["source", "take_n", "take_names", "active_takes"],
+                 note=("one row per track/master; takes are the active take of each "
+                       "captured item (coverage.domains.takes states active_take_only); "
+                       "active_takes='all' means take row i belongs to item row i, "
+                       "otherwise [item_position, take_name_or_null]; exact take rows: "
+                       "query data=['takes']"))
 
 
 def _midi(document: Mapping[str, Any], entities: Entities) -> dict[str, Any]:
@@ -430,25 +490,22 @@ def _fx(document: Mapping[str, Any], entities: Entities) -> dict[str, Any]:
     for row in document.get("fx") or []:
         if not isinstance(row, Mapping):
             continue
-        params = [param for param in row.get("parameters") or [] if isinstance(param, Mapping)]
-        inline = len(params) <= 4
+        params = row.get("parameters")
         rows.append({
             "owner": entities.track_index.get(str(row.get("owner_id")), -1),
             "slot": row.get("slot_index"),
             "name": row.get("name"),
             "on": 1 if row.get("enabled") else 0,
             "offline": 1 if row.get("offline") else 0,
-            "param_n": row.get("parameter_count", len(params)),
-            "params": ([[param.get("index"), param.get("name"),
-                         nz(param.get("normalized"), 4), param.get("formatted")]
-                        for param in params] if inline else []),
-            "params_omitted": 0 if inline else len(params),
+            "param_n": row.get("parameter_count",
+                              len(params) if isinstance(params, list) else None),
         })
-    return table(rows, ["owner", "slot", "name", "on", "offline", "param_n", "params",
-                        "params_omitted"],
-                 note=("params rows are [index, name, normalized, formatted]; above 4 "
-                       "parameters only params_omitted is inline; archive family fx returns "
-                       "the exact parameter list"))
+    return table(rows, ["owner", "slot", "name", "on", "offline", "param_n"],
+                 note=("one row per FX unit in slot order; no parameter values are "
+                       "inlined, param_n is the captured parameter count; exact "
+                       "parameter rows: reaper_panorama_query data=['fx'] "
+                       "objects=[fx id or owner id] (raw_parameters_pointer names "
+                       "the canonical-record location)"))
 
 
 def _routes(document: Mapping[str, Any], entities: Entities) -> dict[str, Any]:
@@ -704,12 +761,13 @@ def _analysis(document: Mapping[str, Any], entities: Entities, *,
             "exact_values_preserved": True,
             "exact_query": ("reaper_panorama_query data=['analysis'], objects=[source id], "
                             "metrics=[metric name]"),
-            "reason": ("all %d sources x %d scalar metrics are serialized at stored precision "
-                       "in this minimum projection" % (len(entities.source_ids), len(names))
-                       if not round_values else
-                       ("legacy capture exposes %d named scalar metrics; " % len(names)
-                        if has_legacy_rows else
-                        "all 42 sources x 24 exact serialized floats exceed the default ")
+            "reason": (("all %d sources x %d scalar metrics are serialized at stored precision "
+                        "in this minimum projection" % (len(entities.source_ids), len(names))
+                        if not round_values else
+                        (("legacy capture exposes %d named scalar metrics; " % len(names))
+                         if has_legacy_rows else
+                         ("all %d sources x %d scalar metrics exceed the default single-response "
+                          "budget; " % (len(entities.source_ids), len(names)))))
                        + "exact values are preserved in the archive and returned by query; "
                          "the inline projection is rounded, never silently replaced"),
         },
@@ -991,11 +1049,19 @@ def _archive(document: Mapping[str, Any], entities: Entities) -> dict[str, Any]:
             size, row_count, row_unit = points * 40, points, "points"
             bytes_method = "estimate_from_point_count"
         elif family == "items":
-            source = entities.items; size = section_bytes(source)
-            row_count, row_unit, bytes_method = len(source), "rows", "measured"
+            source = document.get("items")
+            size = section_bytes(source)
+            if exact_rows(source) is not None:
+                row_count, row_unit, bytes_method = len(exact_rows(source) or []), "rows", "measured"
+            else:
+                row_count, row_unit, bytes_method = summary_count(source) or 0, "items", "summary"
         elif family == "takes":
-            source = entities.takes; size = section_bytes(source)
-            row_count, row_unit, bytes_method = len(source), "rows", "measured"
+            source = document.get("takes")
+            size = section_bytes(source)
+            if exact_rows(source) is not None:
+                row_count, row_unit, bytes_method = len(exact_rows(source) or []), "rows", "measured"
+            else:
+                row_count, row_unit, bytes_method = summary_count(source) or 0, "takes", "summary"
         elif family == "audio":
             source = entities.audio; size = section_bytes(source)
             row_count, row_unit, bytes_method = len(source), "assets", "measured"
@@ -1036,6 +1102,8 @@ def _archive(document: Mapping[str, Any], entities: Entities) -> dict[str, Any]:
             "columns": ["family", "rows", "row_unit", "bytes", "bytes_method", "selectors"],
             "rows": catalog,
             "note": ("bytes_method=measured means the exact canonical payload for that family; "
+                     "summary means the inline section is a per-track inventory whose exact "
+                     "rows are not present in the view and come from the exact query; "
                      "estimate_from_cell/count means the archive payload is not present in the "
                      "view and the exact query is the only delivery path. No estimate reuses "
                      "another family's bytes."),
@@ -1076,8 +1144,8 @@ def _completeness(document: Mapping[str, Any], entities: "Entities",
     counts = {
         "tracks": len(entities.tracks),
         "master": 1 if entities.master else 0,
-        "items": len(entities.items),
-        "takes": len(entities.takes),
+        "items": entities.item_count,
+        "takes": entities.take_count,
         "fx": len(document.get("fx") or []),
         "routes": len(document.get("routes") or []),
         "automation_envelopes": len(_rows(document.get("automation"), "envelopes")),
@@ -1196,36 +1264,27 @@ def _compact_evidence(value: Any) -> dict[str, Any]:
 
 def _content_index(document: Mapping[str, Any], entities: Entities) -> dict[str, Any]:
     """Per-track item/take inventory without duplicating every item/take GUID."""
-    items = [row for row in document.get("items") or [] if isinstance(row, Mapping)]
-    takes = [row for row in document.get("takes") or [] if isinstance(row, Mapping)]
+    item_entries = {str(entry.get("track_id")): entry
+                    for entry in _summary_entries(document, "items", entities)}
+    take_entries = {str(entry.get("track_id")): entry
+                    for entry in _summary_entries(document, "takes", entities)}
     midi = [row for row in document.get("midi") or [] if isinstance(row, Mapping)]
+    midi_counts: Counter[str] = Counter()
+    for row in midi:
+        track_id = row.get("track_id")
+        if track_id:
+            midi_counts[str(track_id)] += 1
     rows: list[list[Any]] = []
-    ordered = list(entities.tracks)
-    if entities.master is not None:
-        ordered.append(entities.master)
-    for source, track in enumerate(ordered):
-        source_id = str(track.get("stable_id"))
-        own_items = [row for row in items if str(row.get("track_id")) == source_id]
-        own_takes = [row for row in takes if str(row.get("track_id")) == source_id]
-        take_ids = {str(row.get("take_id")) for row in own_takes}
-        starts = []
-        ends = []
-        for row in own_items:
-            interval = row.get("interval") if isinstance(row.get("interval"), Mapping) else {}
-            if interval.get("start_s") is not None:
-                starts.append(float(interval["start_s"]))
-            if interval.get("end_s") is not None:
-                ends.append(float(interval["end_s"]))
-        midi_count = sum(
-            1 for row in midi
-            if str(row.get("take_id")) in take_ids or str(row.get("track_id")) == source_id)
+    for source, track_id in enumerate(_track_order(entities)):
+        item_entry = item_entries.get(track_id, {})
+        take_entry = take_entries.get(track_id, {})
         rows.append([
             source,
-            len(own_items),
-            round(min(starts), 6) if starts else None,
-            round(max(ends), 6) if ends else None,
-            len(own_takes),
-            midi_count,
+            item_entry.get("items_count"),
+            item_entry.get("start_min_s"),
+            item_entry.get("end_max_s"),
+            take_entry.get("takes_count"),
+            midi_counts.get(track_id, 0),
         ])
     return {
         "columns": ["source", "item_n", "first_s", "last_s", "take_n", "midi_n"],
@@ -1250,10 +1309,10 @@ def _lean_projection(view: Mapping[str, Any], document: Mapping[str, Any]) -> di
     lean["view_mode"] = "lean_overview"
     lean["entities"] = {
         key: value for key, value in (view.get("entities") or {}).items()
-        if key not in {"item", "take"}
+        if key not in {"item"}
     }
     lean["entities"]["note"] = (
-        "track row i and master map source i; item/take GUIDs are not duplicated in this "
+        "track row i and master map source i; item GUIDs are not duplicated in this "
         "overview; query data=['items']/['takes'] with objects=[track id] returns exact rows")
     lean["content_index"] = _content_index(document, entities)
     archive = dict(view.get("archive") or {})
@@ -1296,8 +1355,8 @@ def _minimum_inventory(document: Mapping[str, Any], entities: Entities,
         "tracks": len(entities.tracks),
         "master": 1 if entities.master else 0,
         "sources": len(entities.source_ids),
-        "items": len(document.get("items") or []),
-        "takes": len(document.get("takes") or []),
+        "items": summary_count(document.get("items")) or 0,
+        "takes": summary_count(document.get("takes")) or 0,
         "midi_reports": len(document.get("midi") or []),
         "fx": len(document.get("fx") or []),
         "routes": len(document.get("routes") or []),
@@ -1468,7 +1527,9 @@ def build_view(document: Mapping[str, Any], *,
             "columns": {
                 "tracks.vol": "REAPER mixer value (not dB)",
                 "tracks.pan": "-1..1",
-                "items.start_s/end_s/pos_s/len_s": "s",
+                "items.start_*_s/end_*_s": "project s (extrema over timed_n items)",
+                "items.item_ids": "stable item:<guid> addresses",
+                "takes.active_takes": "all | [item position, active take name or null]",
                 "audio.frames": "samples",
                 "audio.sr": "Hz",
                 "audio.dur_s": "s",

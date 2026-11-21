@@ -26,6 +26,8 @@ from __future__ import annotations
 from typing import Any, Iterable, Mapping, Sequence
 
 from reaper_audio.context.details import DETAILS_SCHEMA, resolve_details
+from reaper_audio.context.item_summary import (exact_rows, summary_count,
+                                               summary_entries)
 from reaper_audio.context.panorama_view import (
     ARCHIVE_FAMILIES,
     DEFAULT_RESPONSE_BYTES,
@@ -72,7 +74,10 @@ def _overlaps(start: Any, end: Any, window: tuple[float | None, float | None]) -
         return False
 
 
-def _object_index(document: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+def _object_index(document: Mapping[str, Any], *,
+                  item_rows: Sequence[Mapping[str, Any]] | None = None,
+                  take_rows: Sequence[Mapping[str, Any]] | None = None
+                  ) -> dict[str, dict[str, Any]]:
     """Every addressable id, guid and unique name mapped to its object kind."""
     index: dict[str, dict[str, Any]] = {}
 
@@ -97,8 +102,26 @@ def _object_index(document: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
 
     add_all(document.get("tracks") or [], "track", "stable_id")
     add_all([document.get("master") or {}], "track", "stable_id")
-    add_all(document.get("items") or [], "item", "item_id")
-    add_all(document.get("takes") or [], "take", "take_id")
+    if item_rows is None:
+        item_rows = exact_rows(document.get("items"))
+    if item_rows is None:
+        # Summary documents inline the stable item ids, so selecting a track or
+        # item id still resolves without loading the full record.  Exact rows
+        # are fetched separately.
+        item_rows = [
+            {"item_id": item_id, "track_id": entry.get("track_id")}
+            for entry in summary_entries(document.get("items")) or []
+            for item_id in entry.get("item_ids") or []]
+    add_all(item_rows, "item", "item_id")
+    if take_rows is None:
+        take_rows = exact_rows(document.get("takes"))
+    if take_rows is None:
+        # A take id is not inlined (names are); MIDI summaries are the one
+        # inline table that still names its take.
+        take_rows = [{"take_id": row.get("take_id")}
+                     for row in document.get("midi") or []
+                     if isinstance(row, Mapping) and row.get("take_id")]
+    add_all(take_rows, "take", "take_id")
     add_all(document.get("audio") or [], "audio", "audio_id")
     add_all(document.get("analysis") or [], "analysis", "analysis_id")
     add_all([row for row in (document.get("midi") or []) if isinstance(row, Mapping)],
@@ -116,13 +139,16 @@ def _object_index(document: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def _resolve_objects(document: Mapping[str, Any],
-                     objects: Any) -> tuple[list[dict[str, Any]] | None, list[str]]:
+                     objects: Any, *,
+                     item_rows: Sequence[Mapping[str, Any]] | None = None,
+                     take_rows: Sequence[Mapping[str, Any]] | None = None
+                     ) -> tuple[list[dict[str, Any]] | None, list[str]]:
     """Return (selection, unknown). ``None`` selection means 'all objects'."""
     if objects is None or objects == "all" or objects == ["all"]:
         return None, []
     if isinstance(objects, (str, Mapping)):
         objects = [objects]
-    index = _object_index(document)
+    index = _object_index(document, item_rows=item_rows, take_rows=take_rows)
     selection: list[dict[str, Any]] = []
     unknown: list[str] = []
     for raw in objects or []:
@@ -150,6 +176,105 @@ def _source_ids(selection: Sequence[Mapping[str, Any]] | None) -> set[str] | Non
     if selection is None:
         return None
     return {str(entry.get("id")) for entry in selection}
+
+
+def _record_mapping(record: Any) -> Mapping[str, Any]:
+    if isinstance(record, Mapping):
+        return record
+    if hasattr(record, "to_mapping"):
+        return record.to_mapping()
+    if hasattr(record, "to_dict"):
+        return record.to_dict()
+    return {}
+
+
+def exact_item_take_rows(document: Mapping[str, Any],
+                          record: Any) -> tuple[list[Mapping[str, Any]],
+                                                list[Mapping[str, Any]]]:
+    """Exact item/take rows for this capture.
+
+    A summary document carries only the per-track inventory; the exact rows are
+    rebuilt from the canonical record with the same deterministic builder that
+    wrote the sidecar.  A legacy sidecar that still has the full lists is read
+    as-is (its rows are the bound, archived projection).
+    """
+    items = exact_rows(document.get("items"))
+    takes = exact_rows(document.get("takes"))
+    if items is not None and takes is not None:
+        return items, takes
+    from .panorama import _item_views, _take_views
+
+    data = _record_mapping(record)
+    project_map = data.get("project_map")
+    if not isinstance(project_map, Mapping):
+        raise ValidationError(
+            "Exact item/take rows need the canonical capture record",
+            details={"items_count": summary_count(document.get("items")),
+                     "takes_count": summary_count(document.get("takes")),
+                     "next_action": ("pass the handle/receipt of a capture whose "
+                                     "record.json is present; a summary is not proof "
+                                     "that rows are absent")})
+    if items is None:
+        items = [row for row in _item_views(data, project_map)
+                 if isinstance(row, Mapping)]
+    if takes is None:
+        takes = [row for row in _take_views(items, project_map)
+                 if isinstance(row, Mapping)]
+    return items, takes
+
+
+def _pointer_value(data: Any, pointer: Any) -> Any:
+    """Resolve a canonical-record JSON pointer such as #/project_map/... ."""
+    if not isinstance(pointer, str) or not pointer.startswith("#/"):
+        return None
+    node = data
+    for part in pointer[2:].split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, Mapping):
+            node = node.get(part)
+        elif isinstance(node, (list, tuple)):
+            try:
+                node = node[int(part)]
+            except (ValueError, IndexError):
+                return None
+        else:
+            return None
+    return node
+
+
+def _hydrate_fx(document: Mapping[str, Any], record: Any,
+                rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Attach exact parameter rows from the canonical record to FX selections.
+
+    The map carries FX names, order, state and a pointer, never parameter
+    values.  This is the on-demand delivery path for the exact list; a pointer
+    that cannot be resolved says so instead of returning an empty list.
+    """
+    if all(isinstance(row.get("parameters"), (list, tuple)) for row in rows):
+        return [dict(row) for row in rows]
+    data = _record_mapping(record)
+    result = []
+    for row in rows:
+        out = dict(row)
+        if isinstance(row.get("parameters"), (list, tuple)):
+            result.append(out)
+            continue
+        params = _pointer_value(data, row.get("raw_parameters_pointer"))
+        count = row.get("parameter_count")
+        if isinstance(params, (list, tuple)) and (params or not count):
+            out["parameters"] = [
+                {"index": param.get("index"), "name": param.get("name"),
+                 "normalized": param.get("normalized"),
+                 "formatted": param.get("formatted")}
+                for param in params if isinstance(param, Mapping)]
+            out["parameters_available"] = True
+        else:
+            out["parameters_available"] = False
+            out["parameters_note"] = (
+                "the canonical record did not resolve this FX parameter pointer; "
+                "the captured parameter count above is not evidence that the list is empty")
+        result.append(out)
+    return result
 
 
 def _relation_rows(document: Mapping[str, Any], selection: Sequence[Mapping[str, Any]] | None,
@@ -299,11 +424,16 @@ def _detail_requests(document: Mapping[str, Any], families: Sequence[str],
 
 def _family_filter(document: Mapping[str, Any], family: str,
                    selection: Sequence[Mapping[str, Any]] | None,
-                   window: tuple[float | None, float | None]) -> Any:
+                   window: tuple[float | None, float | None], *,
+                   item_rows: Sequence[Mapping[str, Any]] | None = None,
+                   take_rows: Sequence[Mapping[str, Any]] | None = None,
+                   record: Any = None) -> Any:
     if family == "project_summary":
         return document.get("project") or {}
     if family == "items":
-        rows = [row for row in document.get("items") or [] if isinstance(row, Mapping)]
+        rows = [row for row in (item_rows if item_rows is not None
+                                else exact_rows(document.get("items")) or [])
+                if isinstance(row, Mapping)]
         if selection is not None:
             wanted = {str(entry.get("id")) for entry in selection}
             rows = [row for row in rows if str(row.get("item_id")) in wanted
@@ -317,7 +447,9 @@ def _family_filter(document: Mapping[str, Any], family: str,
                                  window)]
         return rows
     if family == "takes":
-        rows = [row for row in document.get("takes") or [] if isinstance(row, Mapping)]
+        rows = [row for row in (take_rows if take_rows is not None
+                                else exact_rows(document.get("takes")) or [])
+                if isinstance(row, Mapping)]
         if selection is not None:
             wanted = {str(entry.get("id")) for entry in selection}
             rows = [row for row in rows if str(row.get("take_id")) in wanted
@@ -343,7 +475,7 @@ def _family_filter(document: Mapping[str, Any], family: str,
             wanted = {str(entry.get("id")) for entry in selection}
             rows = [row for row in rows if str(row.get("owner_id")) in wanted
                     or str(row.get("fx_id")) in wanted]
-        return rows
+        return _hydrate_fx(document, record, rows)
     return None
 
 
@@ -419,7 +551,26 @@ def run_query(document: Mapping[str, Any], record: Any, *,
                 details={"unknown": unknown_metrics, "allowed": all_metrics})
     else:
         requested_metrics = all_metrics
-    selection, unknown_objects = _resolve_objects(document, objects)
+    item_rows = exact_rows(document.get("items"))
+    take_rows = exact_rows(document.get("takes"))
+    selector = not (objects is None or objects == "all" or objects == ["all"])
+    tokens: list[str] = []
+    if selector:
+        raw_objects = objects if isinstance(objects, (list, tuple)) else [objects]
+        for raw in raw_objects:
+            token = raw.get("id") if isinstance(raw, Mapping) else raw
+            if isinstance(token, str) and token:
+                tokens.append(token)
+    needs_selector_rows = False
+    if tokens and (item_rows is None or take_rows is None):
+        known = _object_index(document)
+        needs_selector_rows = any(token not in known for token in tokens)
+    if {"items", "takes"} & set(families):
+        item_rows, take_rows = exact_item_take_rows(document, record)
+    elif needs_selector_rows and record is not None:
+        item_rows, take_rows = exact_item_take_rows(document, record)
+    selection, unknown_objects = _resolve_objects(
+        document, objects, item_rows=item_rows, take_rows=take_rows)
     if unknown_objects:
         raise ValidationError(
             "unknown object in query selection",
@@ -485,7 +636,9 @@ def run_query(document: Mapping[str, Any], record: Any, *,
             value = _relation_rows(document, selection, kinds, bands_hz, window,
                                    include_pairs=include_pairs)
         else:
-            value = _family_filter(document, family, selection, window)
+            value = _family_filter(document, family, selection, window,
+                                   item_rows=item_rows, take_rows=take_rows,
+                                   record=record)
             if family == "analysis":
                 value = _project_analysis_rows(value, requested_metrics
                                                if metrics is not None else None)
