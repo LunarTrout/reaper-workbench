@@ -86,5 +86,5 @@ run in this repository. A 1x edit cannot preserve a take FX chain or take
 envelopes; the operation reports that limitation instead of copying them.
 The detector is signal-driven; the `profile` selects event naming, not a
 musical genre or a fixed threshold. Protected ranges and anchors are caller
-inputs. The real holdout currently has six downloaded pairs; the remaining
+inputs. The real holdout currently has nine downloaded pairs; the remaining
 manifest entries need their local audio before they can be scored.

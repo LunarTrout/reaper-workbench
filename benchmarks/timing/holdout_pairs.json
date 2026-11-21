@@ -38,8 +38,8 @@
   {
     "id": "april_blues_vocal",
     "instrument": "vocal",
-    "before": "pvmt_01_Raw.wav",
-    "after": "pvmt_03_FixesOut.wav",
+    "before": "april_raw.wav",
+    "after": "april_fixed.wav",
     "source": "https://www.soundonsound.com/techniques/mixing-pop-vocals-audio-examples",
     "truth": "measured_local_shift",
     "note": "same lead vocal before/after pitch and timing tweaks"
@@ -56,8 +56,8 @@
   {
     "id": "rearranging_guitar",
     "instrument": "guitar",
-    "before": "mr_15.wav",
-    "after": "mr_16.wav",
+    "before": "rearr_warp.wav",
+    "after": "rearr_edit.wav",
     "source": "https://www.soundonsound.com/techniques/mix-rescue-rearranging-audio-examples",
     "truth": "perceptual_ab",
     "note": "time-stretch attempt vs audio-edit correction on the same acoustic guitar"
@@ -83,8 +83,8 @@
   {
     "id": "wolfs_head_full",
     "instrument": "mixed",
-    "before": "corrections out.wav",
-    "after": "CorrectionsIn.wav",
+    "before": "wolfs/CorrectionsOut.wav",
+    "after": "wolfs/CorrectionsIn.wav",
     "source": "https://www.soundonsound.com/techniques/mix-rescue-wolfs-head-vixen-morris-band-media",
     "truth": "perceptual_ab",
     "note": "drums quantised with relative second-beat shift; other instruments edited differently"

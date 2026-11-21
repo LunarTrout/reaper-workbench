@@ -104,12 +104,24 @@
       "instrument": "vocal",
       "truth": "measured_local_shift",
       "source": "https://www.soundonsound.com/techniques/mixing-pop-vocals-audio-examples",
-      "status": "missing_audio",
+      "status": "ok",
       "files": {
-        "before": "pvmt_01_Raw.wav",
-        "after": "pvmt_03_FixesOut.wav"
+        "before": "april_raw.wav",
+        "after": "april_fixed.wav"
       },
-      "next": "download the named files from the source page"
+      "duration_before_s": 17.5485,
+      "duration_after_s": 17.5485,
+      "detected_events": 61,
+      "matched_events": 60,
+      "match_rate": 0.9836,
+      "shift_mean_s": 0.00397,
+      "shift_median_s": 0.0,
+      "shift_mae_s": 0.01258,
+      "shift_p90_s": 0.02932,
+      "shift_min_s": -0.05805,
+      "shift_max_s": 0.04354,
+      "mean_correlation": 0.8923,
+      "note": "same lead vocal before/after pitch and timing tweaks"
     },
     {
       "id": "cambridge_guitar_bass",
@@ -128,12 +140,25 @@
       "instrument": "guitar",
       "truth": "perceptual_ab",
       "source": "https://www.soundonsound.com/techniques/mix-rescue-rearranging-audio-examples",
-      "status": "missing_audio",
+      "status": "ok",
       "files": {
-        "before": "mr_15.wav",
-        "after": "mr_16.wav"
+        "before": "rearr_warp.wav",
+        "after": "rearr_edit.wav"
       },
-      "next": "download the named files from the source page"
+      "duration_before_s": 34.0891,
+      "duration_after_s": 36.0325,
+      "detected_events": 174,
+      "matched_events": 160,
+      "match_rate": 0.9195,
+      "shift_mean_s": 0.02037,
+      "shift_median_s": 0.03193,
+      "shift_mae_s": 0.03445,
+      "shift_p90_s": 0.05515,
+      "shift_min_s": -0.05805,
+      "shift_max_s": 0.05805,
+      "mean_correlation": 0.6941,
+      "note": "time-stretch attempt vs audio-edit correction on the same acoustic guitar",
+      "next": "perceptual A/B only; do not report an edit MAE"
     },
     {
       "id": "tom_mckenzie_full",
@@ -190,14 +215,27 @@
       "instrument": "mixed",
       "truth": "perceptual_ab",
       "source": "https://www.soundonsound.com/techniques/mix-rescue-wolfs-head-vixen-morris-band-media",
-      "status": "missing_audio",
+      "status": "ok",
       "files": {
-        "before": "corrections out.wav",
-        "after": "CorrectionsIn.wav"
+        "before": "wolfs/CorrectionsOut.wav",
+        "after": "wolfs/CorrectionsIn.wav"
       },
-      "next": "download the named files from the source page"
+      "duration_before_s": 26.2538,
+      "duration_after_s": 26.2427,
+      "detected_events": 95,
+      "matched_events": 90,
+      "match_rate": 0.9474,
+      "shift_mean_s": 0.00935,
+      "shift_median_s": 0.01451,
+      "shift_mae_s": 0.02683,
+      "shift_p90_s": 0.04644,
+      "shift_min_s": -0.05515,
+      "shift_max_s": 0.05805,
+      "mean_correlation": 0.6778,
+      "note": "drums quantised with relative second-beat shift; other instruments edited differently",
+      "next": "perceptual A/B only; do not report an edit MAE"
     }
   ],
-  "available": 6,
+  "available": 9,
   "planned": 10
 }
