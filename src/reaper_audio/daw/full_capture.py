@@ -1065,6 +1065,23 @@ class FullCaptureService:
                 analysis_results=results,
                 analysis_timing=analysis_timing,
             )
+            # The captured record is now the durable audio truth.  Fill the
+            # one mutable project state from the same record so later reads
+            # query objects, facts and staleness from one place instead of a
+            # parallel capture snapshot.  The legacy archive above stays; a
+            # later stream removes it.
+            state_store = StateStore(self.archive_root)
+            project_state = ProjectState(state_store, record.project_id)
+            state_fill = fill_state_from_capture(
+                project_state,
+                self.session,
+                record,
+                section=(start_s, end_s),
+                revision=record.revision_before,
+            )
+            state_path = project_state.save()
+            state_fill = {**state_fill, "ok": True, "path": str(state_path)}
+
             archive_start = time.perf_counter()
             archived = archive.append(
                 record,
@@ -1106,23 +1123,6 @@ class FullCaptureService:
                         "master_attempts": stored_attempts,
                     },
                 )
-
-            # The captured record is now the durable audio truth.  Fill the
-            # one mutable project state from the same record so later reads
-            # query objects, facts and staleness from one place instead of a
-            # parallel capture snapshot.  The legacy archive above stays; a
-            # later stream removes it.
-            state_store = StateStore(self.archive_root)
-            project_state = ProjectState(state_store, stored.project_id)
-            state_fill = fill_state_from_capture(
-                project_state,
-                self.session,
-                stored,
-                section=(start_s, end_s),
-                revision=stored.revision_before,
-            )
-            state_path = project_state.save()
-            state_fill = {**state_fill, "ok": True, "path": str(state_path)}
 
             return {
                 "ok": True,
