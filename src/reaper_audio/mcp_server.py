@@ -3789,8 +3789,6 @@ def _undo_operation_facts(plan: EditPlan) -> list[dict[str, Any]]:
     return facts
 
 
-@server.tool()
-@_guard
 def _append_journal(archive_root, project_id, result, operations, *,
                     journal, why, kind="apply", undoes=None) -> None:
     """Append one decision entry; never propagate a journaling failure.
@@ -3823,6 +3821,8 @@ def _append_journal(archive_root, project_id, result, operations, *,
         return
 
 
+@server.tool()
+@_guard
 def reaper_edit(mode: str,
                 project_id: str,
                 expected_revision: dict[str, Any],
