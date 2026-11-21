@@ -153,7 +153,6 @@ def build_edit_map_from_report(
     return {
         "schema_version": 1,
         "intent": intent,
-        "quantize_strength": strength,
         "duration_s": round(float(duration), 3),
         "tempo_beats": len(beats),
         "sections": [],
