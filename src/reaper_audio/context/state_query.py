@@ -660,7 +660,8 @@ def query_facts(
         key = _key_of(fact)
         if source_id is not None and key["source_id"] != source_id:
             continue
-        if stage is not None and key["stage"] != stage:
+        if (stage is not None and key["stage"] != stage and
+                public_stage(key["stage"]) != stage):
             continue
         if status is not None and _status(fact) != status:
             continue
