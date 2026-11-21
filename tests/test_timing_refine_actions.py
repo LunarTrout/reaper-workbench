@@ -454,7 +454,11 @@ def test_insert_seam_places_one_late_attack_and_keeps_its_neighbours():
     assert changes["shift_s"] == pytest.approx(-0.020, abs=1e-6)
     assert {row["event_id"] for row in changes["anchors_moved"]} == {"a2"}
     times = {item["id"]: item["project_s"] for item in child["anchors"]}
-    assert times["a2"] == pytest.approx(1.080, abs=1e-6)
+    assert times["a2"] == pytest.approx(1.100, abs=1e-6)
+    assert child["plan_id"] != plan["plan_id"]
+    assert child["parent_plan_id"] == plan["plan_id"]
+    moved = next(anchor for anchor in child["anchors"] if anchor["id"] == "a2")
+    assert moved["project_s"] + moved["achieved_shift_s"] == pytest.approx(1.080)
     assert times["a1"] == pytest.approx(0.20)
     assert times["a3"] == pytest.approx(1.50)
     assert len(child["blocks"]) == 4
@@ -643,3 +647,24 @@ def test_manual_path_moves_one_pick_once_with_no_hole_and_keeps_neighbours():
 
     # The neighbouring attack keeps its time.
     assert next(a for a in child2["anchors"] if a["id"] == "next")["project_s"] == pytest.approx(69.7585)
+
+
+def test_later_shift_uses_a_distinct_child_and_protects_the_attack_interval():
+    from reaper_audio.daw.timing_apply import check_refined_attacks, normalize_clips
+
+    plan = _riff_b_plan()
+    manual, _ = manual_attack(plan, source_s=17.1955, project_s=68.5540,
+                              target_s=68.5852, attack_end_s=17.2031, event_id="manual_pick")
+    refined, changes = insert_seam(manual, event_id="manual_pick")
+    assert changes["shift_s"] == pytest.approx(0.0312)
+    assert refined["plan_id"] != manual["plan_id"]
+    assert refined["parent_plan_id"] == manual["plan_id"]
+    assert [row["id"] for row in refined["anchors"]].count("manual_pick") == 1
+    origin = plan["item_position_s"] - plan["source_offset_s"]
+    check_refined_attacks(refined, normalize_clips(refined["blocks"], project_start_s=origin))
+
+    # The start still plays at the target, but the outgoing clip reads it too.
+    outgoing = next(b for b in refined["blocks"] if b["position_s"] == 68.2653)
+    outgoing["length_s"] += 0.008
+    with pytest.raises(ValidationError, match="must pass once"):
+        check_refined_attacks(refined, normalize_clips(refined["blocks"], project_start_s=origin))

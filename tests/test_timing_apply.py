@@ -768,6 +768,96 @@ def test_a_plan_from_build_timing_plan_applies_without_translation() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _crossfade_fixture(tmp_path, project):
+    from reaper_audio.daw.timing_service import _file_fingerprint
+
+    source = tmp_path / "di.wav"
+    source.write_bytes(b"fixture")
+    project.items[0].source_path = str(source)
+    return {
+        "method": "crossfade", "plan_id": "child", "parent_plan_id": "parent",
+        "project_id": project.project_id, "track_guid": TRACK_GUID,
+        "item_guid": ITEM_GUID, "take_guid": TAKE_GUID, "source_path": str(source),
+        "source_fingerprint": list(_file_fingerprint(source)),
+        "source_offset_s": 0.0, "item_position_s": 1.0, "item_length_s": 12.0,
+        "tempo_context": project.snapshot().get("tempo"),
+        "blocks": [
+            {"position_s": 1.0, "source_start_s": 0.0, "length_s": 6.01,
+             "fade_in_s": 0.0, "fade_out_s": 0.01},
+            {"position_s": 7.0, "source_start_s": 6.0, "length_s": 6.0,
+             "fade_in_s": 0.01, "fade_out_s": 0.0},
+        ],
+    }
+
+
+def test_refined_plan_needs_its_own_dry_run_at_current_revision(tmp_path, monkeypatch):
+    from reaper_audio.daw.timing_service import PLANS
+
+    project = _project(item_length_s=12.0)
+    plan = _crossfade_fixture(tmp_path, project)
+    monkeypatch.setitem(PLANS, "child", plan)
+    monkeypatch.setitem(PLANS, "sibling", {**plan, "plan_id": "sibling"})
+    assert apply_timing_plan(project, "sibling", dry_run=True)["status"] == "dry_run"
+    with pytest.raises(ValidationError, match="Dry-run this exact"):
+        apply_timing_plan(project, "child")
+    assert apply_timing_plan(project, "child", dry_run=True)["status"] == "dry_run"
+    project.bump()
+    with pytest.raises(ValidationError, match="Dry-run this exact"):
+        apply_timing_plan(project, "child")
+    assert apply_timing_plan(project, "child", dry_run=True)["status"] == "dry_run"
+    assert apply_timing_plan(project, "child")["readback"]["matched"]
+
+
+def test_crossfade_refuses_old_montage_before_writing(tmp_path):
+    project = _project(item_length_s=12.0)
+    plan = _crossfade_fixture(tmp_path, project)
+    project.add_item(guid="{OLD}", position_s=2.0, length_s=1.0,
+                     source_path=plan["source_path"])
+    with pytest.raises(ValidationError, match="overlapping clips"):
+        apply_timing_plan(project, plan)
+    assert project.plan_calls == 0
+
+
+def test_crossfade_undoes_a_readback_mismatch(tmp_path):
+    project = _project(item_length_s=12.0, auto_fade_s=0.005, verify_geometry=False)
+    plan = _crossfade_fixture(tmp_path, project)
+    result = apply_timing_plan(project, plan)
+    assert result["status"] == "rolled_back_readback_mismatch"
+    assert not result["applied"]
+    assert result["rollback"]["readback"]["matched"]
+    assert [item.guid for item in project.items] == [ITEM_GUID]
+
+
+def test_manual_later_attack_roundtrip_keeps_the_neighbour(tmp_path, monkeypatch):
+    from reaper_audio.daw.timing_refine_actions import insert_seam, manual_attack
+    from reaper_audio.daw.timing_service import PLANS
+
+    project = _project(item_length_s=12.0)
+    parent = _crossfade_fixture(tmp_path, project)
+    parent.update(parent_plan_id=None, duration_s=12.0, anchors=[
+        {"id": "neighbour", "source_s": 5.1, "project_s": 6.1, "target_s": 6.1},
+    ])
+    parent["blocks"] = [
+        {"position_s": 1.0, "source_start_s": 0.0, "length_s": 12.0,
+         "event_ids": ["neighbour"], "fade_in_s": 0.0, "fade_out_s": 0.0},
+    ]
+    manual, changes = manual_attack(parent, source_s=5.0, project_s=6.0,
+                                    target_s=6.045, attack_end_s=5.004)
+    child, shift = insert_seam(manual, event_id=changes["event_id"], max_shift_s=0.05)
+    assert shift["applied"]
+    for plan in (parent, manual, child):
+        monkeypatch.setitem(PLANS, plan["plan_id"], plan)
+    with pytest.raises(ValidationError, match="superseded"):
+        apply_timing_plan(project, manual["plan_id"])
+    assert apply_timing_plan(project, child["plan_id"], dry_run=True)["status"] == "dry_run"
+    assert apply_timing_plan(project, child["plan_id"])["readback"]["matched"]
+    for source, expected in [(5.0, 6.045), (5.1, 6.1)]:
+        occurrences = [item.position_s + source - item.source_offset_s
+                       for item in project.items if item.source_offset_s <= source
+                       < item.source_offset_s + item.length_s - 1e-6]
+        assert occurrences == pytest.approx([expected])
+
+
 def test_bridge_declares_and_applies_the_typed_operation() -> None:
     script = Path(__file__).resolve().parents[1] / "scripts" / "reaper_bridge.lua"
     text = script.read_text(encoding="utf-8", errors="replace")

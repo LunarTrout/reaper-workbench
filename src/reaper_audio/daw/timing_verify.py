@@ -466,7 +466,7 @@ def _level_delta(samples: np.ndarray, rate: int, time_s: float) -> float:
     return round(float(20.0 * np.log10((right + LEVEL_FLOOR) / (left + LEVEL_FLOOR))), 2)
 
 
-def _duplicate_by_geometry(blocks: list[dict[str, Any]],
+def _duplicate_by_geometry(blocks: list[_Block],
                            anchors: list[dict[str, Any]]) -> int:
     """Count attacks whose source position is covered by two or more blocks.
 
@@ -484,7 +484,7 @@ def _duplicate_by_geometry(blocks: list[dict[str, Any]],
         for block in blocks:
             start = float(block.source_start_s)
             length = float(block.length_s)
-            if start <= float(source_s) < start + length:
+            if start <= float(source_s) < start + length and _gain_at(block, float(source_s) - start) > 0:
                 covering += 1
         if covering > 1:
             count += 1

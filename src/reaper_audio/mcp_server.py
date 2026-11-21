@@ -2263,6 +2263,9 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review"
                                           "protect", "seam"] | None = None,
                   event_id: str | None = None,
                   source_s: float | None = None,
+                  target_s: float | None = None,
+                  attack_end_s: float | None = None,
+                  compare_plan_id: str | None = None,
                   seam_index: int | None = None,
                   max_shift_s: float = 0.04,
                   refine_reason: str | None = None) -> dict[str, Any]:
@@ -2351,6 +2354,10 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review"
                              reference_events=reference_events)
         return {"ok": True, "action": action, **result}
     if action == "review":
+        if compare_plan_id is not None:
+            return {"ok": True, "action": action, **_timing.compare_timing_reviews(
+                plan_id, compare_plan_id, start_s=start_s, end_s=end_s,
+                offset=review_offset, limit=review_limit)}
         if start_s is not None and end_s is not None:
             plan = _timing.PLANS.get(plan_id or "")
             if not plan:
@@ -2360,10 +2367,9 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review"
             data["conflicts"] = conflict_report(plan, float(plan.get("duration_s") or 0.0))
             if detail == "full" and plan.get("source_path"):
                 try:
-                    import librosa
                     from .daw.timing_verify import verify_plan
-                    audio, rate = librosa.load(plan["source_path"], sr=44100, mono=True)
-                    data["signal"] = verify_plan(plan, audio, sample_rate=rate)["summary"]
+                    audio = load_audio(plan["source_path"])
+                    data["signal"] = verify_plan(plan, audio.samples, sample_rate=audio.sample_rate)["summary"]
                 except Exception as error:
                     data["signal_unavailable"] = str(error)[:200]
             return {"ok": True, "action": "review", "mode": "window", **data}
@@ -2381,10 +2387,9 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review"
         data["conflicts"] = conflict_report(plan, float(plan.get("duration_s") or 0.0))
         if detail == "full" and plan.get("source_path"):
             try:
-                import librosa
                 from .daw.timing_verify import verify_plan
-                audio, rate = librosa.load(plan["source_path"], sr=44100, mono=True)
-                data["signal"] = verify_plan(plan, audio, sample_rate=rate)["summary"]
+                audio = load_audio(plan["source_path"])
+                data["signal"] = verify_plan(plan, audio.samples, sample_rate=audio.sample_rate)["summary"]
             except Exception as error:  # audio optional: geometry still answers
                 data["signal_unavailable"] = str(error)[:200]
         return {"ok": True, "action": action, **data}
@@ -2396,9 +2401,8 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review"
         report = conflict_report(plan, float(plan.get("duration_s") or 0.0))
         payload = {"ok": True, "action": action, "conflicts": report}
         if plan.get("source_path"):
-            import librosa
-            audio, rate = librosa.load(plan["source_path"], sr=44100, mono=True)
-            payload["result"] = verify_plan(plan, audio, sample_rate=rate)
+            audio = load_audio(plan["source_path"])
+            payload["result"] = verify_plan(plan, audio.samples, sample_rate=audio.sample_rate)
         return payload
     if action == "refine" and refine_action:
         plan = _timing.PLANS.get(plan_id or "")
@@ -2411,7 +2415,8 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review"
             if source_s is None or start_s is None:
                 raise ValidationError("manual refine needs source_s and start_s (project time)")
             child, changes = acts.manual_attack(plan, source_s=source_s,
-                                               project_s=start_s, event_id=event_id)
+                                               project_s=start_s, event_id=event_id,
+                                               target_s=target_s, attack_end_s=attack_end_s)
         elif refine_action == "exclude":
             child, changes = acts.exclude_candidate(plan, event_id,
                                                    reason=refine_reason or "agent_excluded")
@@ -2430,11 +2435,18 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review"
             child, changes = acts.recompute_seam(plan, seam_index=seam_index,
                                                  max_shift_s=max_shift_s)
         elif event_id:
+            anchor = acts._find_anchor(plan, event_id)
+            if (source_s is None or anchor.get("source_s") is None
+                    or not abs(anchor["source_s"] - source_s) <= 1e-6):
+                raise ValidationError("Pass source_s matching the event's DI front",
+                                      details={"event_id": event_id, "source_s": source_s,
+                                               "event_source_s": anchor.get("source_s")})
             child, changes = acts.insert_seam(plan, event_id=event_id,
                                               max_shift_s=max_shift_s)
         else:
             raise ValidationError("seam refine needs seam_index or event_id")
-        _timing.PLANS[child["plan_id"]] = child
+        if child["plan_id"] != plan["plan_id"]:
+            _timing.register_timing_refinement(child)
         return {"ok": True, "action": action, "refine_action": refine_action,
                 "parent_plan_id": plan.get("plan_id"), **crossfade_plan_view(child, detail=detail or "summary"),
                 "changes": changes}
@@ -2480,9 +2492,13 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review"
             raise ValidationError("expected_revision is required for apply")
         if not isinstance(reason, str) or not reason.strip():
             raise ValidationError("reason is required for apply")
+        plan = _timing.PLANS.get(plan_id)
+        if plan and plan.get("parent_plan_id") and (not track_guid or not item_guid):
+            raise ValidationError("Pass the destination track_guid and working item_guid for a refined plan",
+                                  details={"code": "timing_destination_required", "plan_id": plan_id})
         session = _session(project_id, bridge_session_id)
         return {"ok": True, "action": action, **apply_timing_plan(
-            session, plan_id, project_id=project_id,
+            session, plan_id, project_id=project_id, track_guid=track_guid, item_guid=item_guid,
             protected_ranges=protected_ranges or (),
             expected_revision=expected_revision, reason=reason,
             dry_run=dry_run)}

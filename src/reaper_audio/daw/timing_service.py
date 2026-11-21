@@ -489,6 +489,31 @@ def _finish_crossfade_plan(plan, analysis, tempo):
     return plan
 
 
+def register_timing_refinement(plan):
+    analysis = ANALYSES.get(plan.get("analysis_id"))
+    if analysis:
+        review_plan(plan, analysis, TempoMap.from_context(plan["tempo_context"]),
+                    RHYTHMS.get(plan.get("rhythm_id")))
+    PLANS[plan["plan_id"]] = plan
+
+
+def compare_timing_reviews(plan_id, compare_plan_id, *, start_s, end_s, offset, limit):
+    first = inspect_timing_review(plan_id, kind="all", start_s=start_s, end_s=end_s,
+                                  offset=offset, limit=limit)
+    left, right = PLANS[plan_id], PLANS.get(compare_plan_id)
+    if not right or left.get("analysis_id") != right.get("analysis_id"):
+        raise ValidationError("Compare plans made from the same source analysis")
+    by_id = {row["event_id"]: row for row in right["review_rows"]}
+    base_ids = {row["event_id"] for row in left["review_rows"]}
+    right_only = [row for row in right["review_rows"] if row["event_id"] not in base_ids
+                  and (start_s is None or row["observed_s"] >= start_s)
+                  and (end_s is None or row["observed_s"] < end_s)]
+    rows = [{"event_id": row["event_id"], "left": row, "right": by_id.get(row["event_id"])}
+            for row in first["rows"]]
+    return {**first, "compare_plan_id": compare_plan_id, "rows": rows,
+            "right_only_count": len(right_only), "right_only": right_only[:limit]}
+
+
 def crossfade_plan_view(plan, *, detail="summary"):
     if plan.get("method") != "crossfade":
         return plan
@@ -748,12 +773,10 @@ def review_window(plan, *, start_s, end_s, context_beats=2.0):
     source_path = plan.get("source_path")
     if source_path:
         try:
-            import librosa
-            loaded, sample_rate = librosa.load(str(source_path), sr=44100, mono=True)
-            samples = np.asarray(loaded, dtype=np.float64).reshape(-1)
-            if not samples.size:
-                samples = None
-        except Exception:
+            audio = load_audio(source_path)
+            sample_rate = audio.sample_rate
+            samples = audio.samples.mean(axis=1)
+        except ValidationError:
             samples = None
 
     def attack_envelope(source_s):

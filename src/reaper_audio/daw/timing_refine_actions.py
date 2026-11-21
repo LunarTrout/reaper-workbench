@@ -163,7 +163,8 @@ def pin_attack(plan: Mapping[str, Any], event_id: str
 
 
 def manual_attack(plan: Mapping[str, Any], *, source_s: float, project_s: float,
-                  event_id: str | None = None
+                  event_id: str | None = None, target_s: float | None = None,
+                  attack_end_s: float | None = None
                   ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Add an attack the detector missed at an explicit source and project time.
 
@@ -216,8 +217,11 @@ def manual_attack(plan: Mapping[str, Any], *, source_s: float, project_s: float,
     else:
         new_id = event_id
 
-    block_index = None
-    mapping_residual = 0.0
+    target = project if target_s is None else _number(target_s, "target_s")
+    attack_end = source if attack_end_s is None else _number(attack_end_s, "attack_end_s")
+    if not position <= target < position + length or not source <= attack_end <= offset + length:
+        raise ValidationError("The manual target and attack interval must fit inside the item")
+    candidates = []
     for index, block in enumerate(child["blocks"]):
         if not isinstance(block, Mapping):
             raise ValidationError("Timing plan blocks must be objects",
@@ -228,11 +232,17 @@ def manual_attack(plan: Mapping[str, Any], *, source_s: float, project_s: float,
         inside = (start - 1e-9 <= source <= start + clip_length + 1e-9
                   if last else start - 1e-9 <= source < start + clip_length - 1e-12)
         if inside:
-            block_index = index
-            break
-    if block_index is None:
+            candidates.append(index)
+    if not candidates:
         raise ValidationError("The manual attack lies outside every plan block",
                               details={"source_s": source, "project_s": project})
+    owners = [index for index in candidates
+              if abs(child["blocks"][index]["position_s"] + source
+                     - child["blocks"][index]["source_start_s"] - project) <= 1e-6]
+    if len(candidates) > 1 and len(owners) != 1:
+        raise ValidationError("The manual attack appears in several blocks; pass its observed project time",
+                              details={"source_s": source, "block_indexes": candidates})
+    block_index = owners[0] if owners else candidates[0]
     block = child["blocks"][block_index]
     block_position = _number(block.get("position_s"), "block.position_s")
     block_source = _number(block.get("source_start_s"), "block.source_start_s")
@@ -251,7 +261,9 @@ def manual_attack(plan: Mapping[str, Any], *, source_s: float, project_s: float,
 
     new_anchor = {
         "id": new_id, "source_s": source, "project_s": project,
-        "target_s": project, "desired_shift_s": 0.0, "confidence": 1.0,
+        "target_s": target, "desired_shift_s": target - project, "confidence": 1.0,
+        "attack_end_s": attack_end, "achieved_shift_s": mapping_residual,
+        "residual_s": project + mapping_residual - target,
         "kind": "attack", "manual": True,
     }
     anchor_index = len(anchors)
@@ -267,8 +279,8 @@ def manual_attack(plan: Mapping[str, Any], *, source_s: float, project_s: float,
         "applied": True,
         "source_s": source,
         "project_s": project,
-        "target_s": project,
-        "residual_s": 0.0,
+        "target_s": target,
+        "residual_s": project + mapping_residual - target,
         "mapping_residual_s": mapping_residual,
         "block_index": block_index,
         "event_ids_index": insert_at,
@@ -915,7 +927,7 @@ def insert_seam(plan: Mapping[str, Any], *, event_id: str, lead_s: float = 0.008
             break
     if anchor is None:
         raise ValidationError("Unknown event id", details={"event_id": event_id})
-    attack_s = _anchor_time(anchor, "project_s")
+    observed_s = _anchor_time(anchor, "project_s")
     attack_source = anchor.get("source_s")
     if not isinstance(attack_source, (int, float)):
         raise ValidationError("The attack has no source coordinate",
@@ -925,19 +937,6 @@ def insert_seam(plan: Mapping[str, Any], *, event_id: str, lead_s: float = 0.008
         raise ValidationError("The attack has no numeric target",
                               details={"event_id": event_id})
     target = float(target)
-    wanted = target - attack_s
-    delta = max(min(wanted, cap), -cap)
-    # Moving the clip earlier makes the incoming and outgoing clips overlap by
-    # exactly |delta| at the cut, and a crossfade may not run past the attack it
-    # is meant to clear.  The cut therefore sits at least one crossfade plus a
-    # margin before the attack.
-    crossfade_guess = min(abs(delta), 0.025)
-    lead = max(lead, abs(delta) + crossfade_guess + 0.006)
-    if abs(delta) < 1e-6:
-        return child, {"action": "insert_seam", "event_id": event_id,
-                       "applied": False, "reason": "attack is already on target",
-                       "shift_s": 0.0, "conflict": None, "anchors_moved": []}
-
     blocks = child["blocks"]
     seams = child["seams"]
     # Several blocks may read the same source sample (crossfades overlap in
@@ -964,6 +963,9 @@ def insert_seam(plan: Mapping[str, Any], *, event_id: str, lead_s: float = 0.008
                                        "item_window_s": None if item_end is None
                                        else [round(float(item_start), 6), round(item_end, 6)],
                                        "candidates": candidates})
+    owners = [c for c in bound if event_id in _block_ids(blocks[c["index"]])]
+    if len(owners) == 1:
+        bound = owners
     if len(bound) > 1:
         raise ValidationError("Several blocks could play the attack",
                               details={"event_id": event_id, "source_s": attack_source,
@@ -981,6 +983,20 @@ def insert_seam(plan: Mapping[str, Any], *, event_id: str, lead_s: float = 0.008
     # Where this sample sounds today, through the block that holds it.
     echo_project = start + (attack_source - source)
 
+    attack_s = echo_project
+    wanted = target - attack_s
+    delta = max(min(wanted, cap), -cap)
+    # Moving the clip earlier makes the incoming and outgoing clips overlap by
+    # exactly |delta| at the cut, and a crossfade may not run past the attack it
+    # is meant to clear.  The cut therefore sits at least one crossfade plus a
+    # margin before the attack.
+    crossfade_guess = min(abs(delta), 0.025)
+    lead = max(lead, abs(delta) + crossfade_guess + 0.006)
+    if abs(delta) < 1e-6:
+        return child, {"action": "insert_seam", "event_id": event_id,
+                       "applied": False, "reason": "attack is already on target",
+                       "shift_s": 0.0, "conflict": None, "anchors_moved": []}
+
     if delta > 0.0:
         # Moving an attack later: the outgoing clip must fade to silence exactly
         # where it would otherwise repeat the attack, and the incoming clip must
@@ -988,51 +1004,57 @@ def insert_seam(plan: Mapping[str, Any], *, event_id: str, lead_s: float = 0.008
         crossfade = min(max(lead_s, 0.004), 0.025)
         cut_project = echo_project - crossfade
         new_position = cut_project
-        right_source = attack_source - (target - new_position)
+        right_source = attack_source - (echo_project + delta - new_position)
         left_length = echo_project - start
         if left_length < MIN_CLIP_S:
             return _seam_conflict(child, max(index - 1, 0), cut_project, 0.0,
                                   "clip_too_short",
                                   f"the outgoing half would be {left_length:.6f} s", 0.0)
-        later_times = [t for t in (
-            _anchor_time(a, "project_s") for a in child["anchors"]
-            if isinstance(a, Mapping)) if attack_s + 1e-9 < t < end - 1e-9]
-        tail_cut_local = (min(later_times) - lead) if later_times else None
-        right_length = ((tail_cut_local + 0.004) if tail_cut_local is not None else end) - new_position
-        if duration is not None:
-            right_length = min(right_length, duration - right_source)
-        if duration is not None and right_source + right_length > duration + 1e-9:
+        from ..analysis.timing_seams import MAX_SOURCE_SKIP
+
+        attack_end = float(anchor.get("attack_end_s", attack_source))
+        shifted_end = echo_project + delta + attack_end - attack_source
+        later_times = [start + float(row["source_s"]) - source
+                       for row in child["anchors"] if row.get("source_s") is not None
+                       and row["id"] != event_id
+                       and attack_end < float(row["source_s"]) < source + length]
+        tail_fade = max(crossfade, delta - MAX_SOURCE_SKIP + 1e-6)
+        original_fade_out = float(block.get("fade_out_s") or 0.0)
+        tail_cut = min([end - max(MIN_CLIP_S, original_fade_out + tail_fade),
+                        *(time - tail_fade for time in later_times)])
+        right_end = tail_cut + tail_fade
+        if (right_source < 0 or shifted_end > tail_cut or tail_cut < echo_project
+                or right_end - new_position < MIN_CLIP_S):
             return _seam_conflict(child, max(index - 1, 0), cut_project, delta,
-                                  "insufficient_source",
-                                  f"the new clip would read to {right_source + right_length:.6f} s "
-                                  f"of {duration:.6f} s", 0.0)
-        left = dict(block); left["length_s"] = round(left_length, 6)
-        left["fade_out_s"] = round(crossfade, 6)
+                                  "no_safe_tail_seam",
+                                  "the shifted attack and its next neighbour need more room", 0.0)
+
+        left = dict(block, length_s=round(left_length, 6), fade_out_s=round(crossfade, 6))
+        left["event_ids"] = [key for key in _block_ids(left) if key != event_id]
         right = {"position_s": round(new_position, 6),
                  "source_start_s": round(right_source, 6),
-                 "length_s": round(right_length, 6),
+                 "length_s": round(right_end - new_position, 6),
                  "fade_in_s": round(crossfade, 6),
-                 "fade_out_s": 0.004 if tail_cut_local is not None else 0.0,
-                 "event_ids": []}
-        moved = []
-        for item in child["anchors"]:
-            if not isinstance(item, Mapping):
-                continue
-            t = _anchor_time(item, "project_s")
-            if echo_project - 1e-9 <= t < end - 1e-9:
-                new_t = t + (target - echo_project) if abs(t - echo_project) < 0.030 else t
-                moved.append({"event_id": item.get("id"), "previous_project_s": round(t, 6),
-                              "project_s": round(new_t, 6)})
-                if isinstance(item, MutableMapping):
-                    item["project_s"] = new_t
-                right["event_ids"].append(item.get("id"))
-        blocks[index] = left
-        blocks.insert(index + 1, right)
-        seams.insert(index, round(new_position, 6))
-        return child, {"action": "insert_seam", "event_id": event_id, "applied": True,
-                       "mode": "later", "shift_s": round(target - echo_project, 6),
-                       "cut_project_s": round(cut_project, 6), "cut_source_s": round(right_source, 6),
-                       "crossfade_s": round(crossfade, 6), "anchors_moved": moved, "conflict": None}
+                 "fade_out_s": round(tail_fade, 6), "event_ids": [event_id]}
+        tail = dict(block, position_s=round(tail_cut, 6),
+                    source_start_s=round(source + tail_cut - start, 6),
+                    length_s=round(end - tail_cut, 6), fade_in_s=round(tail_fade, 6))
+        tail_ids = {row["id"] for row in child["anchors"] if row.get("source_s") is not None
+                    and source + tail_cut - start <= row["source_s"] < source + length}
+        tail["event_ids"] = [key for key in left["event_ids"] if key in tail_ids]
+        left["event_ids"] = [key for key in left["event_ids"] if key not in tail_ids]
+        moved = [{"event_id": event_id, "previous_project_s": round(echo_project, 6),
+                  "project_s": round(echo_project + delta, 6)}]
+        blocks[index:index + 1] = [left, right, tail]
+        seams[index:index] = [round(new_position, 6), round(tail_cut, 6)]
+        changes = {"action": "insert_seam", "event_id": event_id, "applied": True,
+                   "mode": "later", "shift_s": round(delta, 6),
+                   "cut_project_s": round(cut_project, 6), "cut_source_s": round(right_source, 6),
+                   "crossfade_s": round(crossfade, 6), "anchors_moved": moved, "conflict": None}
+        anchor["project_s"] = observed_s
+        anchor["achieved_shift_s"] = echo_project + delta - observed_s
+        anchor["residual_s"] = echo_project + delta - target
+        return _stamp(child, plan, "insert_seam", changes), changes
 
     cut_project = attack_s - lead
     new_position = cut_project + delta
@@ -1157,4 +1179,7 @@ def insert_seam(plan: Mapping[str, Any], *, event_id: str, lead_s: float = 0.008
         "anchors_moved": moved,
         "conflict": None,
     }
-    return child, changes
+    anchor["project_s"] = observed_s
+    anchor["achieved_shift_s"] = echo_project + delta - observed_s
+    anchor["residual_s"] = echo_project + delta - target
+    return _stamp(child, plan, "insert_seam", changes), changes

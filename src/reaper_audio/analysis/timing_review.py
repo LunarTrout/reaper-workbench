@@ -13,7 +13,8 @@ def _nearby(times, value):
 
 
 def review_plan(plan, analysis, tempo, rhythm=None):
-    events = analysis["events"]
+    manual = [a for a in plan["anchors"] if a.get("manual")]
+    events = sorted([*analysis["events"], *manual], key=lambda event: event["project_s"])
     blocks = plan["blocks"]
     anchors = {a["id"]: a for a in plan["anchors"]}
     phase = plan["grid_phase_s"]

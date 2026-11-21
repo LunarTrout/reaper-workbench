@@ -219,3 +219,18 @@ id produces:
 reproduces this case numerically: the pick is audible once on target, the old
 copy has zero gain, no hole appears on the timeline and the neighbouring attack
 keeps its time.
+
+### Validate a per-event refinement
+
+For a missed front, call `refine` with `refine_action="manual"`.
+Pass the DI onset as `source_s`, its current project time as `start_s`,
+and its musical goal as `target_s`. Supply `attack_end_s` to check the
+whole transient. Run `refine_action="seam"` on the new plan with the
+returned `event_id` and the same `source_s`.
+
+Run `apply(dry_run=true)` on the final child plan at the revision you
+intend to apply. A refined front must pass in one clip outside its fades.
+Pass the destination `track_guid` and working `item_guid` for both calls.
+Review reports the remaining timing error. Use
+`review(compare_plan_id=...)` to compare targets and errors between plans
+from one source analysis, including events without targets.
