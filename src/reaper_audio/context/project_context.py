@@ -80,7 +80,7 @@ TOKEN_BYTES_ESTIMATE = 2.2
 
 #: Default page budget.  Below the 48,000-byte panorama policy default and the
 #: 50,000-character host inline threshold, leaving room for the envelope.
-DEFAULT_PAGE_BYTES = 46_000
+DEFAULT_PAGE_BYTES = 46_000  # caller-overridable; see context_page_bytes
 
 #: Presentation bound for the no-token change log read.  This is not a project
 #: threshold: it only stops the raw log from crowding the context, and the

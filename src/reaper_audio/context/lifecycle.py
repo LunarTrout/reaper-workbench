@@ -94,7 +94,7 @@ MAX_PAGE_BYTES = 262_144
 # There is no page-count limit: a larger project simply yields more pages, as
 # long as every single page stays inside the client's response cap.
 VIEW_PAGE_TARGET_BYTES = 30_000
-VIEW_PAGE_MAX_BYTES = 46_000
+VIEW_PAGE_MAX_BYTES = int(os.environ.get("REAPER_VIEW_PAGE_BYTES", "46000"))
 # Delta delivery uses the same page machinery.  An inline delta is capped well
 # below the host result limit; a larger delta is delivered as a complete page
 # set and advances only after every page hash (or the manifest hash) is acked.
@@ -105,7 +105,7 @@ DELTA_PAGE_MAX_BYTES = 40_000
 # There is no result-specific query_too_large: a large exact selection or audio
 # delta is delivered in full pages and acknowledged by reconstruction.
 RESULT_PAGE_TARGET_BYTES = 28_000
-RESULT_PAGE_MAX_BYTES = 46_000
+RESULT_PAGE_MAX_BYTES = int(os.environ.get("REAPER_RESULT_PAGE_BYTES", "46000"))
 # Page sizing uses the UTF-8 byte count of this deterministic indented JSON
 # rendering. It is the payload the server serves, not the complete MCP transport
 # envelope; clients and hosts may add framing. The reported size and the enforced

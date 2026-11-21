@@ -51,11 +51,11 @@ PANORAMA_LEGACY_SCHEMA_VERSIONS = frozenset({"reaper-workbench.capture-panorama/
 PANORAMA_FILE_NAME = "panorama.json"
 # One-shot model context budget.  The canonical record remains complete on
 # disk; this is the bounded derived projection returned to the model.
-DEFAULT_MAX_TOKENS = 256_000
+DEFAULT_MAX_TOKENS = int(os.environ.get("REAPER_CAPTURE_MAX_TOKENS", "256000"))
 # Deliberately conservative: a real BPE measured ~3.07 bytes/token on compact
 # panorama JSON; 2.2 bytes/token is kept as a safety margin.
 TOKEN_BYTES_ESTIMATE = 2.2
-DEFAULT_MAX_BYTES = 700_000
+DEFAULT_MAX_BYTES = int(os.environ.get("REAPER_CAPTURE_MAX_BYTES", "700000"))
 MIDI_NOTE_LIMIT = 10000
 FILE_DURATION_TOLERANCE_S = 0.001
 # Display budget for the inline song map.  It is a presentation bound, not a
