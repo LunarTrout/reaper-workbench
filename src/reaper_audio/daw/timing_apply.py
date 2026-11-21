@@ -58,6 +58,7 @@ COVERAGE_ATOL = 1e-6
 MAX_SEAM_OVERLAP_S = 0.060
 
 BlockInput = Mapping[str, Any]
+APPLIED: dict[str, dict[str, Any]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -867,7 +868,7 @@ def apply_timing_plan(
         source_removed=source_removed, source_path=item["source_path"],
         before_item_guids=base["before_item_guids"])
     matched = bool(readback["matched"])
-    return {
+    result = {
         "ok": True,
         **base,
         "status": "applied" if matched else "applied_readback_mismatch",
@@ -886,11 +887,14 @@ def apply_timing_plan(
             "restores": "the original item and removes every clip this plan created",
         },
     }
+    if matched and result["plan_id"]:
+        APPLIED[str(result["plan_id"])] = result
+    return result
 
 
 def undo_timing_apply(
     session: Any,
-    applied: Mapping[str, Any],
+    applied: Mapping[str, Any] | str,
     *,
     reason: str | None = None,
     project_id: str | None = None,
@@ -899,8 +903,17 @@ def undo_timing_apply(
 
     The bridge undo is revision-bound and plan-bound; this wrapper then reads
     the project back and proves that the original item is byte-for-byte the
-    same geometry and that none of the plan's clips remain.
+    same geometry and that none of the plan's clips remain.  A plan id is
+    resolved from the in-process apply cache when the caller cannot pass the
+    full apply result.
     """
+    if isinstance(applied, str):
+        cached = APPLIED.get(applied)
+        if cached is None:
+            raise ValidationError("Unknown applied timing plan_id",
+                                  details={"code": "timing_undo_unavailable",
+                                           "plan_id": applied})
+        applied = cached
     if not isinstance(applied, Mapping):
         raise ValidationError("undo_timing_apply needs the result of an apply")
     if applied.get("applied") is not True or not applied.get("plan_id"):
@@ -985,6 +998,7 @@ __all__ = [
     "GEOMETRY_ATOL",
     "MAX_BLOCKS",
     "MAX_SEAM_OVERLAP_S",
+    "APPLIED",
     "OPERATION_KIND",
     "SCHEMA",
     "TimingClip",

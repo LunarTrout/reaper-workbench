@@ -65,7 +65,7 @@ def analyze_timing(session: Any, *, project_id: str | None,
     snapshot = session.snapshot(project_id=project_id, include_items=True)
     track, item = _find_item(snapshot, item_guid, track_guid)
     take = item.get("active_take") or {}
-    source_path = take.get("source_path") or item.get("source_path")
+    source_path = take.get("source_path") or take.get("source") or item.get("source_path")
     if not source_path:
         raise ValidationError("The selected item has no file-backed active take",
                               details={"item_guid": item.get("guid")})

@@ -53,6 +53,7 @@ from .daw.midi import MidiService
 from .daw.edit import run_edit, send_list, undo_receipt
 from .daw.receipt import FileReceiptStore
 from .daw.timing_service import analyze_timing, inspect_timing, plan_timing
+from .daw.timing_apply import apply_timing_plan, undo_timing_apply
 from .daw.reference import cached_reference_report
 from .daw.session_control import app_action as _app_action
 from .daw.session_status import merge_digest_routing
@@ -150,6 +151,7 @@ _MAX_AUDIO_BYTES = 512 * 1024 * 1024
 _TRANSACTION_OPERATIONS = (
     "track.set", "track.create", "track.delete", "track.reorder",
     "item.set", "item.create", "item.delete", "item.split", "item.duplicate",
+    "item.timing_apply",
     "take.set", "midi.create", "fx.set_enabled", "fx.set_parameter",
     "fx.insert", "fx.delete", "fx.set_preset", "fx.move", "fx.offline",
     "send.set", "send.create", "send.delete", "marker.create",
@@ -2220,7 +2222,7 @@ def reaper_media(action: str,
 
 @server.tool()
 @_guard
-def reaper_timing(action: Literal["analyze", "plan", "inspect"],
+def reaper_timing(action: Literal["analyze", "plan", "inspect", "apply", "undo"],
                   project_id: str | None = None,
                   track_guid: str | None = None,
                   item_guid: str | None = None,
@@ -2237,13 +2239,18 @@ def reaper_timing(action: Literal["analyze", "plan", "inspect"],
                   group_gap_s: float = 0.25,
                   group_shift_s: float = 0.012,
                   protected_ranges: list[dict[str, Any]] | None = None,
-                  reference_events: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                  reference_events: list[dict[str, Any]] | None = None,
+                  expected_revision: dict[str, Any] | None = None,
+                  dry_run: bool = False,
+                  reason: str | None = None) -> dict[str, Any]:
     """Analyze audio timing against the project grid and build a 1x clip plan.
 
     analyze resolves one file-backed audio item, detects attacks and returns an
     ``analysis_id``; plan matches them monotonically to the tempo grid and
     returns a ``plan_id`` with source/project geometry; inspect returns a stored
-    analysis or plan.  Apply the returned geometry through ``reaper_edit``.
+    analysis or plan.  apply replaces the source item with the plan's clips in
+    one revision-bound transaction; undo removes those clips and restores the
+    original item through the same transaction receipt.
     """
     if action == "analyze":
         session = _session(project_id)
@@ -2269,7 +2276,30 @@ def reaper_timing(action: Literal["analyze", "plan", "inspect"],
     if action == "inspect":
         return {"ok": True, "action": action,
                 **inspect_timing(analysis_id=analysis_id, plan_id=plan_id)}
-    raise ValidationError("action must be analyze, plan or inspect")
+    if action == "apply":
+        _handbook_required()
+        if not isinstance(plan_id, str) or not plan_id:
+            raise ValidationError("plan_id is required for apply")
+        if not isinstance(expected_revision, dict) or not expected_revision:
+            raise ValidationError("expected_revision is required for apply")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValidationError("reason is required for apply")
+        session = _session(project_id)
+        return {"ok": True, "action": action, **apply_timing_plan(
+            session, plan_id, project_id=project_id,
+            protected_ranges=protected_ranges or (),
+            expected_revision=expected_revision, reason=reason,
+            dry_run=dry_run)}
+    if action == "undo":
+        _handbook_required()
+        if not isinstance(plan_id, str) or not plan_id:
+            raise ValidationError("plan_id is required for undo")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValidationError("reason is required for undo")
+        session = _session(project_id)
+        return {"ok": True, "action": action, **undo_timing_apply(
+            session, plan_id, project_id=project_id, reason=reason)}
+    raise ValidationError("action must be analyze, plan, inspect, apply or undo")
 
 
 @server.tool()

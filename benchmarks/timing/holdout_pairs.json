@@ -1,0 +1,92 @@
+[
+  {
+    "id": "ollie_wright_guitars",
+    "instrument": "guitar_bass",
+    "before": "guitarsuntimed.wav",
+    "after": "guitarstimed.wav",
+    "source": "https://www.soundonsound.com/techniques/mix-rescue-ollie-wright-audio",
+    "truth": "measured_local_shift",
+    "note": "rhythm guitars and bass in context; before/after human timing edits"
+  },
+  {
+    "id": "ollie_wright_vocal",
+    "instrument": "vocal",
+    "before": "lvunedited.wav",
+    "after": "lvedited.wav",
+    "source": "https://www.soundonsound.com/techniques/mix-rescue-ollie-wright-audio",
+    "truth": "measured_local_shift",
+    "note": "lead vocal; human pitch and timing edits"
+  },
+  {
+    "id": "session_guitar",
+    "instrument": "guitar",
+    "before": "session/Session Notes 0519 - Overdubs vs Band In The Room/WAVs/Editing03_GtrTimingEditOut.wav",
+    "after": "session/Session Notes 0519 - Overdubs vs Band In The Room/WAVs/Editing04_GtrTimingEditIn.wav",
+    "source": "https://www.soundonsound.com/techniques/session-notes-editing-full-band-recordings-audio-examples",
+    "truth": "measured_local_shift",
+    "note": "isolated guitar timing edit, same take"
+  },
+  {
+    "id": "we_fell_drums",
+    "instrument": "drums",
+    "before": "wefell/WAVs/DrumsUntimed.wav",
+    "after": "wefell/WAVs/DrumsTimed.wav",
+    "source": "https://www.soundonsound.com/techniques/mix-rescue-we-fell-sky-media",
+    "truth": "measured_local_shift",
+    "note": "500+ human edits; audio must be fetched from the SOS media ZIP"
+  },
+  {
+    "id": "april_blues_vocal",
+    "instrument": "vocal",
+    "before": "pvmt_01_Raw.wav",
+    "after": "pvmt_03_FixesOut.wav",
+    "source": "https://www.soundonsound.com/techniques/mixing-pop-vocals-audio-examples",
+    "truth": "measured_local_shift",
+    "note": "same lead vocal before/after pitch and timing tweaks"
+  },
+  {
+    "id": "cambridge_guitar_bass",
+    "instrument": "guitar_bass",
+    "before": "Ex06.01.wav",
+    "after": "Ex06.02.wav",
+    "source": "https://cambridge-mt.com/ms/ch6/",
+    "truth": "perceptual_ab",
+    "note": "backing without/with extensive bass and guitar timing edits"
+  },
+  {
+    "id": "rearranging_guitar",
+    "instrument": "guitar",
+    "before": "mr_15.wav",
+    "after": "mr_16.wav",
+    "source": "https://www.soundonsound.com/techniques/mix-rescue-rearranging-audio-examples",
+    "truth": "perceptual_ab",
+    "note": "time-stretch attempt vs audio-edit correction on the same acoustic guitar"
+  },
+  {
+    "id": "tom_mckenzie_full",
+    "instrument": "mixed",
+    "before": "tom/Timing02_Unedited.wav",
+    "after": "tom/Timing01_Edited.wav",
+    "source": "https://www.soundonsound.com/techniques/mix-rescue-tom-mckenzie-media",
+    "truth": "perceptual_ab",
+    "note": "same section; raw multitrack and Reaper remix project available at Cambridge-MT"
+  },
+  {
+    "id": "lockdown_full",
+    "instrument": "mixed",
+    "before": "lockdown/Lockdown Mixdown/Wish You Well original timing.wav",
+    "after": "lockdown/Lockdown Mixdown/Wish You Well corrected timing.wav",
+    "source": "https://www.soundonsound.com/techniques/lockdown-mixdown-audio-examples",
+    "truth": "perceptual_ab",
+    "note": "identical mixes except supplied vs corrected timing"
+  },
+  {
+    "id": "wolfs_head_full",
+    "instrument": "mixed",
+    "before": "corrections out.wav",
+    "after": "CorrectionsIn.wav",
+    "source": "https://www.soundonsound.com/techniques/mix-rescue-wolfs-head-vixen-morris-band-media",
+    "truth": "perceptual_ab",
+    "note": "drums quantised with relative second-beat shift; other instruments edited differently"
+  }
+]

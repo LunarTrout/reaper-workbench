@@ -520,7 +520,7 @@ def test_resident_lua_declares_the_async_capture_contract() -> None:
     """Static guard: the additive job operations and their yield survive edits."""
     from reaper_audio.reaper.bridge_lifecycle import bridge_script_path
     text = bridge_script_path().read_text(encoding="utf-8", errors="replace")
-    assert '"b26-2026-11-21"' in text
+    assert '"b27-2026-11-21"' in text
     # The per-source track render must keep the production parallel-via-master
     # mode; the non-parallel 128 mode is not the archived production audio.
     assert "capture_job_track_render_settings = 128 + (8 << 16)" in text

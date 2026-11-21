@@ -1,7 +1,8 @@
 # Timing analysis and grid planning
 
 `reaper_timing` measures a file-backed audio take against the project grid and
-returns a 1x clip plan. It is an analysis tool: it does not edit the project.
+returns a 1x clip plan. `apply` replaces the source item with those clips in one
+revision-bound transaction; the analysis actions themselves do not edit.
 
 ## Actions
 
@@ -47,6 +48,28 @@ reaper_timing(action="inspect", analysis_id=... | plan_id=...)
 Returns the stored analysis or plan. `plan` already carries project positions
 for every block (`project_target_start_s`, `project_target_end_s`).
 
+```text
+reaper_timing(action="apply", project_id=..., plan_id=..., reason=...,
+              expected_revision=..., dry_run=False)
+reaper_timing(action="undo", project_id=..., plan_id=..., reason=...)
+```
+
+`apply` checks the item is a file-backed 1x take without stretch markers, the
+plan covers the item's source window, every clip stays inside the source file
+and no protected range is cut or moved. It then sends exactly one
+`item.timing_apply` operation, reads every created clip back (position, source
+offset, length, playrate, fades, duplicates, leftovers) and returns the
+post-apply revision plus the undo contract. `undo` uses that revision-bound
+receipt and verifies the original item geometry is restored. The bridge build
+is `b27`; the transaction is atomic and does not create a second edit engine.
+
+## Evaluation
+
+`benchmarks/timing/` holds the protocol, real audio-pair manifest, exact-truth
+synthetic generator, baselines and reports. The real-pair report labels
+cross-correlation estimates as measured shifts, never as human ground truth;
+real audio is downloaded locally and is not committed.
+
 ## Coordinates and units
 
 - `source_s` — seconds in the take's WAV, independent of the item position.
@@ -57,8 +80,11 @@ for every block (`project_target_start_s`, `project_target_end_s`).
 
 ## Current limits
 
-The plan is the reviewed artifact. Applying it through `reaper_edit` and the
-native A/B preview are separate steps and are not claimed by this page yet.
+The plan is the reviewed artifact. `apply` is implemented and unit-tested
+against a fake bridge, but native A/B on a live REAPER project has not yet been
+run in this repository. A 1x edit cannot preserve a take FX chain or take
+envelopes; the operation reports that limitation instead of copying them.
 The detector is signal-driven; the `profile` selects event naming, not a
 musical genre or a fixed threshold. Protected ranges and anchors are caller
-inputs.
+inputs. The real holdout currently has six downloaded pairs; the remaining
+manifest entries need their local audio before they can be scored.

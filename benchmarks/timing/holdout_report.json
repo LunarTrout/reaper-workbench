@@ -1,0 +1,203 @@
+{
+  "schema": "reaper-workbench.timing-holdout-report/1",
+  "note": "Local measurements only. The audio is not redistributed; measured_local_shift is a cross-correlation estimate, not human truth.",
+  "root_label": "TIMING_HOLDOUT_DIR",
+  "pairs": [
+    {
+      "id": "ollie_wright_guitars",
+      "instrument": "guitar_bass",
+      "truth": "measured_local_shift",
+      "source": "https://www.soundonsound.com/techniques/mix-rescue-ollie-wright-audio",
+      "status": "ok",
+      "files": {
+        "before": "guitarsuntimed.wav",
+        "after": "guitarstimed.wav"
+      },
+      "duration_before_s": 41.8077,
+      "duration_after_s": 41.8077,
+      "detected_events": 144,
+      "matched_events": 133,
+      "match_rate": 0.9236,
+      "shift_mean_s": 0.005,
+      "shift_median_s": 0.0,
+      "shift_mae_s": 0.01617,
+      "shift_p90_s": 0.04063,
+      "shift_min_s": -0.05515,
+      "shift_max_s": 0.05515,
+      "mean_correlation": 0.6037,
+      "note": "rhythm guitars and bass in context; before/after human timing edits"
+    },
+    {
+      "id": "ollie_wright_vocal",
+      "instrument": "vocal",
+      "truth": "measured_local_shift",
+      "source": "https://www.soundonsound.com/techniques/mix-rescue-ollie-wright-audio",
+      "status": "ok",
+      "files": {
+        "before": "lvunedited.wav",
+        "after": "lvedited.wav"
+      },
+      "duration_before_s": 14.7412,
+      "duration_after_s": 14.7412,
+      "detected_events": 20,
+      "matched_events": 19,
+      "match_rate": 0.95,
+      "shift_mean_s": 0.02322,
+      "shift_median_s": 0.03773,
+      "shift_mae_s": 0.03727,
+      "shift_p90_s": 0.05515,
+      "shift_min_s": -0.04354,
+      "shift_max_s": 0.05805,
+      "mean_correlation": 0.7176,
+      "note": "lead vocal; human pitch and timing edits"
+    },
+    {
+      "id": "session_guitar",
+      "instrument": "guitar",
+      "truth": "measured_local_shift",
+      "source": "https://www.soundonsound.com/techniques/session-notes-editing-full-band-recordings-audio-examples",
+      "status": "ok",
+      "files": {
+        "before": "session/Session Notes 0519 - Overdubs vs Band In The Room/WAVs/Editing03_GtrTimingEditOut.wav",
+        "after": "session/Session Notes 0519 - Overdubs vs Band In The Room/WAVs/Editing04_GtrTimingEditIn.wav"
+      },
+      "duration_before_s": 3.676,
+      "duration_after_s": 3.676,
+      "detected_events": 13,
+      "matched_events": 13,
+      "match_rate": 1.0,
+      "shift_mean_s": 0.0,
+      "shift_median_s": 0.0,
+      "shift_mae_s": 0.0,
+      "shift_p90_s": 0.0,
+      "shift_min_s": 0.0,
+      "shift_max_s": 0.0,
+      "mean_correlation": 0.9577,
+      "note": "isolated guitar timing edit, same take"
+    },
+    {
+      "id": "we_fell_drums",
+      "instrument": "drums",
+      "truth": "measured_local_shift",
+      "source": "https://www.soundonsound.com/techniques/mix-rescue-we-fell-sky-media",
+      "status": "ok",
+      "files": {
+        "before": "wefell/WAVs/DrumsUntimed.wav",
+        "after": "wefell/WAVs/DrumsTimed.wav"
+      },
+      "duration_before_s": 63.1245,
+      "duration_after_s": 63.1245,
+      "detected_events": 166,
+      "matched_events": 152,
+      "match_rate": 0.9157,
+      "shift_mean_s": -0.00665,
+      "shift_median_s": -0.0029,
+      "shift_mae_s": 0.02513,
+      "shift_p90_s": 0.05224,
+      "shift_min_s": -0.05805,
+      "shift_max_s": 0.05805,
+      "mean_correlation": 0.5882,
+      "note": "500+ human edits; audio must be fetched from the SOS media ZIP"
+    },
+    {
+      "id": "april_blues_vocal",
+      "instrument": "vocal",
+      "truth": "measured_local_shift",
+      "source": "https://www.soundonsound.com/techniques/mixing-pop-vocals-audio-examples",
+      "status": "missing_audio",
+      "files": {
+        "before": "pvmt_01_Raw.wav",
+        "after": "pvmt_03_FixesOut.wav"
+      },
+      "next": "download the named files from the source page"
+    },
+    {
+      "id": "cambridge_guitar_bass",
+      "instrument": "guitar_bass",
+      "truth": "perceptual_ab",
+      "source": "https://cambridge-mt.com/ms/ch6/",
+      "status": "missing_audio",
+      "files": {
+        "before": "Ex06.01.wav",
+        "after": "Ex06.02.wav"
+      },
+      "next": "download the named files from the source page"
+    },
+    {
+      "id": "rearranging_guitar",
+      "instrument": "guitar",
+      "truth": "perceptual_ab",
+      "source": "https://www.soundonsound.com/techniques/mix-rescue-rearranging-audio-examples",
+      "status": "missing_audio",
+      "files": {
+        "before": "mr_15.wav",
+        "after": "mr_16.wav"
+      },
+      "next": "download the named files from the source page"
+    },
+    {
+      "id": "tom_mckenzie_full",
+      "instrument": "mixed",
+      "truth": "perceptual_ab",
+      "source": "https://www.soundonsound.com/techniques/mix-rescue-tom-mckenzie-media",
+      "status": "ok",
+      "files": {
+        "before": "tom/Timing02_Unedited.wav",
+        "after": "tom/Timing01_Edited.wav"
+      },
+      "duration_before_s": 27.8725,
+      "duration_after_s": 27.8725,
+      "detected_events": 125,
+      "matched_events": 123,
+      "match_rate": 0.984,
+      "shift_mean_s": 0.00984,
+      "shift_median_s": 0.01161,
+      "shift_mae_s": 0.01782,
+      "shift_p90_s": 0.03715,
+      "shift_min_s": -0.05515,
+      "shift_max_s": 0.05224,
+      "mean_correlation": 0.7582,
+      "note": "same section; raw multitrack and Reaper remix project available at Cambridge-MT",
+      "next": "perceptual A/B only; do not report an edit MAE"
+    },
+    {
+      "id": "lockdown_full",
+      "instrument": "mixed",
+      "truth": "perceptual_ab",
+      "source": "https://www.soundonsound.com/techniques/lockdown-mixdown-audio-examples",
+      "status": "ok",
+      "files": {
+        "before": "lockdown/Lockdown Mixdown/Wish You Well original timing.wav",
+        "after": "lockdown/Lockdown Mixdown/Wish You Well corrected timing.wav"
+      },
+      "duration_before_s": 235.9797,
+      "duration_after_s": 235.9797,
+      "detected_events": 1062,
+      "matched_events": 1028,
+      "match_rate": 0.968,
+      "shift_mean_s": 0.0084,
+      "shift_median_s": 0.0,
+      "shift_mae_s": 0.01579,
+      "shift_p90_s": 0.04644,
+      "shift_min_s": -0.05805,
+      "shift_max_s": 0.05805,
+      "mean_correlation": 0.7924,
+      "note": "identical mixes except supplied vs corrected timing",
+      "next": "perceptual A/B only; do not report an edit MAE"
+    },
+    {
+      "id": "wolfs_head_full",
+      "instrument": "mixed",
+      "truth": "perceptual_ab",
+      "source": "https://www.soundonsound.com/techniques/mix-rescue-wolfs-head-vixen-morris-band-media",
+      "status": "missing_audio",
+      "files": {
+        "before": "corrections out.wav",
+        "after": "CorrectionsIn.wav"
+      },
+      "next": "download the named files from the source page"
+    }
+  ],
+  "available": 6,
+  "planned": 10
+}
