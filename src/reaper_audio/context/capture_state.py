@@ -653,6 +653,39 @@ def _route_is_master(source_id: str, master_fingerprint: Mapping[str, Any] | Non
     return bool(guid) and source_id == guid
 
 
+
+
+def _compact_map(tracks, master, routing) -> dict:
+    """Structure-only map: no item rows, no parameter values."""
+    def track(row):
+        items = row.get("items") if isinstance(row.get("items"), list) else []
+        return {
+            "guid": row.get("guid"),
+            "name": row.get("name"),
+            "fx_names": [str(fx.get("name")) for fx in (row.get("fx") or [])
+                         if isinstance(fx, Mapping)],
+            "send_count": len(row.get("sends") or []) if isinstance(
+                row.get("sends"), list) else row.get("send_count"),
+            "item_summary": {"count": len(items)} if items else {
+                "count": row.get("item_count") or 0},
+            "volume_db": row.get("volume_db"),
+            "pan": row.get("pan"),
+            "folder_depth": row.get("folder_depth"),
+        }
+    master_row = None
+    if isinstance(master, Mapping):
+        master_row = {
+            "guid": master.get("guid"),
+            "name": master.get("name") or "master",
+            "fx_names": [str(fx.get("name")) for fx in (master.get("fx") or [])
+                         if isinstance(fx, Mapping)],
+        }
+    return {
+        "tracks": [track(row) for row in tracks],
+        "master": master_row,
+        "routes": list(routing or []),
+    }
+
 def fill_state_from_capture(
     state: ProjectState,
     session: Any,
@@ -687,6 +720,7 @@ def fill_state_from_capture(
             details={"capture": project_id, "state": state.project_id})
 
     tracks, master, routing = _read_session_rows(session)
+    state.upsert_map(_compact_map(tracks, master, routing))
     stored_shape = _stored_shape(state)
 
     track_fingerprints = {

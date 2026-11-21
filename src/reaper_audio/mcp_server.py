@@ -45,6 +45,7 @@ from .context.state_query import (query_facts, changes_since as state_changes_si
                                   availability as state_availability, public_stage)
 from .context.project_context import (build_project_context, estimated_tokens,
                                        project_context_pages)
+from .context.journal import JournalStore, make_entry
 from .daw.midi import MidiService
 from .daw.edit import run_edit, send_list, undo_receipt
 from .daw.receipt import FileReceiptStore
@@ -1621,10 +1622,12 @@ def reaper_session(action: str = "health",
             state = read_state(archive_root, selected)
             if state is None:
                 raise ValidationError("no project state exists yet; run a capture or measure")
-            snapshot = session.snapshot(include_items=False)
-            map_document = {"tracks": snapshot.get("tracks") or [],
-                            "master": snapshot.get("master") or {},
-                            "routes": (snapshot.get("sends") or {}).get("rows") or []}
+            map_document = state.get("map")
+            if not isinstance(map_document, Mapping):
+                snapshot = session.snapshot(include_items=False)
+                map_document = {"tracks": snapshot.get("tracks") or [],
+                                "master": snapshot.get("master") or {},
+                                "routes": (snapshot.get("sends") or {}).get("rows") or []}
             context = build_project_context(
                 state, map_document=map_document, fx_summary=[],
                 since_token=context_since, detail=context_detail,
@@ -3805,7 +3808,8 @@ def reaper_edit(mode: str,
                 owner_guid: str | None = None,
                 envelope: str | None = None,
                 interval: list[float] | None = None,
-                scaling: str = "amplitude") -> dict[str, Any]:
+                scaling: str = "amplitude",
+                journal: dict[str, Any] | None = None) -> dict[str, Any]:
     """Preview, apply, or undo one revision-bound batch of project edits.
 
     preview: supply operations and reason; nothing changes. apply: use the
@@ -3829,6 +3833,19 @@ def reaper_edit(mode: str,
         return {"ok": True, "mode": "envelope_points",
                 **envelope_points(session, owner_guid or "", envelope or "",
                                   interval=interval, scaling=scaling)}
+    if plan_id and not reason:
+        entry = _edit_plans.get(plan_id) if isinstance(_edit_plans, dict) else None
+        cached_plan = entry.get("plan") if isinstance(entry, dict) else entry
+        if cached_plan is not None:
+            reason = (getattr(cached_plan, "reason", None)
+                      or (cached_plan.get("reason") if isinstance(cached_plan, dict) else None)
+                      or reason)
+    if mode in {"apply", "undo"}:
+        why = (journal or {}).get("why") if isinstance(journal, dict) else None
+        if not (isinstance(why, str) and why.strip()) and not (reason and reason.strip()):
+            raise ValidationError("apply and undo require a non-empty journal.why "
+                                  "(or a reason) explaining the change",
+                                  details={"code": "journal_required"})
     if mode == "undo" and receipt:
         session = _session(project_id, bridge_session_id)
         return {"ok": True, **undo_receipt(
@@ -3853,10 +3870,13 @@ def reaper_edit(mode: str,
                     "decision_gate": gate, "project_id": project_id,
                     "revision": expected.to_dict()}
     if mode == "apply" and plan_id is None and isinstance(operations, list) and operations:
-        return {"ok": True, "mode": "apply", **run_edit(
+        applied = {"ok": True, "mode": "apply", **run_edit(
             session, operations, reason=reason or "edit", verify=verify,
             measure=_edit_measure(session),
             receipt_store=_receipt_store(archive_root), max_rebase=2)}
+        _append_journal(archive_root, project_id, applied, operations,
+                        journal=journal, why=reason, kind="apply")
+        return applied
     access: dict[str, Any] | None = None
     if mode != "preview":
         access = _require_structural_access(session=session, project_id=project_id,

@@ -45,6 +45,7 @@ Schema (``reaper-workbench.project-state/1``, frozen)
       "schema": "reaper-workbench.project-state/1",
       "project_id": "reaper:{GUID}:/songs/song.rpp",
       "token": 17,
+      "map": null,
       "objects": {
         "tracks": {
           "<track guid>": {"guid": "...", "fingerprint": {...}}
@@ -948,6 +949,23 @@ class ProjectState:
 
     def save(self) -> Path:
         return self._store.save(self._state)
+
+    def upsert_map(self, mapping: Mapping[str, Any]) -> dict[str, Any]:
+        """Store the compact project map that agent context is built from.
+
+        The map is structure, not evidence: tracks/master/routes/tempo/markers
+        with item and FX summaries, never exact item/take rows or parameter
+        values.  Replacing it bumps the state token so context deltas notice.
+        """
+        if not isinstance(mapping, Mapping):
+            raise ValidationError("project map must be a mapping")
+        if self._state.get("map") == dict(mapping):
+            return {"token": int(self._state["token"]), "changed": False,
+                    "sections": list(mapping)}
+        self._state["map"] = dict(mapping)
+        token = self._begin_change()
+        self._append_change({"seq": token, "kind": "map", "fields": list(mapping)})
+        return {"token": token, "sections": list(mapping)}
 
     # -- token/change plumbing --------------------------------------------- #
 
