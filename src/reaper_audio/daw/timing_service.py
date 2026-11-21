@@ -14,6 +14,7 @@ from uuid import uuid4
 from ..analysis.audio import load_audio
 from ..analysis.timing import (build_timing_plan, detect_timing_events,
                                grid_times, match_events)
+from ..analysis.timing_context import plan_phrase
 from ..daw.midi import TempoMap
 from ..errors import ValidationError
 
@@ -168,7 +169,35 @@ def plan_timing(analysis_id: str, *, tempo_context: Mapping[str, Any],
             position + block["target_start_s"] - offset, 7)
         block["project_target_end_s"] = round(
             position + block["target_end_s"] - offset, 7)
+    # Keep the losing options visible for phrase-level decisions.
+    alternatives = []
+    for index, block in enumerate(plan["blocks"], start=1):
+        ids = set(block["event_ids"])
+        rows = [event for event in events if str(event.get("id")) in ids]
+        targets = {}
+        for row in matched["assignments"]:
+            event = events[int(row["event_index"])]
+            if event.get("id") in ids:
+                targets[str(event["id"])] = float(row["target_s"])
+        if not rows:
+            continue
+        phrase_events = [{
+            "id": row["id"], "phrase": f"block_{index}",
+            "start_s": float(row["source_s"]),
+            "end_s": min(float(analysis["duration_s"]),
+                         float(row["source_s"]) + 0.25),
+            "boundary_end_s": block["end_s"],
+        } for row in rows]
+        options = plan_phrase(phrase_events, targets,
+                              phrase_key="phrase", strength=strength,
+                              preserve_duration=True,
+                              protected_ranges=protected_ranges)
+        alternatives.append({"block": index, "options": options})
+        for issue in options.get("issues", []):
+            if issue.get("code") == "duration_preserved_by_smaller_shift":
+                block["duration_preserved_by_smaller_shift"] = True
     plan.update({
+        "alternatives": alternatives,
         "plan_id": f"tpl_{uuid4().hex[:16]}",
         "tempo_map_source": getattr(tempo, "source", "project"),
         "subdivision": division,
