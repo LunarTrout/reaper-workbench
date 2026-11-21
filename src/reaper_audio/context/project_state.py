@@ -1009,14 +1009,27 @@ class ProjectState:
                     table[digest] = value
                     prints[role] = {"$ref": digest}
         removed = 0
-        for fact in self._state.get("facts", {}).values():
+        facts = self._state.get("facts", {})
+        for fact_id, fact in list(facts.items()):
             if fact.get("status") != STATUS_SUPERSEDED:
                 continue
-            if fact.get("metrics"):
-                fact["metrics"] = {}
-                removed += 1
-            fact["fingerprints"] = {}
-            fact["compacted"] = True
+            # History keeps identity and lineage, not the measured payload:
+            # key+values+revision were the bulk and are not quotable evidence.
+            facts[fact_id] = {
+                "id": fact.get("id") or fact_id,
+                "status": STATUS_SUPERSEDED,
+                "source_id": fact.get("source_id"),
+                "stage": fact.get("stage"),
+                "window": fact.get("window"),
+                "metrics": {},
+                "fingerprints": {},
+                "key_sha256": fact.get("key_sha256"),
+                "measured_at": fact.get("measured_at"),
+                "superseded_by": fact.get("superseded_by"),
+                "supersedes": fact.get("supersedes"),
+                "compacted": True,
+            }
+            removed += 1
         return {"compacted": removed}
 
     def save(self) -> Path:
