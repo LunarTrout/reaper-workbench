@@ -19,26 +19,28 @@ The library is a **measuring and editing instrument**, not an advisor: it report
 reaper_session(action="health")                    # bridge session + active project
 reaper_session(action="context", archive_root=...) # ONE project context: map, health, facts, fx, changes
 reaper_session(action="status", detail="summary")  # revision, tracks, routing, tempo
-reaper_capabilities(mode="tools")                  # the ten task groups
+reaper_capabilities(mode="tools")                  # the eleven task groups
 reaper_project(project_id=...)                     # context beyond status
 reaper_structural_token(project_id=...)            # before any mutation
 ```
 
 - `status(detail="summary|full", sections=[...])`: sections `runtime`…`evidence` (13 names); `gaps[]` names what the digest could not supply.
-- `context(archive_root, detail="summary|full", max_facts=50, since=token, pages=false)`: the single agent-facing project context built from `state.json` — project/revision, compact map, health, facts summary, fx summary, changes, audio references and detail pointers. Prefer it over separate status/panorama reads. `since=state_token` returns only project/health/changes/next plus the live revision (a few hundred tokens), never the map again; `pages=true` returns pages and no full context. Summary fact rows list sources/windows/metric sets without values; values come from `state.query`.
+- `context(archive_root, detail="summary|full", max_facts=50, since=token, pages=false)`: the single agent-facing project context built from `state.json` — project/revision, compact map, health, facts summary, fx summary, changes, audio references and detail pointers. Prefer it over separate status reads. `since=state_token` returns only project/health/changes/next plus the live revision (a few hundred tokens), never the map again; `pages=true` returns pages and no full context. Summary fact rows list sources/windows/metric sets without values; values come from `state.query`.
 - `state(archive_root, source=..., stage=..., window=..., metrics=..., status=..., since=token)`: read facts already measured, without rendering. `state_detail="full"` returns complete rows; the default is compact and includes values only for requested metrics.
 - `preflight(allow_solo=[...], check_focus=false)` returns `blockers`, `warnings`, `info` with codes; no verdict. `runtime.stale` → `reaper_session(action="app", app_command="restart")` before editing.
 - Every answer repeats `mode` (`strict` / `advisory` / `off`).
 
 ## 3. Task groups
 
-Eleven groups (`session`, `project`, `capture`, `panorama`, `analysis`, `measure`, `inspect`, `edit`, `discovery`, `research`, `media`); `reaper_capabilities(mode="tools")` lists each group's tools and required context.
+Eleven groups: `session`, `measure`, `edit`, `midi`, `calibrate`, `analyze`, `action`, `api`, `flamingo`, `spatial`, `media`. `reaper_capabilities(mode="tools")` lists each group's tools and required context.
 
-**session** — `reaper_session` (`action`: `health`, `list_instances`, `list_projects`, `dirty`, `status`, `preflight`, `transport`, `project`, `settings`, `app`, `wait_for_change`), `reaper_checkpoint_save`, `reaper_bridge_reload`, `reaper_bridge`, `reaper_mode`, `reaper_structural_token`.
+**session** — `reaper_session` (`action`: `health`, `status`, `context`, `state`, `preflight`, `transport`, `project`, `settings`, `app`, `wait_for_change`, `list_instances`, `list_projects`, `dirty`), `reaper_checkpoint_save`, `reaper_bridge_reload`, `reaper_bridge`, `reaper_mode`, `reaper_structural_token`.
 
+- `context`: the one project view. `since=state_token` returns only project/health/changes/next plus the live revision; `pages=true` returns pages and no full context; `detail` and `max_facts` bound the rest.
+- `state`: facts already measured, without a render; filters by source/stage/window/metrics/status, compact rows by default.
 - `transport`: `transport_action="play|stop|pause"`, `position_s`; `app`: `app_command="ensure|restart|focus"`; `wait_for_change`: `since={"revision"|"transport": ...}`, `timeout_s`.
-- `project`: `project_command="open|save|save_as"`, `path`, `overwrite_existing` (`save_as` refuses an existing file by default); `settings`: `settings_command="read|write"`, `settings_fields`, `settings_values` (REAPER `RENDER_*`/`PROJECT_*` names, read back).
-- `reaper_checkpoint_save(...)` writes a new file only; `reaper_save(mode="save_current|save_as", project_id, expected_revision, path, overwrite_existing, structural_token)`. `reaper_mode(action="get|set")` is the user's decision; `reaper_structural_token(project_id)` is one digest read, no render.
+- `project`: `project_command="open|save|save_as"`, `path`, `overwrite_existing`; `settings`: `settings_command="read|write"`.
+- `reaper_checkpoint_save` writes a new file only; `reaper_save(mode="save_current|save_as", ...)`; `reaper_mode` is the user's decision; `reaper_structural_token(project_id)` is one digest read, no render.
 
 **measure** — `reaper_measure`, `reaper_freshness`, `reaper_coverage`:
 
@@ -63,7 +65,7 @@ reaper_edit(mode="preview", project_id=..., expected_revision=..., reason="...",
 → {"plan_id": "...", "plan": {...}, "next_call": {...}}
 ```
 
-- `apply`: with `plan_id` and the plan's base `expected_revision` → `update` + successor `context_token`; with `operations` and no `plan_id` → applies at once and returns a receipt. `undo`: `plan_id` plus the revision apply produced, or `receipt="r-..."`. Every mutation needs a current structural token (`structural_token`), or a legacy `panorama_receipt`; `advisory` reports it missing instead of blocking, `off` skips it.
+- `apply`: with `plan_id` and the plan's base `expected_revision` → `update` + successor `context_token`; with `operations` and no `plan_id` → applies at once and returns a receipt. `undo`: `plan_id` plus the revision apply produced, or `receipt="r-..."`. Every mutation needs a current structural token (`structural_token`); `advisory` reports it missing instead of blocking, `off` skips it.
 - Operations are `{kind, target_guid, values}`, up to 256 per batch: `track.set/create/delete/reorder`, `item.set/create/delete/split/duplicate`, `take.set`, `midi.create`, `fx.set_enabled/set_parameter/insert/delete/move/set_preset/offline`, `send.connect/set/delete`, `envelope.set`, `envelope.level`, `marker.create`, `region.delete`, `tempo.set`.
 - `send.connect` is idempotent; `send.set` addresses a row by `destination_guid` or `send_index`. A batch cannot repeat a connect, mix `send.delete` with other send changes on one source, or delete a track it also changes.
 - `envelope.set`: `name`, `points`, `mode`, `clear`, `guard` (`min_gain_db`, `forbid_silence`). In `mode="preview"` only, `envelope.level` builds a curve from a measured profile (`{"segments":[...],"target_db":...}`) and `fx.set_parameter` with `{"band":3,"target":"-2 dB"}` resolves through the calibration table — preview then apply.
@@ -87,9 +89,11 @@ reaper_edit(mode="preview", project_id=..., expected_revision=..., reason="...",
 
 **other groups**
 
-- `reaper_calibrate(...)` sweeps a plug-in parameter, records displayed values and restores the original; later `target` values resolve exactly.
-- `reaper_analyze` — every track plus master, or one scoped batch (`capture_id`, `analyzers`, `source_ids`, `intervals`); `detail="summary"` is the lossless projection. `reaper_render_candidate(plan_id, project_id, revision_after, start_s, end_s, max_duration_s=120)` renders an applied plan's master.
+- `reaper_calibrate` sweeps a plug-in parameter, records displayed values and restores the original; later `target` values resolve exactly.
+- `reaper_analyze` — track/master analysis plus evidence tokens; `reaper_render_candidate(plan_id, project_id, revision_after, start_s, end_s, max_duration_s=120)` renders an applied plan's master.
 - `reaper_action`, `reaper_api_search` + `reaper_api_call` — low level, no preview/undo guarantee.
+- `reaper_flamingo_*` and `reaper_spatial_*` are optional listening backends; they report model status and are not required for measurement or editing.
+- `reaper_media` is covered above; the remaining group names in `reaper_capabilities` match these tools.
 
 ## 4. Units
 
@@ -104,14 +108,14 @@ reaper_edit(mode="preview", project_id=..., expected_revision=..., reason="...",
 
 `metrics=None` returns every scalar metric; `"all"`/`"*"` adds bands; an unknown name is refused with the accepted list. Stages: `via_master`, `master`, `external_file` — never substitute one. Audio is in seconds; MIDI uses musical time through the tempo map — never assume constant tempo.
 
-## 5. Context protocol (size-independent panorama)
+## 5. Context and facts
 
-1. `reaper_capture_snapshot(project_id, expected_revision, archive_root)` — immutable capture; metadata only, no view.
-2. `reaper_panorama_open(project_id, archive_root, mode="auto")` — the whole view when it fits, otherwise page 1 plus a manifest of **every declared page**. Fetch every one with `reaper_panorama_page(handle, revision, archive_root, page_id)`.
-3. `reaper_panorama_ack(handle, revision, archive_root, page_hashes | page_manifest_sha256)` — mints `receipt` and `context_token`, or returns `incomplete`.
-4. `reaper_panorama_query(revision, archive_root, handle, objects=..., data=..., metrics=..., interval=...)` — exact rows at full resolution. The map carries one item/take inventory row per track (counts, time extrema, short names, stable item ids, take names, active-take alignment) and FX names/order/state only; exact item rows, take rows and FX parameter lists are returned by `data=["items"|"takes"|"fx"]` with `objects=[track or object id]`. `reaper_panorama_changes_since(project_id, archive_root, context_token=...)` — only newer facts; `reaper_panorama_refresh(...)` restarts after loss.
+1. `reaper_session(action="context", archive_root=...)` — project/revision, compact map, health, facts summary, FX summary, changes and audio references. This is the only project context an agent needs for orientation.
+2. `reaper_session(action="context", ..., since=<state_token>)` — delta only: project/health/changes/next. Use it after an edit instead of re-reading the map.
+3. `reaper_session(action="state", ...)` — exact measured facts, filtered; no render. Missing values mean "not measured in this window", not "absent".
+4. `pages=true` on `context` splits the object into pages; the response has pages and no duplicate full context.
 
-A receipt proves the server **served** those pages, not that you understood them. A missing or aggregated value is **not** proof that an event is absent. Check coverage, resolution, units, stage and provenance before any global claim. `reaper_capture_read` needs a receipt for that exact capture.
+A fact is current for the fingerprint that produced it. If the track chain, routing or master changed, `freshness` marks it stale; re-measure only what the decision needs. A missing value is not proof of absence.
 
 ## 6. Errors
 

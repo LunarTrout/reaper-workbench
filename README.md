@@ -4,7 +4,7 @@
 
 Use it to inspect a live REAPER project, capture its tracks and master for analysis, compare audio, and make project edits through the documented ReaScript API. The library exposes project context and low-level capabilities; it does not prescribe a mixing or composition recipe.
 
-[Русская версия](README.ru.md) · [Installation](docs/INSTALLATION.md) · [Architecture](docs/ARCHITECTURE.md) · [MCP guide for models](docs/MCP-README-LLM.md) · [Validation status](docs/VALIDATION.md)
+[Русская версия](README.ru.md) · [Installation](docs/INSTALLATION.md) · [Architecture](docs/ARCHITECTURE.md) · [MCP guide for models](docs/MCP-README-LLM.md)
 
 > **Release status: pre-1.0.** The public API and MCP surface may change before the first stable release. Validation evidence and known limits are documented below; a passing unit suite does not imply complete ReaScript coverage or production readiness.
 
@@ -48,8 +48,7 @@ and reject it if the measurement moves the wrong way or a defect gate regresses.
 These research tools are not part of the default capture path, do not prescribe
 a mix workflow, and do not produce a universal quality verdict. Their method
 and limits are documented in [policy](docs/POLICY.md) and
-[measurement methodology](docs/MIX-QUALITY-METHODOLOGY.ru.md); validation status
-is tracked separately in [validation](docs/VALIDATION.md).
+the operating contract is in the [handbook](docs/HANDBOOK.md).
 
 ### Audio analysis
 
@@ -59,7 +58,7 @@ is tracked separately in [validation](docs/VALIDATION.md).
 - Compare a project source with another file or a selected time window from a reference file.
 - Produce structured mix evidence and edit evidence from measurements without encoding a fixed order of operations.
 
-REAPER's Audio Accessor is a different signal tap: its samples are pre-FX and must not be described as processed mix stems. The current project-analysis path uses REAPER rendering. See [full-capture and analysis details](docs/FULL-CAPTURE.md) and the [validation status](docs/VALIDATION.md); never infer signal stage from a filename alone.
+REAPER's Audio Accessor is a different signal tap: its samples are pre-FX and must not be described as processed mix stems. The current project-analysis path uses REAPER rendering. See the [handbook](docs/HANDBOOK.md); never infer signal stage from a filename alone.
 
 Live-analysis WAVs are stored outside the `.RPP` in a bounded job directory, leased for the request and cleaned up on release or by the stale-job policy. When a reference comparison can reuse an existing `reaper_capture_snapshot`, pass its `capture_id`, `archive_root`, and same-capture panorama receipt to `reaper_analyze`: the server verifies and reads the archived track/master WAVs, reuses full-window measurements where exact, and does not render the project again or duplicate the WAVs. Selected subwindows are remeasured from those archived WAVs. This result describes that capture's revision only. The live render path may temporarily change render settings or track selection and restore them; callers must use the returned revision rather than assume the project's change counter is unchanged.
 
@@ -120,7 +119,7 @@ The actual report also carries project tempo at each timeline cell, FX/routing c
 
 ### LLM-facing interface
 
-The MCP server currently exposes **41 tools**, **5 resource templates** and **3 static resources**. The interface covers project-context delivery (open, page, acknowledge, exact query, status, change updates and refresh), a plan-bound candidate render (`reaper_render_candidate`), capability discovery, integrated analysis, supported edit batches, listener/spatial diagnostics, timeline context, and lower-level REAPER API functions or Actions. Work modes (`strict`/`advisory`/`off`), the stale-share threshold and the lock are set by the user and reported in every response; an edit is authorised by a cheap structural token rather than a full capture. Five helpers cover day-to-day operation: `reaper_bridge` lists, tidies up or starts resident bridges, `reaper_evidence` reads units behind an evidence token, `reaper_calibrate` records a plug-in parameter map so value targets like "25 ms" resolve exactly, `reaper_edit` in `sends`/`envelope_points` mode reads routing and automation without editing, `reaper_midi` reads per-pitch statistics, edits velocities, quantises, and generates or checks notes on the project's own tempo map, and `reaper_media` imports references or encodes audio with a post-codec true-peak check. A measurement takes track GUIDs (or `"all"`/`"master"`/files) over caller intervals and returns one `sources × intervals × metrics` table; it reopens offline media itself, returns a unique `measurement_id`, and does not invalidate a structural token. Candidate rendering uses REAPER's native master path and checks settings restoration and project state; if the check detects a mismatch, the WAV is deleted and the request fails closed. Live comparison against a normal REAPER render is still an open validation item; see [Validation status](docs/VALIDATION.md). The server does not publish one tool per ReaScript function.
+The MCP server currently exposes **41 tools**, **5 resource templates** and **3 static resources**. The interface covers project-context delivery (open, page, acknowledge, exact query, status, change updates and refresh), a plan-bound candidate render (`reaper_render_candidate`), capability discovery, integrated analysis, supported edit batches, listener/spatial diagnostics, timeline context, and lower-level REAPER API functions or Actions. Work modes (`strict`/`advisory`/`off`), the stale-share threshold and the lock are set by the user and reported in every response; an edit is authorised by a cheap structural token rather than a full capture. Five helpers cover day-to-day operation: `reaper_bridge` lists, tidies up or starts resident bridges, `reaper_evidence` reads units behind an evidence token, `reaper_calibrate` records a plug-in parameter map so value targets like "25 ms" resolve exactly, `reaper_edit` in `sends`/`envelope_points` mode reads routing and automation without editing, `reaper_midi` reads per-pitch statistics, edits velocities, quantises, and generates or checks notes on the project's own tempo map, and `reaper_media` imports references or encodes audio with a post-codec true-peak check. A measurement takes track GUIDs (or `"all"`/`"master"`/files) over caller intervals and returns one `sources × intervals × metrics` table; it reopens offline media itself, returns a unique `measurement_id`, and does not invalidate a structural token. Candidate rendering uses REAPER's native master path and checks settings restoration and project state; if the check detects a mismatch, the WAV is deleted and the request fails closed. The server does not publish one tool per ReaScript function.
 
 Project context starts with one complete panorama bound to a capture and revision. `reaper_panorama_open` returns the full view when it fits; otherwise it returns page 1 and a manifest, and the model fetches every remaining page before acknowledging the exact view and receiving its context token. Pagination preserves the bounded projection without transport truncation; dense time series are summarized and linked to exact archived data. Page count adapts to the configured response budget. The token represents the latest project state delivered to the model. After a typed edit, the normal `change_update` contains only added, changed or removed facts, using stable object IDs and the new current values; unchanged facts and the original panorama are not repeated. The update carries its successor token, so the model merges it into its known state instead of reloading the whole view after each edit. Oversized updates are delivered completely in pages and advance the token only after acknowledgement. If continuity is lost or cannot be proven, `reaper_panorama_refresh` opens a new full view. An explicit comparison of two archived captures is separate from these current-state updates; it reports factual changes and comparability, never a quality verdict. Numeric audio-metric comparisons are also separate from project-state updates. The receipt guarantees delivery of the exact view pages, not that a model read or understood them.
 
@@ -171,7 +170,7 @@ Full commands, client configuration, troubleshooting, and bridge lifecycle instr
 
 Project-aware calls use stable identifiers and expected revisions. A supported edit is not considered successful merely because REAPER accepted a command: inspect the post-edit context and confirm the touched objects. If the project has changed since the plan was prepared, the plan is stale and must be rebuilt from fresh context.
 
-This protection has defined limits. A generic ReaScript call or Action may have side effects beyond the typed transaction layer and may not be safely undoable by the library. Saving, overwriting, rendering, destructive editing, and project-file management require their own explicit checks. The safety model and current gates are documented in [Safety](docs/SAFETY.md) and [Validation status](docs/VALIDATION.md).
+This protection has defined limits. A generic ReaScript call or Action may have side effects beyond the typed transaction layer and may not be safely undoable by the library. Saving, overwriting, rendering, destructive editing, and project-file management require their own explicit checks. The safety model and current gates are documented in [Safety](docs/SAFETY.md) and the [handbook](docs/HANDBOOK.md).
 
 ## Development
 
@@ -202,10 +201,8 @@ See  for the index and the sync rule with the Hermes profile copy.
 
 - [Installation and connection](docs/INSTALLATION.md)
 - [Architecture and data flow](docs/ARCHITECTURE.md)
-- [Full capture and analysis details](docs/FULL-CAPTURE.md)
 - [Safety and project-state guarantees](docs/SAFETY.md)
 - [MCP guide for language models](docs/MCP-README-LLM.md)
-- [Validation status and release gates](docs/VALIDATION.md)
 - [Russian documentation](README.ru.md)
 
 ## License

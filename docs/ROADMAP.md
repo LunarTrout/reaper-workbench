@@ -2,7 +2,7 @@
 
 This page records the remaining implementation and validation gates. It is not
 a mixing recipe. Confirmed behavior and evidence are in
-[validation status](VALIDATION.md); the current model-facing contract is in the
+the [handbook](HANDBOOK.md); the current model-facing contract is in the
 [MCP guide](MCP-README-LLM.md).
 
 ## Implemented scope

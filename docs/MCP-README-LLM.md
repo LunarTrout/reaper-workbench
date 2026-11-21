@@ -312,7 +312,7 @@ For bridge maintenance, `reaper_bridge_reload` is an in-place activation for a
 bridge that already implements the lifecycle contract. It proves one new
 session, the expected build, and the unchanged project identity. A legacy bridge
 returns `bootstrap_required`; do not try to invoke Actions or start a duplicate
-loop through MCP. Follow [the bridge lifecycle procedure](bridge-lifecycle.md)
+loop through MCP. Follow the bridge procedure in [the handbook](HANDBOOK.md)
 for the operator-managed cold start or legacy upgrade.
 
 ## Find an API capability

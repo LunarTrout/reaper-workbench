@@ -2295,7 +2295,7 @@ local capture_job_string_fields = { "RENDER_FILE", "RENDER_PATTERN",
 -- ``render_settings=128`` and ``parallel_via_master=True``, which computes the
 -- same value inside project_capture_render.  One selected track renders through
 -- the master exactly like the batch path, so the async job must not substitute
--- the non-parallel 128 mode (docs/FULL-CAPTURE.md: Delivery and restoration).
+-- the non-parallel 128 mode (docs/HANDBOOK.md: capture and signal stages).
 local capture_job_track_render_settings = 128 + (8 << 16)
 
 local function capture_job_same_path(left, right)
