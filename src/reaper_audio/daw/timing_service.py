@@ -206,7 +206,7 @@ def plan_timing(analysis_id: str, *, tempo_context: Mapping[str, Any],
         for row in matched["assignments"]:
             event = events[int(row["event_index"])]
             if event.get("id") in ids:
-                targets[str(event["id"])] = float(row["target_s"])
+                targets[str(event["id"])] = offset + (float(row["target_s"]) - position)
         if not rows:
             continue
         phrase_events = [{
@@ -220,6 +220,15 @@ def plan_timing(analysis_id: str, *, tempo_context: Mapping[str, Any],
                               phrase_key="phrase", strength=strength,
                               preserve_duration=True,
                               protected_ranges=protected_ranges)
+        if not options.get("selected"):
+            options["selected"] = [{"event_id": row["id"], "shift_s": 0.0,
+                                    "start_s": float(row["source_s"])}
+                                   for row in rows]
+            options.setdefault("issues", []).append({
+                "code": "leave_selected",
+                "phrase": f"block_{index}",
+                "next_action": "audition the unshifted phrase or lower strength",
+            })
         alternatives.append({"block": index, "options": options})
         for issue in options.get("issues", []):
             if issue.get("code") == "duration_preserved_by_smaller_shift":

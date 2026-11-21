@@ -78,6 +78,7 @@ until it is read.
 - [Installation](docs/INSTALLATION.md) · [Russian](docs/INSTALLATION.ru.md)
 - [Policy](docs/POLICY.md) — thresholds belong to the owner
 - [Safety](docs/SAFETY.md) — trust boundary and state guarantees
+- [Timing and grid planning](docs/TIMING.md)
 - [Partial loudness](docs/PARTIAL-LOUDNESS-GATE.md) — gate and residual method
 - [Flamingo](docs/flamingo.md), [Ossicle](docs/ossicle.md) — optional listening backends
 

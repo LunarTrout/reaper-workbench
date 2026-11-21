@@ -78,6 +78,7 @@ measure/edit/midi/analyze отказывают с `HANDBOOK_REQUIRED`, пока 
 - [Установка](docs/INSTALLATION.ru.md) · [English](docs/INSTALLATION.md)
 - [Политика](docs/POLICY.md) — пороги задаёт владелец
 - [Безопасность](docs/SAFETY.ru.md) — границы доверия и гарантии состояния
+- [Тайминг и планирование по сетке](docs/TIMING.md)
 - [Partial loudness](docs/PARTIAL-LOUDNESS-GATE.md) — гейт и метод остатка
 - [Flamingo](docs/flamingo.md), [Ossicle](docs/ossicle.md) — опциональные слуховые бэкенды
 
