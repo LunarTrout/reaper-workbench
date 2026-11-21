@@ -39,6 +39,10 @@ from .daw.session import EditOperation, EditPlan, ProjectRevision, ProjectSessio
 from .daw.full_capture import FullCaptureService
 from .daw.measure import MeasureService
 from .daw.media_wake import ensure_media_online
+from .daw.capture_jobs import (start_capture_job, capture_job_status,
+                               capture_job_result, cancel_capture_job)
+from .context.state_query import (query_facts, changes_since as state_changes_since,
+                                  availability as state_availability)
 from .daw.midi import MidiService
 from .daw.edit import run_edit, send_list, undo_receipt
 from .daw.receipt import FileReceiptStore
@@ -497,7 +501,13 @@ def _require_interpretation_receipt(receipt: str | None, project_id: str,
 def _require_capture_read_receipt(receipt: str | None, project_id: str,
                                   expected_revision: Mapping[str, Any] | None,
                                   capture_id: str,
-                                  archive_root: str | None = None) -> dict[str, Any]:
+                                  archive_root: str | None = None,
+                   state_source: str | None = None,
+                   state_stage: str | None = None,
+                   state_window: list[float] | None = None,
+                   state_metrics: list[str] | None = None,
+                   state_status: str | None = None,
+                   state_since: int | None = None) -> dict[str, Any]:
     """Gate a model-facing archive read for one exact capture.
 
     Unlike a mutation gate, this must validate the receipt against the capture
@@ -1573,7 +1583,13 @@ def reaper_session(action: str = "health",
                    force: bool = False,
                    since: dict[str, Any] | None = None,
                    timeout_s: float = 30.0,
-                   archive_root: str | None = None) -> dict[str, Any]:
+                   archive_root: str | None = None,
+                   state_source: str | None = None,
+                   state_stage: str | None = None,
+                   state_window: list[float] | None = None,
+                   state_metrics: list[str] | None = None,
+                   state_status: str | None = None,
+                   state_since: int | None = None) -> dict[str, Any]:
     """Inspect the REAPER connection or list live instances/projects.
 
     action: health, list_instances, list_projects, or dirty. When several
@@ -1583,16 +1599,34 @@ def reaper_session(action: str = "health",
     """
     allowed = {"health", "list_instances", "list_projects", "dirty", "status",
                "preflight", "transport", "project", "settings", "app",
-               "wait_for_change"}
+               "wait_for_change", "state"}
     if action not in allowed:
         raise ValidationError("unknown session action", details={"action": action})
-    if action in {"status", "preflight", "transport", "project", "settings",
+    if action in {"status", "state", "preflight", "transport", "project", "settings",
                   "app", "wait_for_change"}:
         session = ProjectSession(ReaperBridge(bridge_session_id=bridge_session_id),
                                  project_id=project_id, archive_root=archive_root)
         if action == "status":
             return session.status(detail=detail, sections=sections,
                                   archive_root=archive_root)
+        if action == "state":
+            if not archive_root:
+                raise ValidationError("archive_root is required for action=state")
+            from .context.state_reads import read_state
+            selected = project_id or session.project_id
+            if not selected:
+                raise ValidationError("project_id is required when no project is active")
+            state = read_state(archive_root, selected)
+            report = state_availability(state)
+            if state_since is not None:
+                return {"ok": True, "action": "state",
+                        "availability": report,
+                        **state_changes_since(state, state_since)}
+            rows = query_facts(state, source_id=state_source, stage=state_stage,
+                               window=state_window, metrics=state_metrics,
+                               status=state_status)
+            return {"ok": True, "action": "state", "availability": report,
+                    "facts": rows, "state_token": (state or {}).get("token")}
         if action == "preflight":
             return session.preflight(allow_solo=allow_solo, check_focus=check_focus)
         if action == "transport":
@@ -5477,7 +5511,10 @@ def reaper_capture_snapshot(project_id: str,
                             sample_rate: int | None = None,
                             tail_ms: int = 0,
                             analysis_workers: int | None = None,
-                            bridge_session_id: str | None = None) -> dict[str, Any]:
+                            bridge_session_id: str | None = None,
+                            mode: str = "sync",
+                            job_id: str | None = None,
+                            wait: bool = False) -> dict[str, Any]:
     """Capture a complete project snapshot and append it to a durable archive.
 
     The capture contains the full project map (tracks/buses/master, items/takes,
@@ -5497,6 +5534,39 @@ def reaper_capture_snapshot(project_id: str,
     new capture, fetch every page it announces with ``reaper_panorama_page``,
     then ``reaper_panorama_ack`` with every page hash before interpreting.
     """
+    if mode != "sync":
+        if mode == "start":
+            session = _session(project_id, bridge_session_id)
+            ensure_media_online(session)
+            started = start_capture_job(
+                session, archive_root,
+                section=(None if start_s is None or end_s is None else (start_s, end_s)),
+                channels=channels, sample_rate=sample_rate, tail_ms=tail_ms,
+                bridge_session_id=bridge_session_id)
+            if not wait:
+                return {"ok": True, "mode": "start", **started}
+            deadline = time.monotonic() + 900
+            while time.monotonic() < deadline:
+                job = capture_job_status(archive_root, started["job_id"])
+                if job.get("state") in {"done", "failed", "cancelled"}:
+                    return {"ok": job.get("state") == "done", "mode": "start",
+                            **capture_job_result(archive_root, started["job_id"])}
+                time.sleep(1.0)
+            return {"ok": False, "mode": "start", "job_id": started["job_id"],
+                    "error": {"code": "job_timeout",
+                              "message": "capture job did not finish within 900 s"}}
+        if mode in {"status", "result", "cancel"}:
+            if not job_id:
+                raise ValidationError("job_id is required for capture mode " + mode)
+            if mode == "status":
+                return {"ok": True, "mode": mode,
+                        **capture_job_status(archive_root, job_id)}
+            if mode == "cancel":
+                return {"ok": True, "mode": mode,
+                        **cancel_capture_job(archive_root, job_id)}
+            return {"ok": True, "mode": mode,
+                    **capture_job_result(archive_root, job_id)}
+        raise ValidationError("mode must be sync, start, status, result or cancel")
     _focus_reaper_window()
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)

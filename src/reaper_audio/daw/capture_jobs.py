@@ -36,8 +36,8 @@ from pathlib import Path
 from typing import Any
 
 from ..analysis.artifacts import AudioArtifactWorkspace
-from ..errors import (BridgeTimeout, BridgeUnavailable, ReaperAudioError,
-                      ValidationError)
+from ..errors import (BridgeTimeout, BridgeUnavailable, PanoramaCapacityError,
+                      ReaperAudioError, ValidationError)
 from ..reaper.bridge_client import ReaperBridge
 from .full_capture import FullCaptureService, PreRenderedCapture
 from .session import ProjectRevision, ProjectSession
@@ -565,13 +565,26 @@ def _run_job(session: ProjectSession, archive_root: Path, job_id: str,
             details = getattr(exc, "details", None)
             capture_id = (details.get("capture_id")
                           if isinstance(details, Mapping) else None)
-            _update_job(archive_root, job_id, _job_mutator(
-                state="failed",
-                phase="failed",
-                error=_error_row(exc),
-                capture_id=capture_id if isinstance(capture_id, str) else None,
-                progress={"current": None},
-            ))
+            if isinstance(exc, PanoramaCapacityError):
+                # The canonical capture and the project state are already
+                # archived; only the one-shot view exceeded its budget.  The
+                # job succeeded and the caller opens pages instead.
+                _update_job(archive_root, job_id, _job_mutator(
+                    state="done",
+                    phase="done",
+                    capture_id=capture_id if isinstance(capture_id, str) else None,
+                    error=None,
+                    progress={"done": len(sources), "total": len(sources),
+                              "current": None},
+                ))
+            else:
+                _update_job(archive_root, job_id, _job_mutator(
+                    state="failed",
+                    phase="failed",
+                    error=_error_row(exc),
+                    capture_id=capture_id if isinstance(capture_id, str) else None,
+                    progress={"current": None},
+                ))
         except Exception:
             # The job file itself is unwritable; nothing else can be reported.
             pass
