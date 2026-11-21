@@ -659,8 +659,9 @@ def _route_is_master(source_id: str, master_fingerprint: Mapping[str, Any] | Non
 
 
 def _fx_summary(session, tracks) -> list[dict]:
-    """Per-plugin rollup: available params and what is set (first_seen baseline)."""
+    """Per-plugin rollup with one default probe per effect plugin name."""
     rows: list[dict] = []
+    defaults_cache: dict[str, list] = {}
     for track in tracks:
         guid = track.get("guid")
         for fx in track.get("fx") or []:
@@ -675,7 +676,19 @@ def _fx_summary(session, tracks) -> list[dict]:
             except Exception:
                 params = []
             name = str(fx.get("name") or "")
-            summary = summarize_fx(name, params, None)
+            defaults = None
+            classification = classify_parameters(params, name)
+            if classification["kind"] == "effect" and classification["defaults_meaningful"]:
+                if name not in defaults_cache:
+                    try:
+                        probed = session.bridge.call(
+                            "fx.probe_defaults", {"name": name}) or {}
+                        defaults_cache[name] = (list(probed.get("parameters") or [])
+                                                if probed.get("status") == "ok" else [])
+                    except Exception:
+                        defaults_cache[name] = []
+                defaults = defaults_cache.get(name) or None
+            summary = summarize_fx(name, params, defaults)
             summary["track_guid"] = guid
             summary["slot"] = fx.get("index")
             summary["track"] = (track.get("name") or track.get("track_name")

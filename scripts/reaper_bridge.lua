@@ -45,7 +45,7 @@ if _G.__reaper_audio_bridge_resident and not _G.__reaper_audio_bridge_reloading 
   return
 end
 _G.__reaper_audio_bridge_resident = true
-local bridge_build = "b25-2026-11-21"  -- async per-source capture jobs
+local bridge_build = "b26-2026-11-21"  -- async per-source capture jobs
 -- A second boot inside the same REAPER Lua state must supersede the first:
 -- two loops would both keep heartbeating and the client would see two live
 -- bridges. Every loop compares this token before it reschedules; the newest
@@ -5157,6 +5157,43 @@ local function fx_list_params(arguments)
            count = count, parameters = parameters }
 end
 
+local function fx_probe_defaults(arguments)
+  local project, path = target_project(arguments)
+  local name = arguments.name
+  if type(name) ~= "string" or name == "" then
+    fail("validation_error", "Plugin name is required", {})
+  end
+  if name:match("^VSTi:") or name:match("^VST3i:") then
+    return { status = "unavailable", reason = "instrument_no_defaults",
+             plugin = name, parameters = json.array() }
+  end
+  local index = reaper.CountTracks(project)
+  reaper.InsertTrackAtIndex(index, false)
+  local track = reaper.GetTrack(project, index)
+  local fx_index = reaper.TrackFX_AddByName(track, name, false, -1)
+  if fx_index < 0 then
+    reaper.DeleteTrack(track)
+    return { status = "failed", reason = "plugin_not_found", plugin = name,
+             parameters = json.array() }
+  end
+  local parameters = json.array()
+  local count = reaper.TrackFX_GetNumParams(track, fx_index)
+  for parameter_index = 0, count - 1 do
+    local name_ok, parameter_name = reaper.TrackFX_GetParamName(
+      track, fx_index, parameter_index)
+    local formatted_ok, formatted = reaper.TrackFX_GetFormattedParamValue(
+      track, fx_index, parameter_index)
+    parameters[#parameters + 1] = {
+      index = parameter_index,
+      name = name_ok and parameter_name or "",
+      normalized = reaper.TrackFX_GetParamNormalized(track, fx_index, parameter_index),
+      formatted = formatted_ok and formatted or "",
+    }
+  end
+  reaper.DeleteTrack(track)
+  return { status = "ok", plugin = name, count = count, parameters = parameters }
+end
+
 local function fx_list_installed(arguments)
   local plugins = json.array()
   local index = 0
@@ -5452,6 +5489,7 @@ local operations = {
   ["project.sample_tracks"] = project_sample_tracks,
   ["fx.list_installed"] = fx_list_installed,
   ["fx.list_params"] = fx_list_params,
+  ["fx.probe_defaults"] = fx_probe_defaults,
   ["project.save"] = project_save,
   ["transaction.preview"] = transaction_preview,
   ["transaction.apply"] = transaction_apply,
