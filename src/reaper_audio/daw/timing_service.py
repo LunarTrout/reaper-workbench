@@ -8,6 +8,8 @@ It never edits the project.
 from __future__ import annotations
 
 from pathlib import Path
+
+import numpy as np
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
@@ -131,7 +133,8 @@ def plan_timing(analysis_id: str, *, tempo_context: Mapping[str, Any],
                 tolerance_s: float = 0.080, strength: float = 1.0,
                 group_gap_s: float = 0.25,
                 group_shift_s: float = 0.012,
-                protected_ranges: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
+                protected_ranges: Sequence[Mapping[str, Any]] = (),
+                reference_events: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
     """Match one stored analysis to the project grid and return a plan."""
     analysis = ANALYSES.get(analysis_id)
     if analysis is None:
@@ -145,8 +148,33 @@ def plan_timing(analysis_id: str, *, tempo_context: Mapping[str, Any],
     end_s = float(analysis["project_window"]["end_s"])
     project_events = [{**event, "source_s": event["project_s"]}
                       for event in events]
-    matched, grid, division = _choose_grid(project_events, tempo, start_s, end_s,
-                                           tolerance_s, subdivisions)
+    if reference_events:
+        assignments = []
+        for index, reference in enumerate(reference_events):
+            if index >= len(project_events):
+                break
+            event = project_events[index]
+            target = reference.get("target_s")
+            if target is None and reference.get("qn") is not None:
+                target = tempo.qn_to_time(float(reference["qn"]))
+            if target is None:
+                continue
+            assignments.append({"event_index": index,
+                                "grid_index": index,
+                                "event_s": float(event["source_s"]),
+                                "target_s": float(target),
+                                "qn": float(tempo.time_to_qn(float(target))),
+                                "offset_s": float(target) - float(event["source_s"])})
+        matched = {"assignments": assignments, "matched": len(assignments),
+                   "skipped_events": [], "skipped_grid": [],
+                   "median_abs_offset_s": (float(np.median(
+                       [abs(row["offset_s"]) for row in assignments]))
+                       if assignments else None)}
+        grid = list(reference_events)
+        division = 0
+    else:
+        matched, grid, division = _choose_grid(project_events, tempo, start_s, end_s,
+                                               tolerance_s, subdivisions)
     position = float(analysis["position_s"])
     offset = float(analysis["source_offset_s"])
     source_assignments = []
@@ -201,6 +229,7 @@ def plan_timing(analysis_id: str, *, tempo_context: Mapping[str, Any],
         "plan_id": f"tpl_{uuid4().hex[:16]}",
         "tempo_map_source": getattr(tempo, "source", "project"),
         "subdivision": division,
+        "target_kind": "reference_events" if reference_events else "project_grid",
         "grid_points": len(grid),
         "match": matched,
         "project_id": analysis.get("project_id"),

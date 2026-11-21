@@ -2236,7 +2236,8 @@ def reaper_timing(action: Literal["analyze", "plan", "inspect"],
                   strength: float = 1.0,
                   group_gap_s: float = 0.25,
                   group_shift_s: float = 0.012,
-                  protected_ranges: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                  protected_ranges: list[dict[str, Any]] | None = None,
+                  reference_events: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Analyze audio timing against the project grid and build a 1x clip plan.
 
     analyze resolves one file-backed audio item, detects attacks and returns an
@@ -2262,7 +2263,8 @@ def reaper_timing(action: Literal["analyze", "plan", "inspect"],
                              tolerance_s=tolerance_s, strength=strength,
                              group_gap_s=group_gap_s,
                              group_shift_s=group_shift_s,
-                             protected_ranges=protected_ranges or ())
+                             protected_ranges=protected_ranges or (),
+                             reference_events=reference_events)
         return {"ok": True, "action": action, **result}
     if action == "inspect":
         return {"ok": True, "action": action,
