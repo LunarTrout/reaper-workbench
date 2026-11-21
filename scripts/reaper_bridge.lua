@@ -45,7 +45,7 @@ if _G.__reaper_audio_bridge_resident and not _G.__reaper_audio_bridge_reloading 
   return
 end
 _G.__reaper_audio_bridge_resident = true
-local bridge_build = "b26-2026-11-21"  -- async per-source capture jobs
+local bridge_build = "b27-2026-11-21"  -- typed item.timing_apply block geometry
 -- A second boot inside the same REAPER Lua state must supersede the first:
 -- two loops would both keep heartbeating and the client would see two live
 -- bridges. Every loop compares this token before it reschedules; the newest
@@ -3699,6 +3699,146 @@ local function validate_item_split_values(values)
   end
 end
 
+local timing_note_prefix = "wb-timing:"
+local max_timing_blocks = 400
+local max_timing_seam_overlap_s = 0.060
+local timing_geometry_tolerance_s = 1e-6
+
+local function is_dense_array(value)
+  if type(value) ~= "table" then return false end
+  local count = 0
+  for key in pairs(value) do
+    if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then return false end
+    count = count + 1
+  end
+  return count == #value
+end
+
+-- One typed operation replaces a file-backed 1x item with a plan's clips.
+-- item.split cannot express a source offset for the left slice and
+-- item.set has no start-offset field, so a 161-block plan is not expressible
+-- as splits/sets.  The geometry is validated here as well as in Python: the
+-- bridge is the last gate before samples move.
+local timing_block_keys = { position_s = true, source_start_s = true,
+                            length_s = true, fade_in_s = true,
+                            fade_out_s = true, rate = true,
+                            event_ids = true }
+
+local function validate_item_timing_values(values)
+  require_object_values(values, { blocks = true, apply_id = true,
+                                  delete_source = true, source_path = true,
+                                  expected_take_guid = true,
+                                  source_length_s = true },
+                        { blocks = true, apply_id = true })
+  if type(values.apply_id) ~= "string" or values.apply_id == "" or
+     #values.apply_id > 96 or not values.apply_id:match("^[%w_%.:%-]+$") then
+    fail("validation_error",
+         "item.timing_apply apply_id must be a short identifier",
+         { apply_id = values.apply_id })
+  end
+  if values.delete_source ~= nil and type(values.delete_source) ~= "boolean" then
+    fail("validation_error", "item.timing_apply delete_source must be a boolean")
+  end
+  if values.source_path ~= nil and
+     (type(values.source_path) ~= "string" or values.source_path == "") then
+    fail("validation_error",
+         "item.timing_apply source_path must be a non-empty string")
+  end
+  if values.expected_take_guid ~= nil and
+     type(values.expected_take_guid) ~= "string" then
+    fail("validation_error",
+         "item.timing_apply expected_take_guid must be a string")
+  end
+  if values.source_length_s ~= nil and
+     (not finite_number(values.source_length_s) or values.source_length_s <= 0) then
+    fail("validation_error",
+         "item.timing_apply source_length_s must be a positive number")
+  end
+  local blocks = values.blocks
+  if not is_dense_array(blocks) or #blocks == 0 or #blocks > max_timing_blocks then
+    fail("validation_error",
+         "item.timing_apply requires 1 to " .. max_timing_blocks .. " blocks",
+         { blocks = type(blocks) == "table" and #blocks or 0 })
+  end
+  local previous_position, previous_end, previous_source_end = nil, nil, nil
+  for index, block in ipairs(blocks) do
+    local block_index = index - 1
+    if type(block) ~= "table" then
+      fail("validation_error", "Each timing block must be an object",
+           { block_index = block_index })
+    end
+    for key in pairs(block) do
+      if not timing_block_keys[key] then
+        fail("validation_error", "Unknown timing block field",
+             { block_index = block_index, field = tostring(key) })
+      end
+    end
+    if not finite_number(block.position_s) or block.position_s < 0 then
+      fail("validation_error",
+           "A timing block needs a finite non-negative position_s",
+           { block_index = block_index })
+    end
+    if not finite_number(block.source_start_s) or block.source_start_s < 0 then
+      fail("validation_error",
+           "A timing block needs a finite non-negative source_start_s",
+           { block_index = block_index })
+    end
+    if not finite_number(block.length_s) or block.length_s <= 0 then
+      fail("validation_error", "A timing block needs a positive length_s",
+           { block_index = block_index })
+    end
+    if not finite_number(block.rate) or math.abs(block.rate - 1.0) > 1e-9 then
+      fail("validation_error", "Timing blocks are applied at 1x only",
+           { block_index = block_index, rate = block.rate })
+    end
+    local fade_in, fade_out = block.fade_in_s, block.fade_out_s
+    if not finite_number(fade_in) or fade_in < 0 or
+       not finite_number(fade_out) or fade_out < 0 or
+       fade_in + fade_out > block.length_s + timing_geometry_tolerance_s then
+      fail("validation_error", "A timing block needs valid fade lengths",
+           { block_index = block_index, fade_in_s = fade_in,
+             fade_out_s = fade_out, length_s = block.length_s })
+    end
+    if block.event_ids ~= nil then
+      if type(block.event_ids) ~= "table" or #block.event_ids > 4096 then
+        fail("validation_error",
+             "event_ids must be an array of at most 4096 identifiers",
+             { block_index = block_index })
+      end
+      for event_index, event_id in ipairs(block.event_ids) do
+        if type(event_id) ~= "string" then
+          fail("validation_error", "event_ids must contain strings",
+               { block_index = block_index, event_index = event_index - 1 })
+        end
+      end
+    end
+    local block_end = block.position_s + block.length_s
+    local source_end = block.source_start_s + block.length_s
+    if previous_position ~= nil and
+       block.position_s < previous_position - timing_geometry_tolerance_s then
+      fail("validation_error", "Timing blocks would be reordered on the timeline",
+           { block_index = block_index, position_s = block.position_s,
+             previous_position_s = previous_position })
+    end
+    if previous_end ~= nil and block.position_s <
+       previous_end - max_timing_seam_overlap_s - timing_geometry_tolerance_s then
+      fail("validation_error",
+           "Timing blocks overlap by more than a seam crossfade",
+           { block_index = block_index, position_s = block.position_s,
+             previous_end_s = previous_end,
+             limit_s = max_timing_seam_overlap_s })
+    end
+    if previous_source_end ~= nil and
+       block.source_start_s < previous_source_end - timing_geometry_tolerance_s then
+      fail("validation_error", "Timing blocks reuse or reorder source material",
+           { block_index = block_index, source_start_s = block.source_start_s,
+             previous_source_end_s = previous_source_end })
+    end
+    previous_position, previous_end, previous_source_end =
+      block.position_s, block_end, source_end
+  end
+end
+
 local function validate_envelope_values(values)
   require_object_values(values, { envelope = true, points = true, clear = true, active = true },
                         { envelope = true, points = true })
@@ -3941,6 +4081,8 @@ local function normalize_edit_operation(project, operation)
     validate_item_create_values(values)
   elseif kind == "item.split" then
     validate_item_split_values(values)
+  elseif kind == "item.timing_apply" then
+    validate_item_timing_values(values)
   elseif kind == "item.duplicate" then
     validate_item_duplicate_values(values)
   elseif kind == "envelope.set" then
@@ -3960,7 +4102,8 @@ local function normalize_edit_operation(project, operation)
          { kind = kind, supported = { "track.set", "track.create",
                                        "track.delete", "track.reorder",
                                        "item.set", "item.create", "item.delete",
-                                       "item.split", "item.duplicate",
+                                       "item.split", "item.timing_apply",
+                                       "item.duplicate",
                                        "take.set", "midi.create",
                                        "fx.set_enabled", "fx.set_parameter",
                                        "fx.insert", "fx.delete", "fx.move",
@@ -3974,6 +4117,7 @@ local function normalize_edit_operation(project, operation)
 
   local target
   if kind == "item.set" or kind == "item.delete" or kind == "item.split" or
+     kind == "item.timing_apply" or
      kind == "item.duplicate" or kind == "take.set" then
     target = resolve_item(project, target_guid)
   elseif kind == "track.create" or kind == "marker.create" or kind == "tempo.set" or
@@ -4040,6 +4184,7 @@ local function read_edit_state(project, operation)
   local kind, values = operation.kind, operation.values
   local target
   if kind == "item.set" or kind == "item.delete" or kind == "item.split" or
+     kind == "item.timing_apply" or
      kind == "item.duplicate" or kind == "take.set" then
     target = resolve_item(project, operation.target_guid)
   elseif kind == "track.create" or kind == "marker.create" or kind == "tempo.set" or
@@ -4091,6 +4236,30 @@ local function read_edit_state(project, operation)
         if key == "mute" then state[key] = value ~= 0 else state[key] = value end
       end
     end
+  elseif kind == "item.timing_apply" then
+    local take = reaper.GetActiveTake(target)
+    local source = take and reaper.GetMediaItemTake_Source(take) or nil
+    local take_guid_ok, take_guid = false, ""
+    if take then
+      take_guid_ok, take_guid = reaper.GetSetMediaItemTakeInfo_String(
+        take, "GUID", "", false)
+    end
+    local owner = reaper.GetMediaItem_Track(target)
+    state.item_guid = operation.target_guid
+    state.position_s = reaper.GetMediaItemInfo_Value(target, "D_POSITION")
+    state.length_s = reaper.GetMediaItemInfo_Value(target, "D_LENGTH")
+    state.source_offset_s = take and
+      reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS") or 0
+    state.playrate = take and
+      reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE") or 0
+    state.fade_in_s = reaper.GetMediaItemInfo_Value(target, "D_FADEINLEN")
+    state.fade_out_s = reaper.GetMediaItemInfo_Value(target, "D_FADEOUTLEN")
+    state.source_path = source and reaper.GetMediaSourceFileName(source, "") or ""
+    state.take_guid = take_guid_ok and take_guid or ""
+    state.track_item_count =
+      owner and reaper.CountTrackMediaItems(owner) or 0
+    state.block_count = #values.blocks
+    state.apply_id = values.apply_id
   elseif kind == "midi.create" then
     state.item_count = reaper.CountTrackMediaItems(target)
     state.position_s = values.position_s
@@ -4243,6 +4412,15 @@ local function read_edit_state_after(project, operation)
     local item = resolve_item(project, operation.target_guid)
     local track = item and reaper.GetMediaItem_Track(item) or nil
     return { item_count = track and reaper.CountTrackMediaItems(track) or 0 }
+  elseif kind == "item.timing_apply" then
+    -- The source item may be gone after a successful apply; only report what
+    -- can still be read.
+    local item = resolve_item(project, operation.target_guid)
+    local track = item and reaper.GetMediaItem_Track(item) or nil
+    return { source_exists = item ~= nil,
+             item_count = track and reaper.CountTrackMediaItems(track) or nil,
+             block_count = operation.values.blocks and
+               #operation.values.blocks or 0 }
   end
   return read_edit_state(project, operation)
 end
@@ -4274,6 +4452,7 @@ local function inspect_edit(project, operation)
          normalized.kind == "item.create" or normalized.kind == "item.delete" or
          normalized.kind == "marker.create" or normalized.kind == "send.create" or
          normalized.kind == "send.delete" or normalized.kind == "item.split" or
+         normalized.kind == "item.timing_apply" or
          normalized.kind == "item.duplicate" or normalized.kind == "envelope.set" or
          normalized.kind == "region.delete" or normalized.kind == "track.reorder" then
     changed = true
@@ -4374,6 +4553,7 @@ local function apply_edit(project, inspected)
   local kind, values = operation.kind, operation.values
   local target
   if kind == "item.set" or kind == "item.delete" or kind == "item.split" or
+     kind == "item.timing_apply" or
      kind == "item.duplicate" or kind == "take.set" then
     target = resolve_item(project, operation.target_guid)
   elseif kind == "track.create" or kind == "marker.create" or kind == "tempo.set" or
@@ -4769,6 +4949,207 @@ local function apply_edit(project, inspected)
     return { changed = true, new_item_guid = guid_ok and new_guid or "",
              position_s = values.position_s, fade_s = fade_length, tail_s = tail,
              right_trim_s = right_trim, move_s = move }
+  elseif kind == "item.timing_apply" then
+    local take = reaper.GetActiveTake(target)
+    if not take then
+      fail("stale_context", "The timing source item has no active take",
+           { target_guid = operation.target_guid })
+    end
+    local source = reaper.GetMediaItemTake_Source(take)
+    local source_path = source and reaper.GetMediaSourceFileName(source, "") or ""
+    if source_path == "" then
+      fail("stale_context", "The timing source take is not backed by a media file",
+           { target_guid = operation.target_guid })
+    end
+    if values.source_path ~= nil and source_path ~= values.source_path then
+      fail("stale_context",
+           "The active take's source changed after the timing plan was made",
+           { expected = values.source_path, actual = source_path })
+    end
+    if values.expected_take_guid ~= nil then
+      local take_ok, take_guid = reaper.GetSetMediaItemTakeInfo_String(
+        take, "GUID", "", false)
+      if not take_ok or take_guid ~= values.expected_take_guid then
+        fail("stale_context",
+             "The active take changed after the timing plan was made",
+             { expected = values.expected_take_guid,
+               actual = take_ok and take_guid or "" })
+      end
+    end
+    local source_rate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+    if not finite_number(source_rate) or math.abs(source_rate - 1.0) > 1e-9 then
+      fail("validation_error", "item.timing_apply needs a 1x source take",
+           { playrate = source_rate })
+    end
+    if reaper.GetTakeNumStretchMarkers(take) > 0 then
+      fail("validation_error",
+           "item.timing_apply cannot replace a take with stretch markers",
+           { target_guid = operation.target_guid })
+    end
+    local source_length = reaper.GetMediaSourceLength(source)
+    if not finite_number(source_length) or source_length <= 0 then
+      fail("stale_context", "The take's source length is unknown",
+           { target_guid = operation.target_guid })
+    end
+    if values.source_length_s ~= nil and
+       math.abs(source_length - values.source_length_s) > 1e-3 then
+      fail("stale_context",
+           "The take's source file length changed since the plan",
+           { planned_length_s = values.source_length_s,
+             actual_length_s = source_length })
+    end
+    local needed = 0
+    for _, block in ipairs(values.blocks) do
+      local end_s = block.source_start_s + block.length_s
+      if end_s > needed then needed = end_s end
+    end
+    if needed > source_length + timing_geometry_tolerance_s then
+      fail("source_handles_unavailable",
+           "The timing plan reads past the end of the take",
+           { needed_s = needed, source_length_s = source_length,
+             overflow_s = needed - source_length })
+    end
+    local track = reaper.GetMediaItem_Track(target)
+    if not track then
+      fail("stale_context", "The timing source item is not on a track",
+           { target_guid = operation.target_guid })
+    end
+    -- A retry after an interrupted attempt must not duplicate clips: every
+    -- clip this geometry digest created earlier is removed before creating.
+    local marker_prefix = timing_note_prefix .. values.apply_id .. ":"
+    local leftovers = {}
+    for item_index = reaper.CountTrackMediaItems(track) - 1, 0, -1 do
+      local candidate = reaper.GetTrackMediaItem(track, item_index)
+      if candidate ~= nil and candidate ~= target then
+        local notes_ok, notes = reaper.GetSetMediaItemInfo_String(
+          candidate, "P_NOTES", "", false)
+        if notes_ok and type(notes) == "string" and
+           notes:sub(1, #marker_prefix) == marker_prefix then
+          leftovers[#leftovers + 1] = candidate
+        end
+      end
+    end
+    for _, leftover in ipairs(leftovers) do
+      reaper.DeleteTrackMediaItem(track, leftover)
+    end
+    local name_ok, take_name = reaper.GetSetMediaItemTakeInfo_String(
+      take, "P_NAME", "", false)
+    local take_volume = reaper.GetMediaItemTakeInfo_Value(take, "D_VOL")
+    local take_pan = reaper.GetMediaItemTakeInfo_Value(take, "D_PAN")
+    local take_pitch = reaper.GetMediaItemTakeInfo_Value(take, "D_PITCH")
+    local take_ppitch = reaper.GetMediaItemTakeInfo_Value(take, "B_PPITCH")
+    local take_chanmode = reaper.GetMediaItemTakeInfo_Value(take, "I_CHANMODE")
+    local created = json.array()
+    local mismatches = json.array()
+    for block_index, block in ipairs(values.blocks) do
+      local item = reaper.AddMediaItemToTrack(track)
+      if not item then
+        fail("transaction_apply_failed", "REAPER did not create a timing clip",
+             { block_index = block_index - 1 })
+      end
+      local new_source = reaper.PCM_Source_CreateFromFile(source_path)
+      if not new_source then
+        fail("transaction_apply_failed",
+             "REAPER could not reopen the item source",
+             { source_path = source_path, block_index = block_index - 1 })
+      end
+      local new_take = reaper.AddTakeToMediaItem(item)
+      if not new_take then
+        fail("transaction_apply_failed",
+             "REAPER did not create a take for a timing clip",
+             { block_index = block_index - 1 })
+      end
+      reaper.SetMediaItemTake_Source(new_take, new_source)
+      checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "D_STARTOFFS",
+                   block.source_start_s)
+      checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "D_PLAYRATE", 1.0)
+      checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "B_LOOPSRC", 0)
+      checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "B_PPITCH",
+                   take_ppitch)
+      checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "I_CHANMODE",
+                   take_chanmode)
+      checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "D_VOL",
+                   take_volume)
+      checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "D_PAN", take_pan)
+      checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "D_PITCH",
+                   take_pitch)
+      -- Seconds, not beats: the plan's geometry is in project seconds.
+      checked_call(reaper.SetMediaItemTakeInfo_Value, new_take,
+                   "C_BEATATTACHMODE", 0)
+      if name_ok and type(take_name) == "string" and take_name ~= "" then
+        checked_call(reaper.GetSetMediaItemTakeInfo_String, new_take, "P_NAME",
+                     take_name, true)
+      end
+      -- Automatic fades are the usual reason a read-back disagrees; disable
+      -- them and write both explicit lengths.
+      checked_call(reaper.SetMediaItemInfo_Value, item, "C_AUTOSTRETCH", 0)
+      checked_call(reaper.SetMediaItemInfo_Value, item, "D_FADEINLEN_AUTO", 0)
+      checked_call(reaper.SetMediaItemInfo_Value, item, "D_FADEOUTLEN_AUTO", 0)
+      checked_call(reaper.SetMediaItemInfo_Value, item, "D_FADEINLEN", 0)
+      checked_call(reaper.SetMediaItemInfo_Value, item, "D_FADEOUTLEN", 0)
+      checked_call(reaper.SetMediaItemInfo_Value, item, "D_POSITION",
+                   block.position_s)
+      checked_call(reaper.SetMediaItemInfo_Value, item, "D_LENGTH", block.length_s)
+      checked_call(reaper.SetMediaItemInfo_Value, item, "D_FADEINLEN",
+                   block.fade_in_s)
+      checked_call(reaper.SetMediaItemInfo_Value, item, "D_FADEOUTLEN",
+                   block.fade_out_s)
+      checked_call(reaper.GetSetMediaItemInfo_String, item, "P_NOTES",
+                   marker_prefix .. tostring(block_index), true)
+      reaper.UpdateItemInProject(item)
+      local actual = {
+        position_s = reaper.GetMediaItemInfo_Value(item, "D_POSITION"),
+        length_s = reaper.GetMediaItemInfo_Value(item, "D_LENGTH"),
+        source_offset_s = reaper.GetMediaItemTakeInfo_Value(
+          new_take, "D_STARTOFFS"),
+        playrate = reaper.GetMediaItemTakeInfo_Value(new_take, "D_PLAYRATE"),
+        fade_in_s = reaper.GetMediaItemInfo_Value(item, "D_FADEINLEN"),
+        fade_out_s = reaper.GetMediaItemInfo_Value(item, "D_FADEOUTLEN"),
+      }
+      local expected = {
+        position_s = block.position_s,
+        length_s = block.length_s,
+        source_offset_s = block.source_start_s,
+        playrate = 1.0,
+        fade_in_s = block.fade_in_s,
+        fade_out_s = block.fade_out_s,
+      }
+      for field, wanted in pairs(expected) do
+        if not finite_number(actual[field]) or
+           math.abs(actual[field] - wanted) > timing_geometry_tolerance_s then
+          mismatches[#mismatches + 1] = {
+            block_index = block_index - 1, field = field,
+            expected = wanted, actual = actual[field],
+          }
+        end
+      end
+      if #mismatches >= 32 then
+        fail("timing_geometry_mismatch",
+             "REAPER stored timing clip geometry that differs from the plan",
+             { mismatches = mismatches })
+      end
+      local guid_ok, item_guid = reaper.GetSetMediaItemInfo_String(
+        item, "GUID", "", false)
+      created[#created + 1] = guid_ok and item_guid or ""
+    end
+    if #mismatches > 0 then
+      fail("timing_geometry_mismatch",
+           "REAPER stored timing clip geometry that differs from the plan",
+           { mismatches = mismatches })
+    end
+    local deleted_guid = ""
+    if values.delete_source ~= false then
+      local guid_ok, source_guid = reaper.GetSetMediaItemInfo_String(
+        target, "GUID", "", false)
+      deleted_guid = guid_ok and source_guid or ""
+      reaper.DeleteTrackMediaItem(track, target)
+    end
+    reaper.UpdateArrange()
+    return { changed = true, apply_id = values.apply_id,
+             blocks = #values.blocks, created_item_guids = created,
+             deleted_source_item_guid = deleted_guid,
+             replaced_leftovers = #leftovers,
+             item_count_after = reaper.CountTrackMediaItems(track) }
   elseif kind == "item.duplicate" then
     local source_take = reaper.GetActiveTake(target)
     if not source_take then
