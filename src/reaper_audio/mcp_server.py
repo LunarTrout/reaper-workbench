@@ -43,6 +43,8 @@ from .daw.capture_jobs import (start_capture_job, capture_job_status,
                                capture_job_result, cancel_capture_job)
 from .context.state_query import (query_facts, changes_since as state_changes_since,
                                   availability as state_availability, public_stage)
+from .context.project_context import (build_project_context, estimated_tokens,
+                                       project_context_pages)
 from .daw.midi import MidiService
 from .daw.edit import run_edit, send_list, undo_receipt
 from .daw.receipt import FileReceiptStore
@@ -501,14 +503,7 @@ def _require_interpretation_receipt(receipt: str | None, project_id: str,
 def _require_capture_read_receipt(receipt: str | None, project_id: str,
                                   expected_revision: Mapping[str, Any] | None,
                                   capture_id: str,
-                                  archive_root: str | None = None,
-                   state_source: str | None = None,
-                   state_stage: str | None = None,
-                   state_window: list[float] | None = None,
-                   state_metrics: list[str] | None = None,
-                   state_status: str | None = None,
-                   state_since: int | None = None,
-                   state_detail: str = "summary") -> dict[str, Any]:
+                                  archive_root: str | None = None) -> dict[str, Any]:
     """Gate a model-facing archive read for one exact capture.
 
     Unlike a mutation gate, this must validate the receipt against the capture
@@ -1591,7 +1586,12 @@ def reaper_session(action: str = "health",
                    state_metrics: list[str] | None = None,
                    state_status: str | None = None,
                    state_since: int | None = None,
-                   state_detail: str = "summary") -> dict[str, Any]:
+                   state_detail: str = "summary",
+                   context_since: int | None = None,
+                   context_detail: str = "summary",
+                   context_max_facts: int = 50,
+                   context_pages: bool = False,
+                   context_page_bytes: int = 46000) -> dict[str, Any]:
     """Inspect the REAPER connection or list live instances/projects.
 
     action: health, list_instances, list_projects, or dirty. When several
@@ -1601,16 +1601,40 @@ def reaper_session(action: str = "health",
     """
     allowed = {"health", "list_instances", "list_projects", "dirty", "status",
                "preflight", "transport", "project", "settings", "app",
-               "wait_for_change", "state"}
+               "wait_for_change", "state", "context"}
     if action not in allowed:
         raise ValidationError("unknown session action", details={"action": action})
-    if action in {"status", "state", "preflight", "transport", "project", "settings",
+    if action in {"status", "state", "context", "preflight", "transport", "project", "settings",
                   "app", "wait_for_change"}:
         session = ProjectSession(ReaperBridge(bridge_session_id=bridge_session_id),
                                  project_id=project_id, archive_root=archive_root)
         if action == "status":
             return session.status(detail=detail, sections=sections,
                                   archive_root=archive_root)
+        if action == "context":
+            if not archive_root:
+                raise ValidationError("archive_root is required for action=context")
+            from .context.state_reads import read_state
+            selected = project_id or session.project_id
+            if not selected:
+                raise ValidationError("project_id is required when no project is active")
+            state = read_state(archive_root, selected)
+            if state is None:
+                raise ValidationError("no project state exists yet; run a capture or measure")
+            snapshot = session.snapshot(include_items=False)
+            map_document = {"tracks": snapshot.get("tracks") or [],
+                            "master": snapshot.get("master") or {},
+                            "routes": (snapshot.get("sends") or {}).get("rows") or []}
+            context = build_project_context(
+                state, map_document=map_document, fx_summary=[],
+                since_token=context_since, detail=context_detail,
+                max_facts=context_max_facts)
+            answer = {"ok": True, "action": "context", "context": context,
+                      "estimated_tokens": estimated_tokens(context)}
+            if context_pages:
+                answer["pages"] = project_context_pages(
+                    context, page_bytes=context_page_bytes)
+            return answer
         if action == "state":
             if not archive_root:
                 raise ValidationError("archive_root is required for action=state")
