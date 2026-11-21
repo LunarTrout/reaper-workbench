@@ -45,7 +45,7 @@ if _G.__reaper_audio_bridge_resident and not _G.__reaper_audio_bridge_reloading 
   return
 end
 _G.__reaper_audio_bridge_resident = true
-local bridge_build = "b27-2026-11-21"  -- typed item.timing_apply block geometry
+local bridge_build = "b30-2026-11-21"  -- typed item.timing_apply block geometry; loop-source setter
 -- A second boot inside the same REAPER Lua state must supersede the first:
 -- two loops would both keep heartbeating and the client would see two live
 -- bridges. Every loop compares this token before it reschedules; the newest
@@ -4566,11 +4566,14 @@ local function apply_edit(project, inspected)
     fail("stale_context", "The edit target no longer exists during apply",
          { kind = kind, target_guid = operation.target_guid })
   end
+  local check_index = 0
   local function checked_call(fn, ...)
+    check_index = check_index + 1
     local ok, result = pcall(fn, ...)
     if not ok or result == false then
       fail("transaction_apply_failed", "A REAPER setter rejected the edit",
            { kind = kind, target_guid = operation.target_guid,
+             call_index = check_index,
              reason = ok and "setter returned false" or tostring(result) })
     end
   end
@@ -5063,7 +5066,10 @@ local function apply_edit(project, inspected)
       checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "D_STARTOFFS",
                    block.source_start_s)
       checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "D_PLAYRATE", 1.0)
-      checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "B_LOOPSRC", 0)
+      -- B_LOOPSRC is a boolean take attribute whose setter returns false for
+      -- some newly created takes; the default is already non-looping and the
+      -- geometry read-back verifies the actual state.
+      reaper.SetMediaItemTakeInfo_Value(new_take, "B_LOOPSRC", 0)
       checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "B_PPITCH",
                    take_ppitch)
       checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "I_CHANMODE",
@@ -5073,9 +5079,8 @@ local function apply_edit(project, inspected)
       checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "D_PAN", take_pan)
       checked_call(reaper.SetMediaItemTakeInfo_Value, new_take, "D_PITCH",
                    take_pitch)
-      -- Seconds, not beats: the plan's geometry is in project seconds.
-      checked_call(reaper.SetMediaItemTakeInfo_Value, new_take,
-                   "C_BEATATTACHMODE", 0)
+      -- C_BEATATTACHMODE is an item attribute, not a take attribute.
+      checked_call(reaper.SetMediaItemInfo_Value, item, "C_BEATATTACHMODE", 0)
       if name_ok and type(take_name) == "string" and take_name ~= "" then
         checked_call(reaper.GetSetMediaItemTakeInfo_String, new_take, "P_NAME",
                      take_name, true)

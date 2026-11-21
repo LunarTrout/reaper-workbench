@@ -236,7 +236,8 @@ def build_timing_plan(events: Sequence[Mapping[str, Any]],
                       group_gap_s: float = 0.25,
                       group_shift_s: float = 0.012,
                       protected_ranges: Iterable[Mapping[str, Any]] = (),
-                      fade_s: float = 0.0045) -> dict[str, Any]:
+                      fade_s: float = 0.0045,
+                      cut_pre_roll_s: float = 0.0) -> dict[str, Any]:
     """Group matched events into move blocks and return 1x clip geometry.
 
     A block is a contiguous run of events whose required shifts differ by less
@@ -276,6 +277,7 @@ def build_timing_plan(events: Sequence[Mapping[str, Any]],
             groups.append([item])
     blocks: list[dict[str, Any]] = []
     issues: list[dict[str, Any]] = []
+    previous_end = 0.0
     for group in groups:
         first_index, first_assignment = group[0]
         last_index, last_assignment = group[-1]
@@ -284,8 +286,16 @@ def build_timing_plan(events: Sequence[Mapping[str, Any]],
         shifts = [float(assignment["offset_s"]) * strength
                   for _, assignment in group]
         shift = float(np.median(shifts))
-        start_s = 0.0 if first_index == 0 else (
-            float(ordered[first_index - 1]["source_s"]) + first_s) / 2.0
+        if first_index == 0:
+            start_s = 0.0
+        elif cut_pre_roll_s > 0:
+            # Cut shortly before the first attack of the block rather than
+            # halfway between peaks.  The previous block gets a short fade
+            # before the protected attack, and no source material is repeated.
+            start_s = max(previous_end, first_s - cut_pre_roll_s)
+            start_s = min(start_s, first_s - 1e-4)
+        else:
+            start_s = (float(ordered[first_index - 1]["source_s"]) + first_s) / 2.0
         end_s = duration_s if last_index == len(ordered) - 1 else (
             last_s + float(ordered[last_index + 1]["source_s"])) / 2.0
         end_s = min(duration_s, max(end_s, last_s + 1e-4))
@@ -302,6 +312,7 @@ def build_timing_plan(events: Sequence[Mapping[str, Any]],
             "event_count": len(group),
         }
         blocks.append(block)
+        previous_end = end_s
         if target_start < 0 or target_end > duration_s:
             issues.append({"code": "source_handles_unavailable",
                            "block": block,
@@ -309,6 +320,14 @@ def build_timing_plan(events: Sequence[Mapping[str, Any]],
         if _overlaps(start_s, end_s, protected_ranges):
             issues.append({"code": "protected_range", "block": block,
                            "next_action": "keep this block or lower strength"})
+    if cut_pre_roll_s > 0:
+        # Pre-roll cuts are defined from the next attack, so close the source
+        # gap by making each block end exactly where the next one starts.
+        for left, right in zip(blocks, blocks[1:]):
+            left["end_s"] = right["start_s"]
+            left["source_offset_s"] = left["start_s"]
+            left["target_end_s"] = round(left["target_start_s"] +
+                                         (right["start_s"] - left["start_s"]), 7)
     for left, right in zip(blocks, blocks[1:]):
         delta = float(right["shift_s"]) - float(left["shift_s"])
         if abs(delta) >= 0.030:
