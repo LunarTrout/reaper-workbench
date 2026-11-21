@@ -228,12 +228,14 @@ def _project_section(document: Mapping[str, Any] | None,
         project_id = (_text(container.get("project_id"))
                       or _text(nested.get("project_id")))
     path = None
-    if container is not None:
+    if document is not None:
+        path = _text(document.get("path"))
+    if path is None and container is not None:
         path = (_text(container.get("path"))
                 or _text(container.get("project_path"))
                 or _text(nested.get("path")))
-    revision = None
-    if container is not None:
+    revision = document.get("revision") if document is not None else None
+    if revision is None and container is not None:
         revision = container.get("revision")
         if revision is None:
             revision = nested.get("revision")

@@ -46,6 +46,9 @@ from .context.state_query import (query_facts, changes_since as state_changes_si
 from .context.project_context import (build_project_context, estimated_tokens,
                                        project_context_pages)
 from .context.journal import JournalStore, make_entry
+from .context.project_state import (StateStore, ProjectState, fingerprint_track,
+                                    fingerprint_master)
+from .context.state_diff import state_changes as live_state_changes
 from .daw.midi import MidiService
 from .daw.edit import run_edit, send_list, undo_receipt
 from .daw.receipt import FileReceiptStore
@@ -1622,12 +1625,45 @@ def reaper_session(action: str = "health",
             state = read_state(archive_root, selected)
             if state is None:
                 raise ValidationError("no project state exists yet; run a capture or measure")
+            snapshot = session.snapshot(include_items=False)
+            live_tracks = {str(t.get("guid")): fingerprint_track(t)
+                           for t in (snapshot.get("tracks") or [])
+                           if t.get("guid")}
+            live_master = snapshot.get("master") or {}
+            try:
+                live = state_changes(state.get("objects") or {},
+                                     {"tracks": live_tracks,
+                                      "master": fingerprint_master(live_master) if live_master else None})
+                if live.get("changed"):
+                    ps = ProjectState(StateStore(archive_root), selected)
+                    ps.mark_stale(live.get("changed") or {},
+                                  routing_changed=bool(live.get("routing_changed")))
+                    ps.upsert_objects(tracks=list(live_tracks.values()),
+                                      master=live_master or None)
+                    ps.save()
+                    state = ps.state
+            except Exception:
+                pass
             map_document = state.get("map")
             if not isinstance(map_document, Mapping):
-                snapshot = session.snapshot(include_items=False)
                 map_document = {"tracks": snapshot.get("tracks") or [],
-                                "master": snapshot.get("master") or {},
+                                "master": live_master,
                                 "routes": (snapshot.get("sends") or {}).get("rows") or []}
+            else:
+                # The state map can lag a rename or fader move; the live rows
+                # are the identity the context reports.
+                by_guid = {str(row.get("guid")): row
+                           for row in (snapshot.get("tracks") or [])}
+                map_document = dict(map_document)
+                map_document["tracks"] = [
+                    {**row, "name": by_guid.get(str(row.get("guid")), {}).get("name",
+                                                                             row.get("name"))}
+                    for row in (map_document.get("tracks") or [])]
+                map_document["master"] = live_master
+            state["revision"] = snapshot.get("revision") or state.get("revision")
+            state["path"] = snapshot.get("path") or state.get("path")
+            if isinstance(state.get("project"), dict):
+                state["project"]["revision"] = state["revision"]
             fx_rows = []
             if isinstance(map_document, Mapping):
                 fx_rows = list(map_document.get("fx_summary") or [])
@@ -1635,11 +1671,20 @@ def reaper_session(action: str = "health",
                 state, map_document=map_document, fx_summary=fx_rows,
                 since_token=context_since, detail=context_detail,
                 max_facts=context_max_facts)
+            if context_since is not None:
+                context = {key: context[key] for key in
+                           ("project", "health", "changes", "next")
+                           if key in context}
+                changes = context.setdefault("changes", {})
+                if isinstance(changes, dict):
+                    changes["revision"] = snapshot.get("revision")
             answer = {"ok": True, "action": "context", "context": context,
                       "estimated_tokens": estimated_tokens(context)}
             if context_pages:
-                answer["pages"] = project_context_pages(
-                    context, page_bytes=context_page_bytes)
+                pages = project_context_pages(context, page_bytes=context_page_bytes)
+                return {"ok": True, "action": "context", "pages": pages,
+                        "estimated_tokens": estimated_tokens(context),
+                        "context": None}
             return answer
         if action == "state":
             if not archive_root:
