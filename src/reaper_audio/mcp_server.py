@@ -54,6 +54,7 @@ from .daw.edit import run_edit, send_list, undo_receipt
 from .daw.receipt import FileReceiptStore
 from .daw.timing_service import analyze_timing, inspect_timing, plan_timing
 from .daw.timing_apply import apply_timing_plan, undo_timing_apply
+from .daw.timing_preview import render_timing_preview
 from .daw.reference import cached_reference_report
 from .daw.session_control import app_action as _app_action
 from .daw.session_status import merge_digest_routing
@@ -2222,7 +2223,7 @@ def reaper_media(action: str,
 
 @server.tool()
 @_guard
-def reaper_timing(action: Literal["analyze", "plan", "inspect", "apply", "undo"],
+def reaper_timing(action: Literal["analyze", "plan", "inspect", "preview", "apply", "undo"],
                   project_id: str | None = None,
                   track_guid: str | None = None,
                   item_guid: str | None = None,
@@ -2242,7 +2243,9 @@ def reaper_timing(action: Literal["analyze", "plan", "inspect", "apply", "undo"]
                   reference_events: list[dict[str, Any]] | None = None,
                   expected_revision: dict[str, Any] | None = None,
                   dry_run: bool = False,
-                  reason: str | None = None) -> dict[str, Any]:
+                  reason: str | None = None,
+                  archive_root: str | None = None,
+                  bpm: float | None = None) -> dict[str, Any]:
     """Analyze audio timing against the project grid and build a 1x clip plan.
 
     analyze resolves one file-backed audio item, detects attacks and returns an
@@ -2276,6 +2279,21 @@ def reaper_timing(action: Literal["analyze", "plan", "inspect", "apply", "undo"]
     if action == "inspect":
         return {"ok": True, "action": action,
                 **inspect_timing(analysis_id=analysis_id, plan_id=plan_id)}
+    if action == "preview":
+        if not isinstance(plan_id, str) or not plan_id:
+            raise ValidationError("plan_id is required for preview")
+        from .daw.timing_service import PLANS
+        plan = PLANS.get(plan_id)
+        if plan is None:
+            raise ValidationError("Unknown timing plan_id",
+                                  details={"code": "timing_plan_unknown",
+                                           "plan_id": plan_id})
+        if archive_root:
+            out_dir = Path(archive_root) / "timing-previews"
+        else:
+            out_dir = Path.cwd() / ".timing-previews"
+        preview = render_timing_preview(plan, out_dir=out_dir, bpm=bpm)
+        return {"ok": True, "action": action, "plan_id": plan_id, **preview}
     if action == "apply":
         _handbook_required()
         if not isinstance(plan_id, str) or not plan_id:
@@ -2299,7 +2317,7 @@ def reaper_timing(action: Literal["analyze", "plan", "inspect", "apply", "undo"]
         session = _session(project_id)
         return {"ok": True, "action": action, **undo_timing_apply(
             session, plan_id, project_id=project_id, reason=reason)}
-    raise ValidationError("action must be analyze, plan, inspect, apply or undo")
+    raise ValidationError("action must be analyze, plan, inspect, preview, apply or undo")
 
 
 @server.tool()
