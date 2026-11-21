@@ -1,0 +1,204 @@
+{
+  "schema": "reaper-workbench.timing-benchmark-manifest/1",
+  "audio_policy": "Audio is downloaded by the user and never committed. Each entry records the source page and the terms to verify before use.",
+  "splits": {
+    "dev": "tune thresholds and profiles only",
+    "validation": "untouched until the protocol is frozen",
+    "holdout": "real expert edits, including owner material"
+  },
+  "datasets": [
+    {
+      "id": "guitarset",
+      "kind": "events_and_audio",
+      "instrument": "acoustic_guitar",
+      "url": "https://archives.ismir.net/ismir2018/paper/000188.pdf",
+      "data_url": "https://huggingface.co/datasets/jhartquist/guitarset",
+      "annotation": "note onset/offset, midi pitch, string, beats, downbeats, chords",
+      "role": "event detection and metrical targeting on guitar",
+      "limit": "acoustic excerpts, not high-gain rhythm guitar",
+      "license_note": "GuitarSet v1.1.0; check the dataset card and original paper before redistribution"
+    },
+    {
+      "id": "moisesdb",
+      "kind": "stems",
+      "instrument": "multi",
+      "url": "https://arxiv.org/html/2307.15913",
+      "annotation": "stem taxonomy including distorted/clean electric guitar, lead/background vocals, bass, drums",
+      "role": "real stems and musical context",
+      "limit": "not a corrected-timing pair; do not call it ground truth for timing",
+      "license_note": "free for non-commercial research; verify current terms"
+    },
+    {
+      "id": "medleydb2",
+      "kind": "raw_and_stems",
+      "instrument": "multi",
+      "url": "https://medleydb.weebly.com/",
+      "annotation": "melody f0, instrument activations, raw and processed stems",
+      "role": "real vocal/instrument material and context",
+      "limit": "raw is time-shifted to match stems, so it is not an unedited timing reference",
+      "license_note": "CC BY-NC-SA per dataset description; verify"
+    },
+    {
+      "id": "dali",
+      "kind": "audio_and_vocal_notes",
+      "instrument": "vocal",
+      "url": "https://github.com/gabolsgabs/DALI",
+      "annotation": "time-aligned vocal notes, syllables, words, phrases",
+      "role": "vocal event and syllable-boundary targets",
+      "limit": "annotation is not a corrected-audio pair or a universal grid",
+      "license_note": "research dataset; check repository terms"
+    },
+    {
+      "id": "vocadito",
+      "kind": "vocal_audio_and_notes",
+      "instrument": "vocal",
+      "url": "https://arxiv.org/pdf/2110.05580",
+      "annotation": "f0, two note annotations, lyrics",
+      "role": "vocal event and note boundaries",
+      "limit": "40 short excerpts; not a timing-correction pair",
+      "license_note": "research dataset; check terms"
+    },
+    {
+      "id": "asap",
+      "kind": "midi_and_score",
+      "instrument": "piano",
+      "url": "https://cnam.hal.science/hal-02929324v1/document",
+      "annotation": "performance MIDI, quantized MIDI, MusicXML, beats/downbeats",
+      "role": "rhythm-target logic and symbolic quantisation",
+      "limit": "piano/MIDI; does not prove audio edit quality",
+      "license_note": "academic dataset; check terms"
+    },
+    {
+      "id": "groove_midi",
+      "kind": "performance_midi",
+      "instrument": "drums",
+      "url": "https://magenta.tensorflow.org/datasets/groove",
+      "annotation": "human MIDI timing/velocity, quantized score, drummer-level splits",
+      "role": "human performance vs quantised events; timing metrics",
+      "limit": "MIDI and rendered audio, not vocal/guitar audio",
+      "license_note": "CC BY 4.0 per dataset page; verify"
+    },
+    {
+      "id": "rys_align_bench",
+      "kind": "alignment_benchmark",
+      "instrument": "vocal",
+      "url": "https://github.com/rysupaudio-lab/rysupalign-bench",
+      "annotation": "real singer-pair alignment truth and synthetic exact cases",
+      "role": "audio-to-audio vocal alignment metrics and scorers",
+      "limit": "real pairs are different singers, not the same take before/after",
+      "license_note": "check repository and source-dataset terms"
+    }
+  ],
+  "real_pairs": [
+    {
+      "id": "ollie_wright_guitars",
+      "instrument": "guitar_bass",
+      "url": "https://www.soundonsound.com/techniques/mix-rescue-ollie-wright-audio",
+      "before": "guitarsuntimed.wav",
+      "after": "guitarstimed.wav",
+      "context": "rhythm guitars and bass in the final mix, before/after human timing edits",
+      "truth": "measured_shifts",
+      "license_note": "Sound On Sound educational media; do not redistribute audio"
+    },
+    {
+      "id": "ollie_wright_vocal",
+      "instrument": "vocal",
+      "url": "https://www.soundonsound.com/techniques/mix-rescue-ollie-wright-audio",
+      "before": "lvunedited.wav",
+      "after": "lvedited.wav",
+      "context": "lead vocal before/after Melodyne pitch and Reaper timing edits",
+      "truth": "measured_shifts",
+      "license_note": "Sound On Sound educational media; do not redistribute audio"
+    },
+    {
+      "id": "tom_mckenzie_timing",
+      "instrument": "drums_guitar_bass_vocal",
+      "url": "https://www.soundonsound.com/techniques/mix-rescue-tom-mckenzie-media",
+      "before": "Timing02_Unedited.wav",
+      "after": "Timing01_Edited.wav",
+      "context": "same mix section; raw multitracks and full Reaper remix project available",
+      "truth": "project_geometry",
+      "license_note": "Sound On Sound educational media; do not redistribute audio"
+    },
+    {
+      "id": "we_fell_drums",
+      "instrument": "drums",
+      "url": "https://www.soundonsound.com/techniques/mix-rescue-we-fell-sky-media",
+      "before": "DrumsUntimed",
+      "after": "DrumsTimed",
+      "context": "more than 500 human timing edits to live drums",
+      "truth": "measured_shifts",
+      "license_note": "Sound On Sound educational media; do not redistribute audio"
+    },
+    {
+      "id": "wolfs_head_corrections",
+      "instrument": "full_mix",
+      "url": "https://www.soundonsound.com/techniques/mix-rescue-wolfs-head-vixen-morris-band-media",
+      "before": "corrections out",
+      "after": "CorrectionsIn",
+      "context": "drums quantised with relative second-beat shift; other instruments edited to different degrees",
+      "truth": "perceptual_ab",
+      "license_note": "Sound On Sound educational media; do not redistribute audio"
+    },
+    {
+      "id": "lockdown_wish_you_well",
+      "instrument": "full_mix",
+      "url": "https://www.soundonsound.com/techniques/lockdown-mixdown-audio-examples",
+      "before": "Wish You Well original timing.wav",
+      "after": "Wish You Well corrected timing.wav",
+      "context": "same mix except timing corrections",
+      "truth": "perceptual_ab",
+      "license_note": "Sound On Sound educational media; do not redistribute audio"
+    },
+    {
+      "id": "april_blues_vocal",
+      "instrument": "vocal",
+      "url": "https://www.soundonsound.com/techniques/mixing-pop-vocals-audio-examples",
+      "before": "pvmt_01_Raw",
+      "after": "pvmt_03_FixesOut",
+      "context": "same lead vocal before and after pitch/timing tweaks",
+      "truth": "measured_shifts",
+      "license_note": "Sound On Sound educational media; do not redistribute audio"
+    },
+    {
+      "id": "cambridge_timing_context",
+      "instrument": "guitar_bass",
+      "url": "https://cambridge-mt.com/ms/ch6/",
+      "before": "Ex06.01",
+      "after": "Ex06.02",
+      "context": "backing track without/with extensive bass and guitar timing edits",
+      "truth": "perceptual_ab",
+      "license_note": "Mixing Secrets educational resources; verify terms"
+    },
+    {
+      "id": "cambridge_combined",
+      "instrument": "full_mix",
+      "url": "https://cambridge-mt.com/ms/ch6/",
+      "before": "Ex06.17",
+      "after": "Ex06.16",
+      "context": "final remix section without/with combined timing and tuning corrections",
+      "truth": "perceptual_ab",
+      "license_note": "Mixing Secrets educational resources; verify terms"
+    }
+  ],
+  "raw_libraries": [
+    {
+      "id": "mixing_secrets_multitracks",
+      "url": "https://www.cambridge-mt.com/ms3/mtk/",
+      "role": "raw multitracks, preview mixes, some DAW projects",
+      "license_note": "free for educational use; commercial use requires permission"
+    },
+    {
+      "id": "open_multitrack_testbed",
+      "url": "https://www.semanticaudio.ac.uk/blog/the-open-multitrack-testbed/",
+      "role": "raw tracks, multiple mixes, DAW files; searchable metadata",
+      "license_note": "Creative Commons or similar per item; verify"
+    },
+    {
+      "id": "rawstems",
+      "url": "https://huggingface.co/datasets/yongyizang/RawStems",
+      "role": "unprocessed stems with instrument taxonomy",
+      "license_note": "annotations Apache 2.0; audio rights belong to original creators"
+    }
+  ]
+}

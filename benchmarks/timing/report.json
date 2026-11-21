@@ -1,0 +1,150 @@
+{
+  "schema": "reaper-workbench.timing-synthetic-report/1",
+  "note": "exact-truth harness only; not a real-mix quality claim",
+  "cases": [
+    {
+      "case": "clicks_mixed_shifts",
+      "event_scores": {
+        "precision": 0.6,
+        "recall": 0.6,
+        "f1": 0.6,
+        "matched": 3,
+        "truth_count": 5,
+        "predicted_count": 5
+      },
+      "targets": [
+        0.2,
+        0.45,
+        0.7,
+        0.95,
+        1.2
+      ],
+      "detected": [
+        0.2100208,
+        0.4213333,
+        0.7154583,
+        0.9804583,
+        1.1884583
+      ],
+      "baselines": {
+        "noop": {
+          "count": 3,
+          "mae_s": 0.0123403,
+          "p90_s": 0.014675,
+          "geometry": {
+            "matched": 3,
+            "missing": 0,
+            "duplicated": 0,
+            "start_mae_s": 0.2546458,
+            "start_p90_s": 0.4438583,
+            "length_mae_s": 0.076,
+            "pairs": [
+              {
+                "truth_start_s": 0.2,
+                "predicted_start_s": 0.2100208,
+                "start_error_s": 0.010020799999999996,
+                "truth_length_s": 0.0040000000000000036,
+                "predicted_length_s": 0.08000000000000002,
+                "length_error_s": 0.07600000000000001
+              },
+              {
+                "truth_start_s": 0.45,
+                "predicted_start_s": 0.7154583,
+                "start_error_s": 0.2654583,
+                "truth_length_s": 0.0040000000000000036,
+                "predicted_length_s": 0.07999999999999996,
+                "length_error_s": 0.07599999999999996
+              },
+              {
+                "truth_start_s": 0.7,
+                "predicted_start_s": 1.1884583,
+                "start_error_s": 0.4884583,
+                "truth_length_s": 0.0040000000000000036,
+                "predicted_length_s": 0.08000000000000007,
+                "length_error_s": 0.07600000000000007
+              }
+            ]
+          }
+        },
+        "global_shift": {
+          "count": 2,
+          "mae_s": 0.0027187,
+          "p90_s": 0.0048937,
+          "geometry": {
+            "matched": 3,
+            "missing": 0,
+            "duplicated": 0,
+            "start_mae_s": 0.244625,
+            "start_p90_s": 0.4338375,
+            "length_mae_s": 0.076,
+            "pairs": [
+              {
+                "truth_start_s": 0.2,
+                "predicted_start_s": 0.2,
+                "start_error_s": 0.0,
+                "truth_length_s": 0.0040000000000000036,
+                "predicted_length_s": 0.08000000000000002,
+                "length_error_s": 0.07600000000000001
+              },
+              {
+                "truth_start_s": 0.45,
+                "predicted_start_s": 0.7054374999999999,
+                "start_error_s": 0.25543749999999993,
+                "truth_length_s": 0.0040000000000000036,
+                "predicted_length_s": 0.08000000000000007,
+                "length_error_s": 0.07600000000000007
+              },
+              {
+                "truth_start_s": 0.7,
+                "predicted_start_s": 1.1784375,
+                "start_error_s": 0.47843750000000007,
+                "truth_length_s": 0.0040000000000000036,
+                "predicted_length_s": 0.08000000000000007,
+                "length_error_s": 0.07600000000000007
+              }
+            ]
+          }
+        },
+        "nearest_grid": {
+          "count": 3,
+          "mae_s": 0.0,
+          "p90_s": 0.0,
+          "geometry": {
+            "matched": 3,
+            "missing": 0,
+            "duplicated": 0,
+            "start_mae_s": 0.25,
+            "start_p90_s": 0.45,
+            "length_mae_s": 0.076,
+            "pairs": [
+              {
+                "truth_start_s": 0.2,
+                "predicted_start_s": 0.2,
+                "start_error_s": 0.0,
+                "truth_length_s": 0.0040000000000000036,
+                "predicted_length_s": 0.08000000000000002,
+                "length_error_s": 0.07600000000000001
+              },
+              {
+                "truth_start_s": 0.45,
+                "predicted_start_s": 0.7,
+                "start_error_s": 0.24999999999999994,
+                "truth_length_s": 0.0040000000000000036,
+                "predicted_length_s": 0.07999999999999996,
+                "length_error_s": 0.07599999999999996
+              },
+              {
+                "truth_start_s": 0.7,
+                "predicted_start_s": 1.2,
+                "start_error_s": 0.5,
+                "truth_length_s": 0.0040000000000000036,
+                "predicted_length_s": 0.08000000000000007,
+                "length_error_s": 0.07600000000000007
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
