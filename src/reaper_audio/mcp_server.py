@@ -3848,10 +3848,16 @@ def reaper_edit(mode: str,
                                   details={"code": "journal_required"})
     if mode == "undo" and receipt:
         session = _session(project_id, bridge_session_id)
-        return {"ok": True, **undo_receipt(
+        undone = {"ok": True, **undo_receipt(
             session, receipt, receipt_store=_receipt_store(archive_root),
             allow_overwrite=allow_overwrite, verify=verify,
             measure=_edit_measure(session))}
+        record = undone.get("receipt_record") or {}
+        _append_journal(archive_root, project_id, undone,
+                        record.get("operations") or [],
+                        journal=journal, why=reason, kind="undo",
+                        undoes=receipt)
+        return undone
     expected = _revision(expected_revision, project_id=project_id)
     session = _session(project_id, bridge_session_id)
     _current_context(session, expected)
