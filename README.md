@@ -33,6 +33,9 @@ The server registers 41 tools; the live registry is authoritative and `reaper_ca
 - Search a bundled catalog of **732 documented ReaScript functions** (catalog generated from the official v7.85 reference), inspect signatures, and issue typed API calls. Runtime availability still depends on the installed REAPER version.
 - Search and invoke REAPER Actions for operations that are available only through the Action List.
 - Prepare supported edit batches, preview their intended targets and values, apply them against an expected revision, read back the result, and undo the latest transaction where REAPER permits it.
+- Read one project context (`session(action="context")`) built from the per-project state: compact map, health, measured-fact coverage, FX set-parameter summary, changes, audio references and detail pointers; pass the returned state token to receive only deltas.
+- Query facts already measured (`session(action="state")`) without re-rendering, and see which of them are current or stale.
+- Append a decision entry to the project journal on every apply and undo; a change without a non-empty reason is refused.
 
 The catalog is a discovery surface, not a claim that every API function has been exercised or has a safe transaction wrapper. Generic API calls and Actions are low-level operations; they are not automatically covered by the library's preview/undo guarantees.
 
