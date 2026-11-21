@@ -947,7 +947,26 @@ class ProjectState:
     def objects(self) -> Mapping[str, Any]:
         return self._state["objects"]
 
+    def compact(self) -> dict[str, Any]:
+        """Drop values that no reader needs: superseded facts keep identity only.
+
+        A superseded fact is history, not a value the agent may quote; its
+        metrics and fingerprints are the bulk of the document.  Status, key,
+        revision, timestamps and who replaced it stay, so the lineage is intact.
+        """
+        removed = 0
+        for fact in self._state.get("facts", {}).values():
+            if fact.get("status") != STATUS_SUPERSEDED:
+                continue
+            if fact.get("metrics"):
+                fact["metrics"] = {}
+                removed += 1
+            fact["fingerprints"] = {}
+            fact["compacted"] = True
+        return {"compacted": removed}
+
     def save(self) -> Path:
+        self.compact()
         return self._store.save(self._state)
 
     def upsert_map(self, mapping: Mapping[str, Any]) -> dict[str, Any]:
