@@ -4985,121 +4985,41 @@ def reaper_release(analysis_id: str) -> dict[str, Any]:
 
 
 MODEL_GUIDE: dict[str, Any] = {
-    "schema": "reaper-workbench.model-guide/1",
+    "schema": "reaper-workbench.model-guide/2",
 
-    "modes": ("The work mode (strict / advisory / off), the stale-share threshold and the "
-              "lock belong to the user: change them only at the user's explicit request "
-              "through reaper_mode, never on your own and never to pass a gate; if the "
-              "mode blocks the work, ask. Every response repeats it."),
-    "tokens": ("An edit needs a current structural_token from reaper_structural_token "
-               "(project, instance, epoch, revision and the project-map digest) - one cheap "
-               "read, no capture, no audio. A full panorama is needed only for audio claims "
-               "and global verdicts; a panorama receipt is still accepted for compatibility."),    "purpose": ("Canonical navigation contract for a model using REAPER Workbench. "
-                "It names the complete panorama path, current-state updates, exact query, "
-                "operation discovery and verification; it does not prescribe a genre "
-                "or a fixed mixing recipe."),
+    "modes": ("The work mode (strict / advisory / off), the stale-share threshold and "
+              "the lock belong to the user: change them only at the user's explicit "
+              "request through reaper_mode, never to pass a gate. Every response "
+              "repeats the current mode."),
+    "tokens": ("An edit needs a current structural_token from "
+               "reaper_structural_token: one cheap read, no capture, no audio."),
+    "purpose": ("Canonical navigation contract for a model using REAPER Workbench. "
+                "Project context comes from one state document; measurements are "
+                "facts with revisions, not opinions."),
     "project_context": {
-        "start": "reaper_panorama_open() with no mode argument (default auto).",
-        "auto": ("returns the complete full view with receipt/context_token when it fits "
-                 "the measured budget; otherwise page 1 plus a manifest. An explicit "
-                 "mode='single' over budget also falls back to pages."),
-        "pages": ("pages are the complete path. If manifest.page_ids is present, fetch "
-                  "every id in order. If it is omitted for a very large set, enumerate "
-                  "manifest.page_id_pattern for 1..page_count. Do not skip a page."),
-        "ack": ("reaper_panorama_ack with every page_hash in order, or with "
-                "manifest_sha256 alone. A partial set returns missing page ids and mints "
-                "no receipt or context token."),
-        "continuity": ("The first complete panorama establishes the model's known "
-                       "project state. Keep the latest context_token as the identity of "
-                       "that state. For routine updates, call "
-                       "reaper_panorama_changes_since with this token; do not repeatedly "
-                       "re-anchor to the first capture or request the whole panorama "
-                       "after each edit. Merge returned changed facts into the known "
-                       "state. A new chat or an unprovable/lost token starts from a full "
-                       "panorama."),
-        "stale_or_lost": ("a stale revision needs a new open; reaper_panorama_refresh "
-                          "re-opens the current capture. A handle survives a server "
-                          "restart but expires after its declared TTL."),
-        "claim_limit": ("the receipt proves these exact pages were served, not that the "
-                        "model read them and not that it heard audio."),
-    },
-    "exact_rows": {
-        "tool": "reaper_panorama_query",
-        "selectors": ["data", "objects", "interval", "series", "metrics", "kinds",
-                      "bands_hz", "resolution_s"],
-        "rule": ("one coherent selection per call; use it for relation edges, series "
-                 "cells, MIDI notes and envelope points. A selection too large for one "
-                 "result becomes complete result_page pages; fetch every page and ack. "
-                 "Result-page ack proves exact reconstruction only and mints no receipt, "
-                 "context token or edit permission. Never treat a missing or aggregated "
-                 "value as proof of absence."),
-    },
-    "scoped_analysis": {
-        "tool": "reaper_analyze",
-        "arguments": ["capture_id", "analyzers", "source_ids", "intervals"],
-        "catalog": "reaper_capabilities(mode='tools').analyzers",
-        "rule": ("one batch runs several stable analyzer IDs against named sources and "
-                 "exact song intervals. The result is explicitly scoped, not whole-project "
-                 "coverage, and is bound to its capture/revision. Cost classes are relative, "
-                 "not measured seconds. Large scoped results use complete result pages."),
-        "no_loop": ("a full panorama is not an automatic next step after edits or scoped "
-                    "analysis. Keep working from the acknowledged view, change journal and "
-                    "local evidence while they support the next decision; request a new "
-                    "full panorama only when the next consequential global decision needs "
-                    "fresh whole-project evidence, the user asks for a complete overview, "
-                    "or before a final whole-project conclusion."),
-    },
-    "updates": {
-        "capture": ("For normal continuity, reaper_panorama_changes_since uses the "
-                    "latest context_token and returns not_modified or only the net "
-                    "current facts newer than that token. An explicit base_capture_id / "
-                    "base_fact_root without a token is an informational archived-capture "
-                    "comparison, not the normal model-state update."),
-        "mutation": ("reaper_edit / reaper_api_call / reaper_action / "
-                     "reaper_render_candidate return an update: stable object ids and "
-                     "only the new current values, the current revision and the "
-                     "successor token. No internal mutation record, base/target "
-                     "revision or before/after pair is exposed."),
-        "inline": "a small update carries context_token in the same response.",
-        "paged": ("an update too large for one result returns status='change_page' with "
-                  "page 1, a manifest and a handle. Fetch every declared change page, "
-                  "then ack all hashes or the manifest hash; only that ack advances the "
-                  "token, exactly once."),
-        "identity": ("ops address stable object ids and semantic paths, not array "
-                     "positions; an insertion or FX move must not rename later objects."),
-        "metric_table": ("measurement-heavy updates may carry the same exact metric ops "
-                         "once in metric_table: integer-indexed columns plus "
-                         "exact dictionaries and path_pattern. Expand every row; no "
-                         "changed cell is omitted."),
-        "comparability": ("computed only from identity, method/version, metric, unit, "
-                          "stage, channel/window and grid criteria. Missing evidence is "
-                          "unknown; a stated mismatch is incomparable; each side's exact "
-                          "measured values are still reported in an explicit comparison. "
-                          "A normal state update is not a numeric metric difference. "
-                          "No better/worse verdict."),
-    },
-    "discovery": {
-        "tasks": "reaper_capabilities(mode='tools')",
-        "api_index": "reaper_capabilities(mode='summary') then mode='domain'.",
-        "search": "reaper_api_search(query) returns candidates, not recommendations.",
-        "dispatch": ("reaper_api_call with a typed handle; reaper_action for a named "
-                     "Action. Neither is a separate tool per ReaScript function."),
+        "start": "reaper_session(action='context', archive_root=...)",
+        "contents": ("project/revision, compact map, health, facts summary, FX "
+                     "summary, changes and audio references"),
+        "delta": ("pass since=state_token to receive only project, health, changes "
+                  "and next, with the live revision; do not re-read the map"),
+        "pages": ("pages=true returns pages and no duplicate full context"),
+        "state": ("reaper_session(action='state', ...) reads already measured facts "
+                  "without a render; missing values mean not measured, not absent"),
+        "claim_limit": "A state token identifies the revision the facts belong to; it is not a quality verdict.",
     },
     "edits": {
-        "flow": ("preview a plan (no token needed), apply with expected_revision plus the "
-                 "structural_token, read back the affected "
-                 "objects and the returned update. Save only when requested."),
-        "authority": ("only a complete panorama receipt/context token unlocks a project "
-                      "edit; a read_scope is read-only."),
+        "preview": "reaper_edit(mode='preview', ...) returns a plan without touching the project",
+        "apply": "apply needs the plan's expected_revision, a structural token and journal.why",
+        "undo": "undo needs the apply receipt or plan id plus the revision it produced; it is journaled too",
+        "verify": "verify is a real before/after measurement; compare it, do not assume the sign",
     },
-    "verification": [
-        "keep project_id, instance/epoch, change_count, capture_id and receipt/token together",
-        "check coverage, counts, units, method/version, stage, window and provenance before a conclusion",
-        "distinguish saved, read back, measured and auditioned",
-        "a render mismatch is failed verification; do not retry blindly",
+    "anti_patterns": [
+        "Do not quote a number without a measurement, evidence token or receipt.",
+        "Do not invent thresholds; policy values are the only thresholds.",
+        "Do not treat a missing or aggregated value as proof of absence.",
+        "Do not reload the whole context after every edit; use the state delta.",
     ],
 }
-
 
 @server.resource("reaper://guide/model", name="Model navigation guide",
                  description=("Canonical, always-current MCP navigation contract: full "

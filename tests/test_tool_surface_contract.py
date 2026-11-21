@@ -14,7 +14,7 @@ from pathlib import Path
 
 from reaper_audio import mcp_server
 
-README = Path(__file__).resolve().parents[1] / "docs" / "MCP-README-LLM.md"
+README = Path(__file__).resolve().parents[1] / "README.md"
 
 _WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
           "seven": 7, "eight": 8, "nine": 9, "ten": 10}
@@ -59,14 +59,11 @@ def test_every_group_has_a_purpose_and_context() -> None:
 
 def test_readme_count_matches_the_live_registry() -> None:
     text = README.read_text(encoding="utf-8")
-    match = re.search(r"registers (\d+) tools and (\w+) resource", text)
-    assert match, "the README must state the live tool/resource counts"
-    stated_tools = int(match.group(1))
-    stated_templates = _WORDS.get(match.group(2).lower())
-    live_tools = len(_registered_tools())
-    live_templates = len(mcp_server.server._resource_manager._templates)
-    assert stated_tools == live_tools
-    assert stated_templates == live_templates
+    match = re.search(r"\*\*(\d+) tools in (\w+) groups\*\*", text)
+    assert match, "the README must state the live tool/group counts"
+    assert int(match.group(1)) == len(_registered_tools())
+    stated_groups = int(match.group(2)) if match.group(2).isdigit() else _WORDS.get(match.group(2).lower())
+    assert stated_groups == len(mcp_server.TOOL_SURFACE)
 
 
 def test_audio_delta_lives_inside_mix_evidence_not_a_new_tool() -> None:
@@ -105,37 +102,28 @@ def test_no_new_tool_per_metric_or_model_backend() -> None:
 
 def test_server_instructions_delegate_to_the_handbook() -> None:
     text = mcp_server.server.instructions or ""
-    # The short instruction must point at the handbook and gate the work.
     assert "reaper://handbook" in text
     assert "HANDBOOK_REQUIRED" in text
     assert "no invented thresholds" in text
     assert "status" in text and "measure" in text and "edit" in text
     assert len(text) <= 2200
 
-    # The complete protocol lives in the handbook, not in the injected text.
     handbook = mcp_server.handbook_resource()
-    assert "size-independent" in handbook
-    assert "every declared page" in handbook
+    assert "state_token" in handbook
+    assert "journal_required" in handbook
     assert "structural token" in handbook
-    assert "work mode" in handbook.lower()
-    assert "manifest_sha256" in handbook
+    assert "eleven groups" in handbook.lower()
     assert "anti-patterns" in handbook.lower()
 
 
 def test_model_guide_resource_carries_the_same_contract() -> None:
     assert "reaper://guide/model" in mcp_server.server._resource_manager._resources
     guide = json.loads(mcp_server.model_guide_resource())
-    assert guide["project_context"]["start"].startswith("reaper_panorama_open")
-    assert "pages are the complete path" in guide["project_context"]["pages"]
-    assert "manifest_sha256" in guide["project_context"]["ack"]
-    assert "change_page" in guide["updates"]["paged"]
-    assert "stable object ids" in guide["updates"]["identity"]
-    assert "metric_table" in guide["updates"]
-    assert "No better/worse" in guide["updates"]["comparability"]
-    assert guide["scoped_analysis"]["catalog"] == \
-        "reaper_capabilities(mode='tools').analyzers"
-    assert "not an automatic next step" in guide["scoped_analysis"]["no_loop"]
-    assert "result_page" in guide["exact_rows"]["rule"]
+    assert guide["project_context"]["start"].startswith("reaper_session(action='context'")
+    assert "state_token" in guide["project_context"]["delta"]
+    assert "pages" in guide["project_context"]
+    assert guide["edits"]["apply"].startswith("apply needs")
+    assert guide["anti_patterns"]
     source = Path(mcp_server.__file__).read_text(encoding="utf-8")
     assert 'reaper://guide/model' in source
 
@@ -150,12 +138,12 @@ def test_analyzer_catalog_is_in_the_same_task_surface() -> None:
         assert row["cost"]["class"] in {"light", "medium", "heavy"}
 
 
-def test_readme_has_no_single_first_contradiction() -> None:
+def test_readme_describes_the_state_contract() -> None:
     text = README.read_text(encoding="utf-8")
-    assert 'Prefer `mode="single"`' not in text
-    assert "default for compatibility" not in text
-    assert "size-independent" in text
-    assert "change_page" in text
+    assert "state.json" in text
+    assert "state_token" in text
+    assert "41 tools in 11 groups" in text
+    assert "reaper_panorama_open" not in text
 
 
 FORBIDDEN_MUTATION_KEYS = {
