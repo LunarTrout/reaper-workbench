@@ -489,6 +489,31 @@ def _finish_crossfade_plan(plan, analysis, tempo):
     return plan
 
 
+def register_timing_refinement(plan):
+    analysis = ANALYSES.get(plan.get("analysis_id"))
+    if analysis:
+        review_plan(plan, analysis, TempoMap.from_context(plan["tempo_context"]),
+                    RHYTHMS.get(plan.get("rhythm_id")))
+    PLANS[plan["plan_id"]] = plan
+
+
+def compare_timing_reviews(plan_id, compare_plan_id, *, start_s, end_s, offset, limit):
+    first = inspect_timing_review(plan_id, kind="all", start_s=start_s, end_s=end_s,
+                                  offset=offset, limit=limit)
+    left, right = PLANS[plan_id], PLANS.get(compare_plan_id)
+    if not right or left.get("analysis_id") != right.get("analysis_id"):
+        raise ValidationError("Compare plans made from the same source analysis")
+    by_id = {row["event_id"]: row for row in right["review_rows"]}
+    base_ids = {row["event_id"] for row in left["review_rows"]}
+    right_only = [row for row in right["review_rows"] if row["event_id"] not in base_ids
+                  and (start_s is None or row["observed_s"] >= start_s)
+                  and (end_s is None or row["observed_s"] < end_s)]
+    rows = [{"event_id": row["event_id"], "left": row, "right": by_id.get(row["event_id"])}
+            for row in first["rows"]]
+    return {**first, "compare_plan_id": compare_plan_id, "rows": rows,
+            "right_only_count": len(right_only), "right_only": right_only[:limit]}
+
+
 def crossfade_plan_view(plan, *, detail="summary"):
     if plan.get("method") != "crossfade":
         return plan
@@ -686,3 +711,173 @@ def inspect_timing(analysis_id: str | None = None,
                                   details={"analysis_id": analysis_id})
         return {"schema": "reaper-workbench.timing-inspect/1", "analysis": analysis}
     raise ValidationError("Pass analysis_id or plan_id")
+
+def review_window(plan, *, start_s, end_s, context_beats=2.0):
+    """Phrase-level view of one plan: every attack and every seam it touches.
+
+    One event id survives analysis, planning and verification, so the caller can
+    find the same attack in the source, in the plan and in the result without
+    guessing from a rounded timecode.
+
+    Each attack keeps the three time domains apart (source_s, project_s,
+    target_s) and adds what a single median hides: every clip that plays the
+    attack, its per-clip fade attenuation and the protected ranges that pinned
+    it. Seam rows report the source cut, both fades and whether the outgoing
+    clip still has source audio past its edge. When the plan names a readable
+    source_path, every in-window attack also carries a short RMS envelope.
+    """
+    if not isinstance(plan, Mapping) or plan.get("method") != "crossfade":
+        raise ValidationError("Window review needs a crossfade timing plan")
+    lo, hi = float(start_s), float(end_s)
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo >= hi:
+        raise ValidationError("Window review needs start_s < end_s")
+    context = float(context_beats)
+    if not np.isfinite(context) or context < 0.0:
+        raise ValidationError("Window review needs a finite, non-negative context")
+    position = float(plan["item_position_s"])
+    offset = float(plan["source_offset_s"])
+    item_length = float(plan["item_length_s"])
+    source_total = float(plan.get("duration_s") or 0.0)
+    blocks = list(plan.get("blocks") or [])
+    anchors = list(plan.get("anchors") or [])
+
+    def seam_seconds(value):
+        if isinstance(value, Mapping):
+            for key in ("project_s", "start_s", "time_s"):
+                if value.get(key) is not None:
+                    return float(value[key])
+            raise ValidationError("Seam entry has no project time",
+                                  details={"seam": dict(value)})
+        return float(value)
+
+    seams = sorted(seam_seconds(value) for value in (plan.get("seams") or []))
+    ordered_blocks = sorted(blocks, key=lambda block: float(block["position_s"]))
+
+    blockers: dict[Any, list[Any]] = {}
+    review = plan.get("review")
+    residual_page = review.get("residual") if isinstance(review, Mapping) else None
+    for entry in ((residual_page.get("rows") if isinstance(residual_page, Mapping) else None)
+                  or []):
+        if not isinstance(entry, Mapping) or entry.get("event_id") is None:
+            continue
+        fixed = entry.get("fixed_by") or []
+        if not isinstance(fixed, (list, tuple)):
+            fixed = [fixed]
+        bucket = blockers.setdefault(entry["event_id"], [])
+        for range_id in fixed:
+            if range_id not in bucket:
+                bucket.append(range_id)
+
+    samples = None
+    sample_rate = 44100
+    source_path = plan.get("source_path")
+    if source_path:
+        try:
+            audio = load_audio(source_path)
+            sample_rate = audio.sample_rate
+            samples = audio.samples.mean(axis=1)
+        except ValidationError:
+            samples = None
+
+    def attack_envelope(source_s):
+        """RMS in dBFS every 2 ms across +/-40 ms around one source attack."""
+        step, half = 0.002, 0.001
+        frames = []
+        for index in range(41):
+            center = source_s - 0.040 + index * step
+            low = int(round((center - half) * sample_rate))
+            high = int(round((center + half) * sample_rate))
+            low, high = max(0, min(len(samples), low)), max(0, min(len(samples), high))
+            if high <= low:
+                frames.append(-120.0)
+                continue
+            power = float(np.mean(samples[low:high] ** 2))
+            frames.append(round(20.0 * float(np.log10(max(np.sqrt(power), 1e-6))), 2))
+        return frames
+
+    rows = []
+    for anchor in anchors:
+        project_s = float(anchor["project_s"])
+        if not (lo - context <= project_s <= hi + context):
+            continue
+        target_s = float(anchor.get("target_s", project_s))
+        source_s = offset + (project_s - position)
+        left = max([seam for seam in seams if seam <= project_s], default=position)
+        right = min([seam for seam in seams if seam > project_s],
+                    default=position + item_length)
+        occurrences = []
+        for index, clip in enumerate(blocks):
+            start = float(clip["source_start_s"])
+            end = start + float(clip["length_s"])
+            if not start <= source_s < end:
+                continue
+            fade = 0.0
+            fade_in = float(clip.get("fade_in_s") or 0.0)
+            if fade_in > 0.0 and source_s < start + fade_in:
+                fade = 1.0 - (source_s - start) / fade_in
+            fade_out = float(clip.get("fade_out_s") or 0.0)
+            if fade_out > 0.0 and source_s > end - fade_out:
+                fade = max(fade, 1.0 - (end - source_s) / fade_out)
+            occurrences.append({"block_index": index,
+                                "fade_attenuation": round(float(min(max(fade, 0.0), 1.0)), 4)})
+        row = {
+            "event_id": anchor["id"],
+            "source_s": round(source_s, 6),
+            "project_s": round(project_s, 6),
+            "target_s": round(target_s, 6),
+            "residual_s": round(project_s - target_s, 6),
+            "in_window": bool(lo <= project_s <= hi),
+            "confidence": anchor.get("confidence"),
+            "seam_left_s": round(left, 6),
+            "seam_right_s": round(right, 6),
+            "occurrences": occurrences,
+            "duplicated": len(occurrences) > 1,
+            "under_fade": any(item["fade_attenuation"] > 0.0 for item in occurrences),
+            "blockers": list(blockers.get(anchor["id"], [])),
+        }
+        if row["in_window"]:
+            if samples is None:
+                row["envelope_unavailable"] = True
+            else:
+                row["envelope_db"] = attack_envelope(source_s)
+        rows.append(row)
+
+    seam_rows = []
+    for global_index, project_cut in enumerate(seams):
+        if not (lo - context <= project_cut <= hi + context):
+            continue
+        incoming = next((block for block in ordered_blocks
+                         if float(block["position_s"]) >= project_cut), None)
+        previous = None
+        for block in ordered_blocks:
+            if float(block["position_s"]) < project_cut:
+                previous = block
+            else:
+                break
+        remaining = None
+        exhausted = False
+        if previous is not None and source_total > 0.0:
+            left_audio = source_total - (float(previous["source_start_s"]) +
+                                         float(previous["length_s"]))
+            if left_audio <= 0.0:
+                remaining, exhausted = 0.0, True
+            else:
+                remaining = round(left_audio, 6)
+        seam_rows.append({
+            "seam_index": global_index,
+            "project_s": round(project_cut, 6),
+            "cut_source_s": round(offset + (project_cut - position), 6),
+            "fade_out_s": None if previous is None else previous.get("fade_out_s"),
+            "fade_in_s": None if incoming is None else incoming.get("fade_in_s"),
+            "source_audio_left_s": remaining,
+            "edge_source_exhausted": exhausted,
+        })
+
+    return {"schema": "reaper-workbench.timing-window/1",
+            "window_s": [lo, hi],
+            "item": {"position_s": position, "source_offset_s": offset,
+                     "length_s": item_length, "source_duration_s": source_total},
+            "attack_count": len(rows),
+            "attacks": rows,
+            "seam_count": len(seam_rows),
+            "seams": seam_rows}

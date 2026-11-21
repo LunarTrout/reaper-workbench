@@ -43,7 +43,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from ..errors import StaleContext, ValidationError
+from ..errors import ReaperAudioError, StaleContext, ValidationError
 from .session import EditOperation, ProjectRevision
 
 SCHEMA = "reaper-workbench.timing-apply/1"
@@ -59,6 +59,7 @@ MAX_SEAM_OVERLAP_S = 0.060
 
 BlockInput = Mapping[str, Any]
 APPLIED: dict[str, dict[str, Any]] = {}
+VALIDATED_REFINEMENTS: dict[str, tuple[ProjectRevision, str]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -772,6 +773,31 @@ def _revision_matches(expected: Any, current: ProjectRevision) -> bool:
     return ProjectRevision.from_dict(dict(expected)) == current
 
 
+def check_refined_attacks(plan: Mapping[str, Any], clips: Sequence[TimingClip]) -> None:
+    moved_ids = {entry["changes"].get("event_id") for entry in plan.get("refinements", ())
+                 if entry["action"] == "insert_seam"}
+    for anchor in plan.get("anchors", ()):
+        if anchor["id"] not in moved_ids:
+            continue
+        start = float(anchor["source_s"])
+        end = float(anchor.get("attack_end_s", start))
+        occurrences = []
+        for index, clip in enumerate(clips):
+            if (clip.source_end_s <= start + GEOMETRY_ATOL or
+                    clip.source_start_s > end + GEOMETRY_ATOL):
+                continue
+            full = (clip.source_start_s + clip.fade_in_s <= start + GEOMETRY_ATOL and
+                    end <= clip.source_end_s - clip.fade_out_s + GEOMETRY_ATOL)
+            occurrences.append({"block_index": index, "project_s":
+                                clip.position_s + start - clip.source_start_s,
+                                "full_attack": full})
+        if len(occurrences) != 1 or not occurrences[0]["full_attack"]:
+            raise ValidationError(
+                "The refined attack must pass once and outside the fades",
+                details={"code": "timing_attack_conflict", "event_id": anchor["id"],
+                         "source_interval_s": [start, end], "occurrences": occurrences})
+
+
 def apply_timing_plan(
     session: Any,
     plan: Mapping[str, Any] | str,
@@ -794,6 +820,16 @@ def apply_timing_plan(
         raise ValidationError("dry_run must be a boolean")
     plan_doc = _resolve_plan(plan)
     plan_id = str(plan_doc.get("plan_id") or "")
+    if isinstance(plan, str) and plan_doc.get("method") == "crossfade":
+        from .timing_service import PLANS
+
+        children = [entry["plan_id"] for entry in PLANS.values()
+                    if entry.get("parent_plan_id") == plan_id
+                    and entry.get("refinement", {}).get("state") != "unchanged"]
+        if children:
+            raise ValidationError("This timing plan was superseded by a refinement",
+                                  details={"code": "timing_plan_superseded",
+                                           "plan_id": plan_id, "child_plan_ids": children})
     target_item = item_guid or plan_doc.get("item_guid")
     if not isinstance(target_item, str) or not target_item:
         raise ValidationError("The timing plan does not name a source item",
@@ -833,6 +869,8 @@ def apply_timing_plan(
         raise ValidationError("Timing plan has no new movement to apply",
                               details={"plan_id": plan_id, "review": plan_doc.get("review")})
     if crossfade:
+        if target_item != plan_doc.get("item_guid") or target_track != plan_doc.get("track_guid"):
+            raise ValidationError("The apply target must match the planned item and track")
         from .timing_service import _file_fingerprint
         from pathlib import Path
         if item["take_count"] != 1 or item["take_fx_count"]:
@@ -857,6 +895,26 @@ def apply_timing_plan(
     before_items = _track_items(before["snapshot"], target_track)
     operation = build_timing_apply_operation(
         item, clips, source_length_s=float(item.get("source_length_s") or 0.0) or None)
+
+    receipt_key = (revision, operation.values["apply_id"])
+    needs_dry_run = crossfade and isinstance(plan, str) and bool(plan_doc.get("parent_plan_id"))
+    if crossfade:
+        from pathlib import Path
+
+        source_path = Path(item["source_path"])
+        window_start, window_end = item["position_s"], item["position_s"] + item["length_s"]
+        blockers = [row["guid"] for row in before_items
+                    if row["guid"] != target_item and Path(_take_source_path(row)) == source_path
+                    and row["position_s"] < window_end - COVERAGE_ATOL
+                    and row["position_s"] + row["length_s"] > window_start + COVERAGE_ATOL]
+        if blockers:
+            raise ValidationError("The destination already contains overlapping clips from this source",
+                                  details={"code": "timing_destination_occupied",
+                                           "track_guid": target_track, "item_guids": blockers})
+        check_refined_attacks(plan_doc, clips)
+    if needs_dry_run and not dry_run and VALIDATED_REFINEMENTS.get(plan_id) != receipt_key:
+        raise ValidationError("Dry-run this exact refined plan at the current project revision",
+                              details={"code": "timing_refinement_not_validated", "plan_id": plan_id})
 
     timing_plan_id = plan_id
     batch_reason = (reason or f"timing apply {timing_plan_id or 'plan'}").strip()
@@ -894,6 +952,8 @@ def apply_timing_plan(
         "revision_before": revision.to_dict(),
     }
     if dry_run or applied.get("applied") is not True:
+        if dry_run and needs_dry_run and applied.get("ok", True):
+            VALIDATED_REFINEMENTS[plan_id] = receipt_key
         return {
             "ok": True,
             **base,
@@ -940,6 +1000,17 @@ def apply_timing_plan(
             "restores": "the original item and removes every clip this plan created",
         },
     }
+    if crossfade and not matched:
+        try:
+            rollback = undo_timing_apply(session, result, project_id=project_id)
+        except ReaperAudioError as exc:
+            rollback = {"status": "rollback_failed", "message": str(exc)}
+        restored = rollback.get("readback", {}).get("matched") is True
+        result.update(ok=False, applied=not restored, rollback=rollback,
+                      status="rolled_back_readback_mismatch" if restored
+                      else "applied_readback_mismatch")
+        if restored:
+            result.update(revision_after=rollback["revision_after"], undo=None)
     if matched and result["plan_id"]:
         APPLIED[str(result["plan_id"])] = result
     return result
@@ -1024,6 +1095,10 @@ def undo_timing_apply(
     if leftover:
         mismatches.append({"field": "created_items", "expected": "removed",
                            "actual": leftover[:16]})
+    before_guids = applied.get("before_item_guids")
+    if isinstance(before_guids, list) and set(before_guids) != set(by_guid):
+        mismatches.append({"field": "item_guids", "expected": before_guids,
+                           "actual": sorted(by_guid)})
     expected_count = applied.get("before_item_count")
     if isinstance(expected_count, int) and expected_count != len(items):
         mismatches.append({"field": "item_count", "expected": expected_count,
