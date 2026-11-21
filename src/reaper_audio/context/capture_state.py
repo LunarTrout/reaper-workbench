@@ -52,6 +52,7 @@ from .project_state import (
     fingerprint_track,
 )
 from .state_diff import STAGE_EXTERNAL_FILE, diff_fingerprints
+from ..daw.fx_state import classify_parameters, summarize_fx
 
 __all__ = ["fill_state_from_capture"]
 
@@ -655,6 +656,33 @@ def _route_is_master(source_id: str, master_fingerprint: Mapping[str, Any] | Non
 
 
 
+
+
+def _fx_summary(session, tracks) -> list[dict]:
+    """Per-plugin rollup: available params and what is set (first_seen baseline)."""
+    rows: list[dict] = []
+    for track in tracks:
+        guid = track.get("guid")
+        for fx in track.get("fx") or []:
+            if not isinstance(fx, Mapping):
+                continue
+            params = []
+            try:
+                listing = session.bridge.call(
+                    "fx.list_params",
+                    {"track_guid": guid, "fx_guid": fx.get("guid")}) or {}
+                params = list(listing.get("parameters") or [])
+            except Exception:
+                params = []
+            name = str(fx.get("name") or "")
+            summary = summarize_fx(name, params, None)
+            summary["track_guid"] = guid
+            summary["slot"] = fx.get("index")
+            summary["track"] = (track.get("name") or track.get("track_name")
+                                or track.get("guid"))
+            rows.append(summary)
+    return rows
+
 def _compact_map(tracks, master, routing) -> dict:
     """Structure-only map: no item rows, no parameter values."""
     def track(row):
@@ -720,7 +748,9 @@ def fill_state_from_capture(
             details={"capture": project_id, "state": state.project_id})
 
     tracks, master, routing = _read_session_rows(session)
-    state.upsert_map(_compact_map(tracks, master, routing))
+    compact = _compact_map(tracks, master, routing)
+    compact["fx_summary"] = _fx_summary(session, tracks)
+    state.upsert_map(compact)
     stored_shape = _stored_shape(state)
 
     track_fingerprints = {

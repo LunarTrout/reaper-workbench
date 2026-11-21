@@ -1628,8 +1628,11 @@ def reaper_session(action: str = "health",
                 map_document = {"tracks": snapshot.get("tracks") or [],
                                 "master": snapshot.get("master") or {},
                                 "routes": (snapshot.get("sends") or {}).get("rows") or []}
+            fx_rows = []
+            if isinstance(map_document, Mapping):
+                fx_rows = list(map_document.get("fx_summary") or [])
             context = build_project_context(
-                state, map_document=map_document, fx_summary=[],
+                state, map_document=map_document, fx_summary=fx_rows,
                 since_token=context_since, detail=context_detail,
                 max_facts=context_max_facts)
             answer = {"ok": True, "action": "context", "context": context,
