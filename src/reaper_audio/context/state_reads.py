@@ -46,7 +46,7 @@ from ..errors import ValidationError
 from . import state_diff
 from .freshness import (FRESHNESS_SCHEMA, STATE_CURRENT, STATE_STALE,
                         STATE_UNKNOWN, summarise)
-from .project_state import (
+from .project_state import (resolve_fingerprints, 
     FACT_STATUSES,
     FINGERPRINT_FIELDS,
     MASTER_STAGE_PREFIX,
@@ -754,7 +754,10 @@ def state_freshness(state: object,
     superseded = 0
     stages: set[str] = set()
 
+    table = document.get("fingerprints")
     for fact in facts:
+        fact = dict(fact)
+        fact["fingerprints"] = resolve_fingerprints(fact, table)
         if fact.get("status") == STATUS_SUPERSEDED:
             superseded += 1
             continue

@@ -648,6 +648,22 @@ def safe_project_key(project_id: str) -> str:
     return f"{slug}-{suffix}" if slug else suffix
 
 
+
+
+def resolve_fingerprints(fact: Mapping[str, Any],
+                         table: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Expand ``{"$ref": digest}`` roles against the shared fingerprint table."""
+    prints = fact.get("fingerprints")
+    if not isinstance(prints, Mapping):
+        return {}
+    source = table or {}
+    resolved: dict[str, Any] = {}
+    for role, value in prints.items():
+        if isinstance(value, Mapping) and "$ref" in value:
+            resolved[role] = source.get(str(value["$ref"]), {})
+        else:
+            resolved[role] = value
+    return resolved
 def empty_state(project_id: str) -> dict[str, Any]:
     """The document used for a project that has never been saved."""
     if not isinstance(project_id, str) or not project_id.strip():
@@ -977,8 +993,21 @@ class ProjectState:
                 mapping["routes"] = edges
         for key in ("changes", "history"):
             entries = self._state.get(key)
-            if isinstance(entries, list) and len(entries) > 200:
-                self._state[key] = entries[-200:]
+            if isinstance(entries, list) and len(entries) > 50:
+                self._state[key] = entries[-50:]
+        # One copy of each fingerprint, facts hold refs.
+        table = self._state.setdefault("fingerprints", {})
+        for fact in self._state.get("facts", {}).values():
+            prints = fact.get("fingerprints")
+            if not isinstance(prints, dict):
+                continue
+            for role, value in list(prints.items()):
+                if isinstance(value, dict):
+                    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                         ensure_ascii=False).encode("utf-8")
+                    digest = hashlib.sha256(encoded).hexdigest()
+                    table[digest] = value
+                    prints[role] = {"$ref": digest}
         removed = 0
         for fact in self._state.get("facts", {}).values():
             if fact.get("status") != STATUS_SUPERSEDED:
