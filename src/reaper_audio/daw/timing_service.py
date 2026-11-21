@@ -19,6 +19,7 @@ from ..analysis.timing import (build_timing_plan, detect_timing_events,
 from ..analysis.timing_context import plan_phrase
 from ..analysis.timing_seams import attack_candidates, plan_crossfades
 from ..analysis.timing_rhythm import DEFAULT_DIVISIONS, infer_rhythm
+from ..analysis.timing_review import review_page, review_plan
 from ..daw.midi import TempoMap
 from ..errors import ValidationError
 
@@ -370,7 +371,7 @@ def _select_rhythm_targets(rhythm_id, choices, analysis_id, tempo_context, phase
     return targets, keep, selected
 
 
-def _explicit_targets(references, analysis, tempo, phase_s, tolerance):
+def _explicit_targets(references, analysis, tempo, phase_s, tolerance, *, allow_empty=False):
     events = {e["id"]: e for e in analysis["events"]}
     targets = {}
     window = analysis["project_window"]
@@ -394,7 +395,7 @@ def _explicit_targets(references, analysis, tempo, phase_s, tolerance):
     ordered = [targets[e["id"]] for e in analysis["events"] if e["id"] in targets]
     if any(b <= a for a, b in zip(ordered, ordered[1:])):
         raise ValidationError("Explicit targets must preserve attack order and be distinct")
-    if not targets:
+    if not targets and not allow_empty:
         raise ValidationError("No selected rhythm anchors; keep this item or choose an option")
     return targets
 
@@ -437,12 +438,14 @@ def plan_timing_crossfades(analysis_id: str, *, tempo_context: Mapping[str, Any]
         raise ValidationError("Choose a rhythm map or explicit references for this plan")
     if rhythm_choices and not rhythm_id:
         raise ValidationError("rhythm_choices requires rhythm_id")
-    choices = {}
+    choices, keep = {}, []
+    user_ranges = list(protected_ranges)
     if rhythm_id:
         reference_events, keep, choices = _select_rhythm_targets(
             rhythm_id, rhythm_choices or {}, analysis_id, tempo_context, grid_phase_s)
         protected_ranges = [*protected_ranges, *keep]
-    targets = (_explicit_targets(reference_events, analysis, tempo, grid_phase_s, tolerance_s)
+    targets = (_explicit_targets(reference_events, analysis, tempo, grid_phase_s, tolerance_s,
+                                 allow_empty=bool(rhythm_id))
                if reference_events is not None else None)
     grid = ([row["time_s"] + grid_phase_s for row in grid_times(
         tempo, position-grid_phase_s, position+length-grid_phase_s, subdivision)]
@@ -450,11 +453,8 @@ def plan_timing_crossfades(analysis_id: str, *, tempo_context: Mapping[str, Any]
     result = plan_crossfades(
         load_audio(source), analysis["events"], grid, position=position, offset=offset,
         length=length, tolerance=tolerance_s, strength=strength, profile=analysis["profile"],
-        protected_ranges=protected_ranges, explicit_targets=targets)
-    first, last = result["blocks"][0], result["blocks"][-1]
-    edge_in, edge_out = analysis["edge_fades_s"]
-    first["fade_in_s"] = min(edge_in, first["length_s"]-first["fade_out_s"])
-    last["fade_out_s"] = min(edge_out, last["length_s"]-last["fade_in_s"])
+        protected_ranges=protected_ranges, explicit_targets=targets,
+        edge_fades=analysis["edge_fades_s"])
     result.update({"schema": "reaper-workbench.timing-plan/1", "method": "crossfade",
                    "tempo_context": dict(tempo_context),
                    "plan_id": f"tpl_{uuid4().hex[:16]}", "analysis_id": analysis_id,
@@ -468,18 +468,169 @@ def plan_timing_crossfades(analysis_id: str, *, tempo_context: Mapping[str, Any]
                    "target_kind": ("rhythm_map" if rhythm_id else "reference_events"
                                    if targets is not None else "project_grid"),
                    "rhythm_id": rhythm_id, "rhythm_choices": choices,
+                   "strength": strength, "tolerance_s": tolerance_s,
+                   "user_protected_ranges": user_ranges, "rhythm_keep_ranges": keep,
                    "protected_ranges": list(protected_ranges)})
-    if targets is not None:
-        # Reject unsafe geometry while the agent can still revise the choice.
-        from .timing_apply import check_coverage, check_protected_ranges, normalize_clips
-        origin = position-offset
-        clips = normalize_clips(result["blocks"], project_start_s=origin)
-        item = {"position_s": position, "start_offset_s": offset, "length_s": length}
-        result["coverage_check"] = check_coverage(clips, item, crossfade=True)
-        result["protected_checks"] = check_protected_ranges(
-            clips, item, protected_ranges, project_start_s=origin)
-    PLANS[result["plan_id"]] = result
-    return result
+    return _finish_crossfade_plan(result, analysis, tempo)
+
+
+def _finish_crossfade_plan(plan, analysis, tempo):
+    from .timing_apply import check_coverage, check_protected_ranges, normalize_clips
+
+    position, offset = plan["item_position_s"], plan["source_offset_s"]
+    origin = position-offset
+    clips = normalize_clips(plan["blocks"], project_start_s=origin)
+    item = {"position_s": position, "start_offset_s": offset, "length_s": plan["item_length_s"]}
+    plan["coverage_check"] = check_coverage(clips, item, crossfade=True)
+    plan["protected_checks"] = check_protected_ranges(
+        clips, item, plan["protected_ranges"], project_start_s=origin)
+    review_plan(plan, analysis, tempo, RHYTHMS.get(plan.get("rhythm_id")))
+    PLANS[plan["plan_id"]] = plan
+    return plan
+
+
+def crossfade_plan_view(plan, *, detail="summary"):
+    if plan.get("method") != "crossfade":
+        return plan
+    excluded = {"review_rows"}
+    if detail != "full":
+        excluded.update({"blocks", "seams", "anchors", "phase", "diagnostics",
+                         "protected_checks", "protected_ranges",
+                         "user_protected_ranges", "rhythm_keep_ranges", "rhythm_choices"})
+    return {**{k: v for k, v in plan.items() if k not in excluded},
+            "block_count": len(plan["blocks"]), "seam_count": len(plan["seams"]),
+            "protected_range_count": len(plan.get("protected_ranges", []))}
+
+
+def inspect_timing_review(plan_id, *, kind, start_s=None, end_s=None, offset=0, limit=12):
+    plan = PLANS.get(plan_id)
+    if not plan or "review" not in plan:
+        raise ValidationError("Review requires a crossfade timing plan_id")
+    if (kind not in {"all", "residual", "unassigned"} or not 0 <= offset
+            or not 1 <= limit <= 32 or (start_s is not None and not np.isfinite(start_s))
+            or (end_s is not None and not np.isfinite(end_s))
+            or (start_s is not None and end_s is not None and start_s >= end_s)):
+        raise ValidationError("Invalid timing review page or interval")
+    return {"schema": "reaper-workbench.timing-review/1", "plan_id": plan_id,
+            "review": plan["review"],
+            **review_page(plan, kind=kind, start_s=start_s, end_s=end_s,
+                          offset=offset, limit=limit)}
+
+
+def _outside_window(ranges, start, end):
+    kept = []
+    for row in ranges:
+        lo, hi = row["start_s"], row["end_s"]
+        if lo < start:
+            kept.append({"start_s": lo, "end_s": min(start, hi)})
+        if hi > end:
+            kept.append({"start_s": max(lo, end), "end_s": hi})
+    return kept
+
+
+def _same_geometry(left, right):
+    fields = ("position_s", "source_start_s", "length_s", "fade_in_s", "fade_out_s")
+    return len(left) == len(right) and all(abs(a[k]-b[k]) <= 1e-7
+                                        for a, b in zip(left, right) for k in fields)
+
+
+def refine_timing(plan_id, *, snapshot, start_s, end_s, reference_events):
+    base = PLANS.get(plan_id)
+    if not base or base.get("method") != "crossfade":
+        raise ValidationError("Refine requires a crossfade timing plan_id")
+    if start_s is None or end_s is None or not (
+            np.isfinite(start_s) and np.isfinite(end_s) and start_s < end_s):
+        raise ValidationError("Refine takes a project-time interval with start_s and end_s")
+    analysis = validate_rhythm_analysis(base["analysis_id"], snapshot)
+    tempo_context = snapshot["tempo"]
+    if tempo_context != base["tempo_context"]:
+        raise ValidationError("Project tempo changed; build a new timing plan")
+    tempo = TempoMap.from_context(tempo_context)
+    targets = _explicit_targets(reference_events or (), analysis, tempo, base["grid_phase_s"],
+                                base["tolerance_s"], allow_empty=True)
+    original = base["blocks"]
+    indexes = [i for i, block in enumerate(original)
+               if block["position_s"] < end_s and
+               block["position_s"]+block["length_s"] > start_s]
+    if not indexes:
+        raise ValidationError("Refine interval does not overlap the plan")
+    lo, hi = indexes[0], indexes[-1]+1
+    left, right = original[lo], original[hi-1]
+    position, offset = base["item_position_s"], base["source_offset_s"]
+    origin = position-offset
+    first, last = left["position_s"], right["position_s"]+right["length_s"]
+    first_shift = first-left["source_start_s"]-origin
+    last_shift = right["position_s"]-right["source_start_s"]-origin
+    fade_in, fade_out = left["fade_in_s"], right["fade_out_s"]
+    low_source = left["source_start_s"]+fade_in
+    high_source = right["source_start_s"]+right["length_s"]-fade_out
+    interior = {event["id"] for event in analysis["events"]
+                if low_source <= event["source_s"] <= high_source}
+    if set(targets)-interior:
+        raise ValidationError("Requested attacks touch a retained seam; widen the refine interval",
+                              details={"event_ids": sorted(set(targets)-interior)})
+    old_anchors = {a["id"]: a for a in base["anchors"]}
+    local_goals = {i: a["target_s"] for i, a in old_anchors.items() if i in interior}
+    local_goals.update(targets)
+    if not local_goals:
+        raise ValidationError("No assigned targets in this window; pass reference_events")
+    ordered_goals = [local_goals[e["id"]] for e in analysis["events"] if e["id"] in local_goals]
+    if any(b <= a for a, b in zip(ordered_goals, ordered_goals[1:])):
+        raise ValidationError("Refined targets must preserve the attack order")
+    release_start = max(low_source+origin, start_s-first_shift)
+    release_end = min(high_source+origin, end_s-last_shift)
+    if targets and release_end > release_start:
+        keep = _outside_window(base["rhythm_keep_ranges"], release_start, release_end)
+    else:
+        keep = base["rhythm_keep_ranges"]
+    protected = [*base["user_protected_ranges"], *keep]
+    if any(not first+fade_in <= t <= last-fade_out for t in targets.values()):
+        raise ValidationError("A requested target touches a retained fade; widen the interval")
+    try:
+        local = plan_crossfades(
+            load_audio(base["source_path"]), analysis["events"], [], position=position,
+            offset=offset, length=base["item_length_s"], tolerance=base["tolerance_s"],
+            strength=base["strength"], profile=analysis["profile"], protected_ranges=protected,
+            explicit_targets=local_goals, clip_window=(first, last, first_shift, last_shift),
+            edge_fades=(fade_in, fade_out), fixed_targets=targets)
+    except ValidationError as exc:
+        raise ValidationError("Refinement cannot satisfy the requested targets and retain the seams",
+                              details={"cause": str(exc), "parent_plan_id": plan_id,
+                                       "editable_window_s": [first, last],
+                                       "requested_event_ids": list(targets)}) from exc
+    original_ids = {i for b in original[lo:hi] for i in b["event_ids"]}
+    anchors = [a for a in base["anchors"] if a["id"] not in original_ids | interior]
+    anchors.extend(local["anchors"])
+    local_anchors = {a["id"]: a for a in local["anchors"]}
+    comparison = []
+    events_by_id = {e["id"]: e for e in analysis["events"]}
+    for event_id, wanted in local_goals.items():
+        old = old_anchors.get(event_id)
+        new = local_anchors.get(event_id)
+        event = events_by_id[event_id]
+        source = event["source_s"]
+        positions = [b["position_s"]+source-b["source_start_s"] for b in original[lo:hi]
+                     if b["source_start_s"] <= source < b["source_start_s"]+b["length_s"]]
+        previous = (old["project_s"]+old["achieved_shift_s"] if old else
+                    positions[0] if len(positions) == 1 else None)
+        comparison.append({"event_id": event_id, "observed_s": event["project_s"],
+                           "target_s": wanted,
+                           "old_error_s": previous-wanted if previous is not None else None,
+                           "new_error_s": new["residual_s"] if new else None})
+    plan = {**base, "plan_id": f"tpl_{uuid4().hex[:16]}", "parent_plan_id": plan_id,
+            "blocks": [*original[:lo], *local["blocks"], *original[hi:]],
+            "anchors": sorted(anchors, key=lambda a: a["project_s"]),
+            "seams": [*base["seams"][:lo], *local["seams"], *base["seams"][hi-1:]],
+            "diagnostics": [d for d in base["diagnostics"]
+                            if not first <= d.get("position_s", -1) <= last]+local["diagnostics"],
+            "rhythm_keep_ranges": keep, "protected_ranges": protected,
+            "refinement": {"requested_window_s": [start_s, end_s],
+                           "editable_window_s": [first, last],
+                           "unchanged_outside_count": len(original)-(hi-lo),
+                           "state": ("unchanged" if _same_geometry(local["blocks"], original[lo:hi])
+                                     else "candidate"),
+                           "events": comparison}}
+    return _finish_crossfade_plan(plan, analysis, tempo)
 
 
 def measure_timing_clock(session: Any, *, project_id: str | None, item_guid: str,
@@ -526,7 +677,8 @@ def inspect_timing(analysis_id: str | None = None,
         plan = PLANS.get(plan_id)
         if plan is None:
             raise ValidationError("Unknown timing plan_id", details={"plan_id": plan_id})
-        return {"schema": "reaper-workbench.timing-inspect/1", "plan": plan}
+        return {"schema": "reaper-workbench.timing-inspect/1",
+                "plan": crossfade_plan_view(plan, detail="full")}
     if analysis_id:
         analysis = ANALYSES.get(analysis_id)
         if analysis is None:

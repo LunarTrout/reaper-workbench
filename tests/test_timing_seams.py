@@ -37,3 +37,15 @@ def test_seam_refuses_an_independent_attack_in_the_candidate_window():
     samples = np.zeros((8000, 2))
     assert _seam(samples, 4000, 0., 0., .008, .25, .31,
                  np.arange(.25, .32, .002), .013) is None
+
+
+def test_seam_search_considers_other_candidates_when_best_location_is_protected():
+    samples = np.zeros((8000, 2))
+    args = (samples, 4000, 0., 0., .008, .25, .44, np.asarray([]), .013)
+    best = _seam(*args)
+    assert best is not None
+    blocked = (best["start_s"]-.01, best["end_s"]+.01)
+    alternative = _seam(*args, guarded=[blocked])
+    assert alternative is not None
+    assert (alternative["end_s"] <= blocked[0] or
+            alternative["start_s"]-.008 >= blocked[1])

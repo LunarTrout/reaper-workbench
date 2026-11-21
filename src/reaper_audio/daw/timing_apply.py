@@ -826,6 +826,12 @@ def apply_timing_plan(
                      "next_action": "re-plan against the current revision"})
 
     crossfade = plan_doc.get("method") == "crossfade"
+    if crossfade and (
+        plan_doc.get("review", {}).get("state") == "no_timing_change" or
+        plan_doc.get("refinement", {}).get("state") == "unchanged"
+    ):
+        raise ValidationError("Timing plan has no new movement to apply",
+                              details={"plan_id": plan_id, "review": plan_doc.get("review")})
     if crossfade:
         from .timing_service import _file_fingerprint
         from pathlib import Path

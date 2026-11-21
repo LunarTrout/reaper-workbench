@@ -146,24 +146,30 @@ def _group(anchors, strength, blocked, step):
     short = np.diff(observed, prepend=-10.) < 1.23*step
     weight /= np.where(short, .0045, .006)**2
     count = len(wanted)
+    pins = {i: a["pin_shift_s"] for i, a in enumerate(anchors) if "pin_shift_s" in a}
     costs = np.full(count+1, np.inf)
     costs[0] = 0.
     edges = {}
     for end in range(1, count+1):
         if end in blocked:
             continue
+        fixed = None
         for start in range(end-1, -1, -1):
+            if start in pins:
+                if fixed is not None and abs(fixed-pins[start]) > 1e-7:
+                    break
+                fixed = pins[start]
             if end-start > 18 and start in edges:
                 break
             if not np.isfinite(costs[start]):
                 continue
             w, d = weight[start:end], wanted[start:end]
-            # Pin the item edges in project time so neighbouring material and
-            # the original extent are untouched.
-            shift = 0. if start == 0 or end == count else float(np.average(d, weights=w))
+            shift = fixed if fixed is not None else float(np.average(d, weights=w))
             cost = costs[start] + 1.6 + np.sum(w*(d-shift)**2)
             if cost < costs[end]:
                 costs[end], edges[end] = cost, (start, end, shift)
+    if count not in edges:
+        raise ValidationError("No feasible seam between the retained boundaries")
     groups = []
     end = count
     while end:
@@ -173,11 +179,18 @@ def _group(anchors, strength, blocked, step):
     return list(reversed(groups))
 
 
-def _seam(samples, rate, origin, left, right, a, b, protected, guard):
+def _seam(samples, rate, origin, left, right, a, b, protected, guard,
+          *, project_bounds=None, source_bounds=None, guarded=()):
     # Candidate crossfade must follow the earlier attack and finish before the
     # next under both translations. Independent fronts also veto the seam.
     after = max(a+left, a+right) + guard
     before = min(b+left, b+right) - .006
+    if project_bounds:
+        after = max(after, project_bounds[0])
+        before = min(before, project_bounds[1])
+    if source_bounds:
+        after = max(after, source_bounds[0]+max(left, right))
+        before = min(before, source_bounds[1]+min(left, right))
     if before-after < FADE_WIDTHS[0]:
         return None
     pair_scale = 0.06
@@ -202,8 +215,11 @@ def _seam(samples, rate, origin, left, right, a, b, protected, guard):
         for frame in np.unique(starts):
             start = float(frame/rate)
             end = start+duration
-            src_lo = min(start-left, start-right) - origin
-            src_hi = max(end-left, end-right) - origin
+            raw_lo = start-max(left, right)
+            raw_hi = end-min(left, right)
+            if any(raw_lo < hi and raw_hi > lo for lo, hi in guarded):
+                continue
+            src_lo, src_hi = raw_lo-origin, raw_hi-origin
             if np.any((protected >= src_lo-.009) & (protected <= src_hi+.007)):
                 continue
             i, j = round((start-left-origin)*rate), round((start-right-origin)*rate)
@@ -238,22 +254,33 @@ def _seam(samples, rate, origin, left, right, a, b, protected, guard):
 
 
 def plan_crossfades(audio, events, grid, *, position, offset, length, tolerance,
-                    strength, profile, protected_ranges=(), explicit_targets=None):
+                    strength, profile, protected_ranges=(), explicit_targets=None,
+                    clip_window=None, edge_fades=(0., 0.), fixed_targets=()):
     """Return scored seams and full-length, gap-free project clips at 1x."""
     samples = np.asarray(audio.samples, dtype=np.float64)
     if samples.ndim == 1:
         samples = samples[:, None]
     origin = position-offset
-    guarded = []  # Windows held at their original project position.
+    first, last, first_shift, last_shift = clip_window or (position, position+length, 0., 0.)
+    head_fade, tail_fade = edge_fades
+    if first+head_fade >= last-tail_fade:
+        raise ValidationError("No room to edit between the retained fades")
+    left_gate = first+head_fade-first_shift
+    right_gate = last-tail_fade-last_shift
+    if right_gate <= left_gate:
+        raise ValidationError("The local source window has no editable material")
+    guarded = []
     for row in protected_ranges:
         if "source_start_s" in row:
             start, end = row["source_start_s"]+origin, row["source_end_s"]+origin
         else:
             start, end = row.get("start_s", row.get("project_start_s")), row.get(
                 "end_s", row.get("project_end_s"))
-        if start is None or end is None or not position <= start < end <= position+length:
+        if start is None or end is None or not position-1e-7 <= start < end <= position+length+1e-7:
             raise ValidationError("Protected window needs valid times inside the item")
-        guarded.append((start, end))
+        start, end = max(start, position), min(end, position+length)
+        if end > left_gate and start < right_gate:
+            guarded.append((max(start, left_gate), min(end, right_gate)))
     if explicit_targets is None:
         anchors, phase = select_anchors(events, grid, tolerance)
         step = float(np.median(np.diff(grid))) if len(grid) >= 2 else .1
@@ -261,50 +288,53 @@ def plan_crossfades(audio, events, grid, *, position, offset, length, tolerance,
         anchors = [{**event, "target_s": explicit_targets[event["id"]],
                     "desired_shift_s": explicit_targets[event["id"]]-event["project_s"]}
                    for event in events if event["id"] in explicit_targets]
-        phase, step = [], .096
-    if not anchors:
-        raise ValidationError("No sufficiently supported attack matches the grid")
+        intervals = np.diff([a["target_s"] for a in anchors])
+        phase, step = [], float(np.median(intervals)) if len(intervals) else length
+    anchors = [a for a in anchors if left_gate <= a["project_s"] <= right_gate]
+    requested = set(fixed_targets)
+    if requested - {a["id"] for a in anchors}:
+        raise ValidationError("A fixed target lies past a retained fade")
+    for a in anchors:
+        if a["id"] in requested:
+            a["pin_shift_s"] = a["desired_shift_s"]
     attack_times = np.array([a["source_s"] for a in anchors])
     extra = np.asarray([e["source_s"] for e in events if e["confidence"] >= .34
-                        and np.min(abs(attack_times-e["source_s"])) > .020])
-    # A pin provides a zero-shift assignment inside a kept interval even if
-    # no trustworthy attack was detected there. Seams also avoid its extent.
-    if explicit_targets is not None:
-        for index, (lo, hi) in enumerate(guarded):
-            mid = (lo+hi)/2
-            anchors.append({"id": f"pin_{index}", "project_s": mid,
-                            "source_s": mid-origin, "target_s": mid,
-                            "confidence": 1., "desired_shift_s": 0., "pin": True})
-        anchors.sort(key=lambda a: a["project_s"])
+                        and (not len(attack_times) or
+                             np.min(abs(attack_times-e["source_s"])) > .020)])
+
+    def pin(name, time, shift):
+        return {"id": name, "project_s": time, "source_s": time-origin,
+                "target_s": time+shift, "confidence": 1., "desired_shift_s": shift,
+                "pin": True, "pin_shift_s": shift}
+
+    anchors = [pin("item_start", left_gate, first_shift), *anchors,
+               *(pin(f"protected_{i}", (lo+hi)/2, 0.) for i, (lo, hi) in enumerate(guarded)),
+               pin("item_end", right_gate, last_shift)]
+    anchors.sort(key=lambda a: a["project_s"])
     blocked = set()
     guard = PROFILES[profile][2]
     cache = {}
     excluded = []
     while True:
         groups = _group(anchors, strength, blocked, step)
-        groups = [(a, b, 0. if any(anchors[a]["project_s"] <= hi and
-                    anchors[b-1]["project_s"] >= lo for lo, hi in guarded) else d)
-                  for a, b, d in groups]
         seams = []
         for left, right in zip(groups, groups[1:]):
             a = anchors[left[1]-1]["project_s"]
             b = anchors[right[0]]["project_s"]
             key = (left[2], right[2], a, b)
             if key not in cache:
-                seam = _seam(samples, audio.sample_rate, origin, *key, extra, guard)
-                if seam is not None:
-                    wanted_window = (seam["start_s"]-max(left[2], right[2]),
-                                     seam["end_s"]-min(left[2], right[2]))
-                    if any(wanted_window[0] < hi and wanted_window[1] > lo
-                           for lo, hi in guarded):
-                        seam = None
-                cache[key] = seam
+                cache[key] = _seam(
+                    samples, audio.sample_rate, origin, *key, extra, guard,
+                    project_bounds=(first+head_fade, last-tail_fade),
+                    source_bounds=(left_gate, right_gate), guarded=guarded)
             seam = cache[key]
-            if seam is None or abs(left[2]-right[2]) < .0004:
+            if seam is None or abs(left[2]-right[2]) <= 1e-7:
                 blocked.add(right[0])
                 excluded.append({"between": [anchors[left[1]-1]["id"],
-                                             anchors[right[0]]["id"]],
-                                 "reason": "keep_group_no_distinct_safe_seam"})
+                                              anchors[right[0]]["id"]],
+                                 "position_s": (a+b)/2,
+                                 "reason": ("same_shift" if seam is not None else
+                                            "keep_group_no_distinct_safe_seam")})
                 break
             seams.append(seam)
         else:
@@ -318,24 +348,29 @@ def plan_crossfades(audio, events, grid, *, position, offset, length, tolerance,
     for i, (start, end, shift) in enumerate(groups):
         incoming = seams[i-1] if i else None
         outgoing = seams[i] if i < len(seams) else None
-        left = incoming["start_s"] if incoming else position
-        right = outgoing["end_s"] if outgoing else position+length
-        fade_in = incoming["end_s"]-incoming["start_s"] if incoming else 0.
-        fade_out = outgoing["end_s"]-outgoing["start_s"] if outgoing else 0.
+        left = incoming["start_s"] if incoming else first
+        right = outgoing["end_s"] if outgoing else last
+        fade_in = incoming["end_s"]-incoming["start_s"] if incoming else head_fade
+        fade_out = outgoing["end_s"]-outgoing["start_s"] if outgoing else tail_fade
         for anchor in anchors[start:end]:
             anchor["achieved_shift_s"] = shift
             anchor["residual_s"] = anchor["project_s"]+shift-anchor["target_s"]
+            anchor["fixed_by"] = [a["id"] for a in anchors[start:end] if "pin_shift_s" in a]
         source = left-origin-shift
         blocks.append({"position_s": left, "source_start_s": source,
                        "length_s": right-left, "rate": 1.,
                        "fade_in_s": fade_in, "fade_out_s": fade_out,
                        "event_ids": [a["id"] for a in anchors[start:end] if not a.get("pin")]})
     anchors = [a for a in anchors if not a.get("pin")]
-    before = np.abs([a["desired_shift_s"] for a in anchors])
-    after = np.abs([a["residual_s"] for a in anchors])
     return {"blocks": blocks, "seams": seams, "anchors": anchors, "phase": phase,
             "diagnostics": excluded, "protected_front_count": len(extra),
-            "median_error_before_s": float(np.median(before)),
-            "median_error_after_s": float(np.median(after)),
-            "p90_error_before_s": float(np.percentile(before, 90)),
-            "p90_error_after_s": float(np.percentile(after, 90))}
+            **timing_errors(anchors)}
+
+
+def timing_errors(anchors):
+    before = np.abs([a["desired_shift_s"] for a in anchors])
+    after = np.abs([a["residual_s"] for a in anchors])
+    return {f"{name}_error_{when}_s": float(np.percentile(values, percentile))
+            if len(values) else None
+            for name, percentile in (("median", 50), ("p90", 90))
+            for when, values in (("before", before), ("after", after))}

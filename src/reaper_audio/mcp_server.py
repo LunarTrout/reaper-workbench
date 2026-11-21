@@ -2223,7 +2223,7 @@ def reaper_media(action: str,
 
 @server.tool()
 @_guard
-def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "inspect", "preview", "apply", "undo"],
+def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review", "refine", "inspect", "preview", "apply", "undo"],
                   project_id: str | None = None,
                   track_guid: str | None = None,
                   item_guid: str | None = None,
@@ -2253,7 +2253,11 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "inspect
                   rhythm_choices: dict[str, str] | None = None,
                   context_analysis_ids: list[str] | None = None,
                   rhythm_offset: int = 0,
-                  rhythm_limit: int = 8) -> dict[str, Any]:
+                  rhythm_limit: int = 8,
+                  detail: Literal["summary", "full"] | None = None,
+                  review_kind: Literal["all", "residual", "unassigned"] = "all",
+                  review_offset: int = 0,
+                  review_limit: int = 12) -> dict[str, Any]:
     """Analyze audio timing against the project grid and build a 1x clip plan.
 
     Analyze a clean, file-backed take with an explicit item GUID. Clock verifies
@@ -2261,17 +2265,20 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "inspect
     rhythm interpretations with attack and release evidence. Read more with
     inspect(rhythm_id, rhythm_offset, rhythm_limit). Plan with the rhythm_id
     and optional rhythm_choices mapping segment IDs to option IDs or "keep".
-    Without a rhythm map, plan accepts a single subdivision or explicit
-    reference_events with event_id and target_s or qn. Inspect anchors and
-    seam scores before apply.
-    Apply creates native items and reads their geometry back. Use preview for
-    a dry A/B and undo with the transaction ID returned by apply.
+    Crossfade plan infers local rhythm by default; supply one subdivision or
+    explicit event targets to choose otherwise. Plan and refine summarize
+    assigned, unassigned and residual events. Review pages through those
+    events in project time. Refine replans a selected interval, retaining the
+    surrounding clips of the parent plan. Use detail=full for the geometry.
+    Apply verifies native item geometry. Use preview for a dry A/B and undo
+    with the transaction ID returned by apply.
     """
     from .daw.timing_service import (
-        validate_rhythm_analysis, build_timing_rhythm, measure_timing_clock,
-        plan_timing_crossfades, read_timing_rhythm,
+        build_timing_rhythm, crossfade_plan_view, inspect_timing_review,
+        measure_timing_clock, plan_timing_crossfades, read_timing_rhythm,
+        refine_timing, validate_rhythm_analysis,
     )
-    if action in {"analyze", "clock", "rhythm", "plan", "preview", "apply", "undo"}:
+    if action in {"analyze", "clock", "rhythm", "plan", "refine", "preview", "apply", "undo"}:
         _handbook_required()
     if action == "clock":
         if not item_guid:
@@ -2302,22 +2309,28 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "inspect
             raise ValidationError("analysis_id is required for plan")
         session = _session(project_id, bridge_session_id)
         explicit = rhythm_id is not None or reference_events is not None
-        snapshot = session.snapshot(project_id=project_id,
-                                    include_items=method == "crossfade" and explicit)
+        snapshot = session.snapshot(project_id=project_id, include_items=method == "crossfade")
         tempo = snapshot.get("tempo")
         if method == "crossfade":
             if (explicit and subdivisions is not None) or (
                     not explicit and subdivisions is not None and len(subdivisions) != 1):
                 raise ValidationError("Choose one subdivision, a rhythm map, or explicit targets")
-            if explicit:
-                validate_rhythm_analysis(analysis_id, snapshot)
+            validate_rhythm_analysis(analysis_id, snapshot)
+            if not explicit and subdivisions is None:
+                rhythm_id = build_timing_rhythm(
+                    analysis_id, snapshot=snapshot, tolerance_s=tolerance_s,
+                    grid_phase_s=grid_phase_s if grid_phase_s is not None else 0.,
+                    context_analysis_ids=context_analysis_ids or ())
+            elif context_analysis_ids:
+                raise ValidationError("Pass context analyses to rhythm or to automatic planning")
             result = plan_timing_crossfades(
                 analysis_id, tempo_context=tempo, subdivision=(subdivisions or [4])[0],
                 strength=strength, tolerance_s=tolerance_s, grid_phase_s=grid_phase_s,
                 protected_ranges=protected_ranges or (), project_id=project_id,
                 rhythm_id=rhythm_id, rhythm_choices=rhythm_choices,
                 reference_events=reference_events)
-            return {"ok": True, "action": action, **result}
+            return {"ok": True, "action": action,
+                    **crossfade_plan_view(result, detail=detail or "summary")}
         if rhythm_id or rhythm_choices:
             raise ValidationError("Rhythm maps require the crossfade method")
         result = plan_timing(analysis_id, tempo_context=tempo,
@@ -2328,14 +2341,29 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "inspect
                              protected_ranges=protected_ranges or (),
                              reference_events=reference_events)
         return {"ok": True, "action": action, **result}
+    if action == "review":
+        return {"ok": True, "action": action, **inspect_timing_review(
+            plan_id, kind=review_kind, start_s=start_s, end_s=end_s,
+            offset=review_offset, limit=review_limit)}
+    if action == "refine":
+        if method != "crossfade" or not plan_id:
+            raise ValidationError("Refine requires a crossfade timing plan_id")
+        if subdivisions is not None or rhythm_id or rhythm_choices or protected_ranges:
+            raise ValidationError("Refine uses the parent plan and optional explicit event targets")
+        snapshot = _session(project_id, bridge_session_id).snapshot(
+            project_id=project_id, include_items=True)
+        result = refine_timing(plan_id, snapshot=snapshot, start_s=start_s, end_s=end_s,
+                               reference_events=reference_events)
+        return {"ok": True, "action": action,
+                **crossfade_plan_view(result, detail=detail or "summary")}
     if action == "inspect":
         if rhythm_id:
             if analysis_id or plan_id:
                 raise ValidationError("Inspect one analysis, plan or rhythm map at a time")
             return {"ok": True, "action": action,
                     **read_timing_rhythm(rhythm_id, offset=rhythm_offset, limit=rhythm_limit)}
-        return {"ok": True, "action": action,
-                **inspect_timing(analysis_id=analysis_id, plan_id=plan_id)}
+        data = inspect_timing(analysis_id=analysis_id, plan_id=plan_id)
+        return {"ok": True, "action": action, **data}
     if action == "preview":
         if not isinstance(plan_id, str) or not plan_id:
             raise ValidationError("plan_id is required for preview")
@@ -2374,7 +2402,7 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "inspect
         session = _session(project_id, bridge_session_id)
         return {"ok": True, "action": action, **undo_timing_apply(
             session, plan_id, project_id=project_id, reason=reason)}
-    raise ValidationError("action must be analyze, clock, rhythm, plan, inspect, preview, apply or undo")
+    raise ValidationError("action must be analyze, clock, rhythm, plan, review, refine, inspect, preview, apply or undo")
 
 
 @server.tool()

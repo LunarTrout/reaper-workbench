@@ -292,7 +292,7 @@ Safe consolidations already made or kept deliberately:
 | `reaper_edit_map` | Build cut and seam evidence from an existing analysis; it does not edit the project. |
 | `reaper_render_candidate` | Render one applied plan's processed master output through the native REAPER path, for one exact interval, with verified settings restoration, explicit post-render revision, stage/FX/routing provenance, SHA-256 and a leased audio resource. |
 | `reaper_release` | Release one analysis or candidate report and its temporary WAV files now. |
-| `reaper_timing` | Analyze clean source attacks, rank local rhythm interpretations with `rhythm`, inspect pages by `rhythm_id`, and carry chosen targets into a native 1x crossfade plan. See [Audio timing](TIMING.md). |
+| `reaper_timing` | Analyze clean source attacks, infer local rhythm in `plan`, inspect explicit alternatives by `rhythm_id`, and use `review` and `refine` to address individual timing problems before applying the native 1x plan. See [Audio timing](TIMING.md). |
 
 ### Measurement by interval (3)
 

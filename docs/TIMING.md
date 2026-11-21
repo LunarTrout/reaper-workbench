@@ -19,13 +19,13 @@ track can remain active for playback.
    Analyze the whole item before replacing it. The response includes the
    observed attack front, peak, novelty, prominence, energy change and
    confidence. A detected front is a candidate.
-4. Call `reaper_timing(action="plan", analysis_id=..., subdivisions=[4],
-   tolerance_s=0.046, strength=1.0)` when the intended rhythm uses
-   sixteenth notes. Choose the musical subdivision from the performance,
-   including a different division for triplets. The argument is subdivisions
-   per quarter note. `grid_phase_s` defaults to zero and is an explicit offset
-   from the tempo map. Set `protected_ranges` to pin time windows that must
-   stay in place. Inspect the chosen `anchors`, `seams`, and `diagnostics`.
+4. Call `reaper_timing(action="plan", analysis_id=...)` to infer the rhythm
+   and obtain a plan with its `rhythm_id`. Use `subdivisions=[4]` to explicitly
+   select sixteenths across the item. An explicit grid uses divisions per
+   quarter note. `grid_phase_s` is a seconds offset from the tempo map.
+   Set `protected_ranges` to pin time windows. The summary reports the
+   coverage of the detected fronts and the largest remaining errors.
+   Use `detail="full"` or `inspect(plan_id=...)` for all blocks and seams.
 5. Use `preview` for a dry A/B of the item window. Use
    `reaper_timing(action="apply", plan_id=..., expected_revision=...,
    reason=..., dry_run=true)` to check the plan against REAPER and the file.
@@ -80,6 +80,32 @@ than force the grid, and note-level transcription of overlapping voices is
 outside this tool's current scope.
 
 
+
+## Review and refine a plan
+
+A crossfade plan reports all detected candidates, the assigned subset,
+and the number of assigned attacks that improved, stayed the same,
+or moved farther from their targets. The counts use sample resolution
+for comparison. An unassigned front may be a note attack, an ornament or
+noise. Inspect the evidence before choosing a target. Match errors refer
+to planned audio geometry. They do not verify the sound of a crossfade.
+
+```text
+reaper_timing(action="review", plan_id=..., review_kind="unassigned",
+              start_s=12.0, end_s=13.0)
+reaper_timing(action="review", plan_id=..., review_kind="residual")
+reaper_timing(action="refine", plan_id=..., start_s=12.0, end_s=13.0,
+              reference_events=[{"event_id":"evt_00012","qn":4.5}])
+```
+
+`review` also accepts `review_kind="all"` and pages with `review_offset` and
+`review_limit`. `refine` creates a child plan before the original item is
+replaced. It expands the requested interval to intersecting clips and keeps
+their outer fades and every clip outside those boundaries. Any explicit
+event targets must be reachable within the retained seams. A rejected
+refinement leaves the parent plan available. The child report shows the old
+and new error for each local target and how many surrounding clips were
+kept. A plan with no timing movement cannot replace the item.
 
 ## Plan decisions
 
