@@ -129,3 +129,11 @@ requires independent performers and a real holdout.
 - `metrics.py` — event/timing/duration metrics.
 - `run.py` — synthetic harness and JSON report.
 - `tests/` — exact-truth and baseline-failure tests.
+
+
+## Invalidation notice
+
+The old `*_MY_ALIGNED.wav` files and all C-vs-B numbers produced before
+2026-11-21 are invalid for algorithm evaluation: those shifts were measured
+from the human B and the C files were flat WAV renders, not Workbench edits.
+See `C_INVALIDATION.md`. They are historical only and must not be cited.
