@@ -1412,7 +1412,13 @@ class ProjectState:
                 continue
             selected.append(fact)
         selected.sort(key=lambda fact: (_canonical(fact.get("key")), str(fact.get("id"))))
-        return _clone(selected)
+        table = self._state.get("fingerprints")
+        clones = []
+        for fact in selected:
+            clone = _clone(fact)
+            clone["fingerprints"] = resolve_fingerprints(fact, table)
+            clones.append(clone)
+        return clones
 
     def coverage_summary(self) -> dict[str, Any]:
         """Fact counts by status and by source object, plus object coverage."""
