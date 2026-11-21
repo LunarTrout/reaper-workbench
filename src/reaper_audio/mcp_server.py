@@ -42,7 +42,7 @@ from .daw.media_wake import ensure_media_online
 from .daw.capture_jobs import (start_capture_job, capture_job_status,
                                capture_job_result, cancel_capture_job)
 from .context.state_query import (query_facts, changes_since as state_changes_since,
-                                  availability as state_availability)
+                                  availability as state_availability, public_stage)
 from .daw.midi import MidiService
 from .daw.edit import run_edit, send_list, undo_receipt
 from .daw.receipt import FileReceiptStore
@@ -507,7 +507,8 @@ def _require_capture_read_receipt(receipt: str | None, project_id: str,
                    state_window: list[float] | None = None,
                    state_metrics: list[str] | None = None,
                    state_status: str | None = None,
-                   state_since: int | None = None) -> dict[str, Any]:
+                   state_since: int | None = None,
+                   state_detail: str = "summary") -> dict[str, Any]:
     """Gate a model-facing archive read for one exact capture.
 
     Unlike a mutation gate, this must validate the receipt against the capture
@@ -1589,7 +1590,8 @@ def reaper_session(action: str = "health",
                    state_window: list[float] | None = None,
                    state_metrics: list[str] | None = None,
                    state_status: str | None = None,
-                   state_since: int | None = None) -> dict[str, Any]:
+                   state_since: int | None = None,
+                   state_detail: str = "summary") -> dict[str, Any]:
     """Inspect the REAPER connection or list live instances/projects.
 
     action: health, list_instances, list_projects, or dirty. When several
@@ -1625,6 +1627,25 @@ def reaper_session(action: str = "health",
             rows = query_facts(state, source_id=state_source, stage=state_stage,
                                window=state_window, metrics=state_metrics,
                                status=state_status)
+            if state_detail != "full":
+                keep = list(state_metrics or [])
+                compact = []
+                for row in rows:
+                    values = dict(row.get("values") or {})
+                    if keep:
+                        values = {key: values.get(key) for key in keep if key in values}
+                    compact.append({
+                        "source_id": row.get("source_id"),
+                        "stage": public_stage(row.get("stage")),
+                        "window": row.get("window"),
+                        "status": row.get("status"),
+                        "stale_reason": row.get("stale_reason"),
+                        "values": values,
+                        "measured_at": row.get("measured_at"),
+                        "revision": row.get("revision"),
+                        "overlaps": row.get("overlaps"),
+                    })
+                rows = compact
             return {"ok": True, "action": "state", "availability": report,
                     "facts": rows, "state_token": (state or {}).get("token")}
         if action == "preflight":

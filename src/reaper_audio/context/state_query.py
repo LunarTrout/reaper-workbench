@@ -583,6 +583,24 @@ def _collapse_latest(entries: list[tuple[int, Mapping[str, Any], Mapping[str, An
 # --------------------------------------------------------------------------- #
 
 
+
+
+def public_stage(stage: Any) -> str:
+    """Collapse internal render stage names to the documented three.
+
+    Writers keep the exact render provenance; readers speak via_master,
+    master or external_file so an agent does not have to know bridge internals.
+    """
+    text = str(stage or "")
+    if "external" in text:
+        return "external_file"
+    if "via_master" in text or "selected_track" in text:
+        return "via_master"
+    if text.startswith("master"):
+        return "master"
+    return text
+
+
 def query_facts(
     state: Mapping[str, Any],
     *,
