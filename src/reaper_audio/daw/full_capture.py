@@ -25,12 +25,14 @@ import soundfile as sf
 
 from ..analysis.artifacts import AudioArtifactWorkspace
 from ..analysis.audio import load_audio
+from ..context.capture_state import fill_state_from_capture
 from ..context.full_capture import CaptureArchive, FullCaptureRecord, REQUIRED_MAP_KEYS
 from ..context.ids import new_id
 from ..context import contract_v2
 from ..context.measurement_cache import MeasurementCache
 from ..context.panorama import (build_panorama, build_relation_domain, load_panorama,
                                 panorama_path_for_record)
+from ..context.project_state import ProjectState, StateStore
 from ..context.render_dependencies import build_render_manifest
 from ..context.changes import digest_facts
 from ..errors import (BridgeUnavailable, CaptureMasterInvalid, StaleContext,
@@ -1104,6 +1106,24 @@ class FullCaptureService:
                         "master_attempts": stored_attempts,
                     },
                 )
+
+            # The captured record is now the durable audio truth.  Fill the
+            # one mutable project state from the same record so later reads
+            # query objects, facts and staleness from one place instead of a
+            # parallel capture snapshot.  The legacy archive above stays; a
+            # later stream removes it.
+            state_store = StateStore(self.archive_root)
+            project_state = ProjectState(state_store, stored.project_id)
+            state_fill = fill_state_from_capture(
+                project_state,
+                self.session,
+                stored,
+                section=(start_s, end_s),
+                revision=stored.revision_before,
+            )
+            state_path = project_state.save()
+            state_fill = {**state_fill, "ok": True, "path": str(state_path)}
+
             return {
                 "ok": True,
                 "capture_status": (
@@ -1136,6 +1156,7 @@ class FullCaptureService:
                 },
                 "master_validation": final_master_validation,
                 "master_attempts": stored_attempts,
+                "state": state_fill,
                 "timings": {
                     **record.timings,
                     "archive_s": round(archive_end - archive_start, 3),

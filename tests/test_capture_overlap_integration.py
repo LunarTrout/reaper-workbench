@@ -195,6 +195,9 @@ def test_capture_renders_master_first_overlaps_batches_and_maps_analysis(
 
     assert result["ok"] is True
     assert result["capture_status"] == "valid"
+    assert result["state"]["ok"] is True
+    assert result["state"]["facts_written"] == 9
+    assert Path(result["state"]["path"]).is_file()
     assert len(result["master_attempts"]) == 1
     assert result["master_attempts"][0]["selected"] is True
     assert result["master_attempts"][0]["source_activity"]["audible_count"] == 8
