@@ -22,13 +22,6 @@ env/
 # Local REAPER projects, renders, and validation profiles
 /work/
 # Local research and parity notes are not part of the public product docs.
-/docs/AI-INTERFACE.ru.md
-/docs/ANALYSIS-DEPENDENCIES.ru.md
-/docs/FEATURE-PARITY.ru.md
-/docs/FLCTRL-PARITY.ru.md
-/docs/INTELLIGENT-WORKFLOW.ru.md
-/docs/REAPER-MCP-AUDIT.ru.md
-/docs/STATUS.ru.md
 # Superseded bridge snapshot kept locally for comparison.
 /scripts/reaper_bridge.full.lua
 /scripts/reaper_bridge.lua.bak_*

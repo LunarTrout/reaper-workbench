@@ -119,7 +119,7 @@ After connecting, use this order:
 3. Use `reaper_capabilities` or `reaper_api_search` to discover an operation before making a low-level call.
 4. For a supported edit, preview the revision-bound plan, apply it, read back the touched objects, and undo only when the returned revision still identifies that transaction as the newest edit.
 
-See [MCP-README-LLM.md](MCP-README-LLM.md) for the model-facing contract and tool semantics.
+See the [handbook](HANDBOOK.md) for the model-facing contract and tool semantics.
 
 ## Audio and project files
 
