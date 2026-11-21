@@ -16,6 +16,7 @@ import shutil
 import time
 from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -61,6 +62,26 @@ MASTER_RENDER_MAX_ATTEMPTS = 2
 TRACK_SIGNAL_STAGE = "selected_track_via_master_parallel_batch_post_fx"
 MASTER_SIGNAL_STAGE = "master_mix_post_fx"
 MASTER_SILENCE_DBFS = -120.0
+
+
+@dataclass(frozen=True, slots=True)
+class PreRenderedCapture:
+    """Sources already rendered by an asynchronous capture job.
+
+    ``FullCaptureService.capture(..., pre_rendered=...)`` consumes these files
+    exactly like the master/track renders it would have produced itself: the
+    same admission checks, the same analysis pass and the same archive append.
+    Only the render RPCs are skipped, so the asynchronous path cannot fork a
+    second capture implementation.
+    """
+
+    workspace: AudioArtifactWorkspace
+    master_render: Mapping[str, Any]
+    tracks_render: Mapping[str, Any]
+    revision_after: Mapping[str, Any]
+    restore_report: Mapping[str, Any]
+    render_times: tuple[dict[str, Any], ...] = ()
+    bridge_job_id: str | None = None
 
 
 def _archived_record_binding(record: FullCaptureRecord, archived: Any) -> dict[str, Any]:
@@ -600,6 +621,7 @@ class FullCaptureService:
         include_midi_notes: bool = True,
         analysis_workers: int | None = None,
         producer: str = "hermes",
+        pre_rendered: PreRenderedCapture | None = None,
     ) -> dict[str, Any]:
         if channels not in {"stereo", "mono"}:
             raise ValidationError("channels must be stereo or mono")
@@ -692,7 +714,8 @@ class FullCaptureService:
         pipeline_stats: dict[str, Any] | None = None
         results: list[dict[str, Any]] | None = None
         try:
-            workspace = AudioArtifactWorkspace(workspace_root)
+            workspace = (pre_rendered.workspace if pre_rendered is not None
+                         else AudioArtifactWorkspace(workspace_root))
             tracks_by_guid = {
                 str(track.get("guid")): track
                 for track in tracks
@@ -724,11 +747,27 @@ class FullCaptureService:
             # The master is rendered and validated before any track batch.
             # A silent master is kept as an attempt and classified only after
             # the rendered sources exist; the historical two-attempt gate and
-            # its evidence contract are unchanged.
-            master_rendered = self._render_master_only(
-                current, workspace, f"{workspace.job_id}-master-1",
-                start_s, end_s, channels, sample_rate, tail_ms,
-            )
+            # its evidence contract are unchanged for the synchronous path.
+            if pre_rendered is None:
+                master_rendered = self._render_master_only(
+                    current, workspace, f"{workspace.job_id}-master-1",
+                    start_s, end_s, channels, sample_rate, tail_ms,
+                )
+            else:
+                # An asynchronous job already paid for the render.  Reuse its
+                # single master file through exactly the same admission and
+                # validation code below.
+                master_rendered = dict(pre_rendered.master_render)
+                master_rendered.setdefault(
+                    "revision_after", dict(pre_rendered.revision_after))
+                master_rendered["restore_report"] = dict(pre_rendered.restore_report)
+                master_rendered.setdefault("_elapsed_s", sum(
+                    float(row.get("elapsed_s") or 0.0)
+                    for row in pre_rendered.render_times))
+                self._profile["render_calls"] = len(pre_rendered.render_times)
+                self._profile["render_s"] = sum(
+                    float(row.get("elapsed_s") or 0.0)
+                    for row in pre_rendered.render_times)
             current = ProjectRevision.from_dict(master_rendered["revision_after"])
             master_item = self._one_file(master_rendered, workspace)
             master_path = Path(str(master_item["path"]))
@@ -776,7 +815,8 @@ class FullCaptureService:
                     master_submitted = True
                     first_submit_at = time.perf_counter()
 
-            incremental = (contract_v2.incremental_render_enabled()
+            incremental = (pre_rendered is None and
+                           contract_v2.incremental_render_enabled()
                            and analysis_cache is not None)
             reused_items: list[dict[str, Any]] = []
             dirty_guids = list(all_guids)
@@ -805,7 +845,14 @@ class FullCaptureService:
                         submit_cached([(str(row["source_guid"]), str(row["path"]))
                                        for row in reused_items])
             batch_plan = plan_capture_batches(tracks, digest)
-            if incremental and incremental_info.get("previous_capture"):
+            if pre_rendered is not None:
+                # The job already rendered every source one at a time; admit
+                # them as one complete set so the record keeps one batch row.
+                # The synchronous batch plan did not run, so do not report it.
+                batch_plan = None
+                full_project_render = True
+                planned_batches = [(all_guids, None)]
+            elif incremental and incremental_info.get("previous_capture"):
                 # D1 renders only the dirty subset; the master is always fresh.
                 planned_batches: list[tuple[list[str], int | None]] = (
                     [(list(dirty_guids), None)] if dirty_guids else [])
@@ -822,29 +869,38 @@ class FullCaptureService:
             for batch_guids, batch_number in planned_batches:
                 job_suffix = ("batch" if batch_number is None
                               else f"batch-{batch_number}")
-                try:
-                    rendered = self._render_batch(
-                        current, workspace, f"{workspace.job_id}-{job_suffix}",
-                        len(batch_guids), start_s, end_s, channels, sample_rate,
-                        tail_ms,
-                        track_guids=(None if full_project_render else batch_guids),
-                    )
-                except StaleContext:
-                    # The capture itself bumps change_count (render settings and
-                    # mute restore, R4).  Re-read the revision and retry once;
-                    # the semantic digest is what authorises the render, not the
-                    # counter.
-                    current_digest = self.bridge.project_digest(revision.project_id)
-                    if current_digest.get("sha256") != digest.get("sha256"):
-                        raise
-                    refreshed = self.session.snapshot(include_items=False).get("revision") or {}
-                    current = ProjectRevision.from_dict(refreshed)
-                    rendered = self._render_batch(
-                        current, workspace, f"{workspace.job_id}-{job_suffix}",
-                        len(batch_guids), start_s, end_s, channels, sample_rate,
-                        tail_ms,
-                        track_guids=(None if full_project_render else batch_guids),
-                    )
+                if pre_rendered is not None:
+                    rendered = dict(pre_rendered.tracks_render)
+                    rendered.setdefault("revision_after",
+                                        dict(pre_rendered.revision_after))
+                    rendered["restore_report"] = dict(pre_rendered.restore_report)
+                    rendered.setdefault("_elapsed_s", sum(
+                        float(row.get("elapsed_s") or 0.0)
+                        for row in pre_rendered.render_times))
+                else:
+                    try:
+                        rendered = self._render_batch(
+                            current, workspace, f"{workspace.job_id}-{job_suffix}",
+                            len(batch_guids), start_s, end_s, channels, sample_rate,
+                            tail_ms,
+                            track_guids=(None if full_project_render else batch_guids),
+                        )
+                    except StaleContext:
+                        # The capture itself bumps change_count (render settings and
+                        # mute restore, R4).  Re-read the revision and retry once;
+                        # the semantic digest is what authorises the render, not the
+                        # counter.
+                        current_digest = self.bridge.project_digest(revision.project_id)
+                        if current_digest.get("sha256") != digest.get("sha256"):
+                            raise
+                        refreshed = self.session.snapshot(include_items=False).get("revision") or {}
+                        current = ProjectRevision.from_dict(refreshed)
+                        rendered = self._render_batch(
+                            current, workspace, f"{workspace.job_id}-{job_suffix}",
+                            len(batch_guids), start_s, end_s, channels, sample_rate,
+                            tail_ms,
+                            track_guids=(None if full_project_render else batch_guids),
+                        )
                 current = ProjectRevision.from_dict(rendered["revision_after"])
                 admitted = self._admit_track_batch(
                     rendered, batch_guids, tracks_by_guid, workspace)
@@ -894,7 +950,8 @@ class FullCaptureService:
             _apply_master_classification(
                 master_entry, master_validation, master_classification,
                 source_activity)
-            if master_is_silent and not master_classification["expected_silence"]:
+            if (pre_rendered is None and master_is_silent and
+                    not master_classification["expected_silence"]):
                 extra_master_files[str(master_entry["sha256"])] = str(master_path)
                 rendered = self._render_master_only(
                     current, workspace, f"{workspace.job_id}-master-2",
@@ -1044,6 +1101,13 @@ class FullCaptureService:
                     "render_master_s": master_rendered.get("_elapsed_s"),
                     "render_calls": self._profile["render_calls"],
                     "renders": self._profile["render_calls"],
+                    **({"async_render": {
+                        "scheduling": "per_source_bridge_job",
+                        "bridge_job_id": pre_rendered.bridge_job_id,
+                        "sources_rendered": len(pre_rendered.render_times),
+                        "source_render_s": [dict(row)
+                                            for row in pre_rendered.render_times],
+                    }} if pre_rendered is not None else {}),
                     "incremental_render": incremental_info,
                     "analyses": sum(1 for item in (results or []) if not item.get("reused")),
                     "analyses_reused": sum(1 for item in (results or []) if item.get("reused")),
@@ -2070,4 +2134,4 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-__all__ = ["FullCaptureService"]
+__all__ = ["FullCaptureService", "PreRenderedCapture"]

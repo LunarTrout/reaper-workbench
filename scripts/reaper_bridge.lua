@@ -45,7 +45,7 @@ if _G.__reaper_audio_bridge_resident and not _G.__reaper_audio_bridge_reloading 
   return
 end
 _G.__reaper_audio_bridge_resident = true
-local bridge_build = "b23-2026-11-21"  -- midi.replace for bass line rewrites
+local bridge_build = "b25-2026-11-21"  -- async per-source capture jobs
 -- A second boot inside the same REAPER Lua state must supersede the first:
 -- two loops would both keep heartbeating and the client would see two live
 -- bridges. Every loop compares this token before it reschedules; the newest
@@ -2262,6 +2262,637 @@ local function project_capture_render(arguments)
   capture.revision_before = revision
   capture.revision_after = project_identity_state(project, path)
   return capture
+end
+
+-- ---------------------------------------------------------------------------
+-- Asynchronous capture jobs: one source per render request.
+--
+-- ``project.capture_render`` above still renders every source in one blocking
+-- call and stays the synchronous path.  The additive operations below split
+-- the same work over a job handle so the resident loop can heartbeat and
+-- answer other requests between sources:
+--
+--   project.capture_begin      validate + save render settings, selection and
+--                              transport once; enumerate the source list
+--   project.capture_render_one render exactly one source at ``index`` and
+--                              return its file; never saves/restores settings
+--   project.capture_end        restore the saved state exactly once and return
+--                              every rendered file
+--
+-- A job lives in this script's memory only.  The client owns the durable job
+-- document; the bridge owns the project state it must restore.
+-- ---------------------------------------------------------------------------
+local capture_jobs = {}
+local capture_job_numeric_fields = { "RENDER_SETTINGS", "RENDER_BOUNDSFLAG",
+                                     "RENDER_CHANNELS", "RENDER_SRATE",
+                                     "RENDER_ADDTOPROJ", "RENDER_TAILFLAG",
+                                     "RENDER_TAILMS", "RENDER_DITHER",
+                                     "RENDER_NORMALIZE" }
+local capture_job_string_fields = { "RENDER_FILE", "RENDER_PATTERN",
+                                    "RENDER_FORMAT", "RENDER_FORMAT2" }
+-- The production capture contract is selected-tracks-via-master with the
+-- parallel-via-master bit (128 + (8 << 16)); the synchronous batch path passes
+-- ``render_settings=128`` and ``parallel_via_master=True``, which computes the
+-- same value inside project_capture_render.  One selected track renders through
+-- the master exactly like the batch path, so the async job must not substitute
+-- the non-parallel 128 mode (docs/FULL-CAPTURE.md: Delivery and restoration).
+local capture_job_track_render_settings = 128 + (8 << 16)
+
+local function capture_job_same_path(left, right)
+  local function normalized(value)
+    return value:gsub("/", "\\"):gsub("\\+", "\\"):lower()
+  end
+  return type(left) == "string" and type(right) == "string" and
+         normalized(left) == normalized(right)
+end
+-- Save every project field the async capture rewrites.  This runs exactly
+-- once per job, at capture_begin, and the matching restore runs exactly once
+-- at capture_end.
+local function capture_job_save_state(project)
+  local numeric, strings = {}, {}
+  for _, name in ipairs(capture_job_numeric_fields) do
+    local value = reaper.GetSetProjectInfo(project, name, 0, false)
+    if not finite_number(value) then
+      fail("api_unavailable", "REAPER returned an invalid render setting",
+           { setting = name })
+    end
+    numeric[name] = value
+  end
+  for _, name in ipairs(capture_job_string_fields) do
+    local ok, value = reaper.GetSetProjectInfo_String(project, name, "", false)
+    if not ok or type(value) ~= "string" then
+      fail("api_unavailable", "REAPER could not read a render setting",
+           { setting = name })
+    end
+    strings[name] = value
+  end
+  local dirty = reaper.GetSetProjectInfo(project, "DIRTY", 0, false)
+  if not finite_number(dirty) then
+    fail("api_unavailable", "REAPER returned an invalid project dirty state")
+  end
+  local time_start, time_end = reaper.GetSet_LoopTimeRange2(
+    project, false, false, 0, 0, false)
+  return {
+    numeric = numeric,
+    strings = strings,
+    dirty = dirty,
+    time_start = time_start,
+    time_end = time_end,
+    transport = {
+      play_state = reaper.GetPlayStateEx(project),
+      cursor_s = reaper.GetCursorPositionEx(project),
+      edit_cursor_s = reaper.GetCursorPositionEx(project),
+      play_position_s = reaper.GetPlayPositionEx(project),
+    },
+  }
+end
+
+-- Compare live values to the saved ones and write only what moved.  Writing
+-- every field unconditionally would advance the project change counter for no
+-- reason; skipping a differing field would leave the project in render state.
+local function capture_job_restore_state(project, job)
+  local saved = job.saved
+  local failures = {}
+  for _, name in ipairs(capture_job_numeric_fields) do
+    local current = reaper.GetSetProjectInfo(project, name, 0, false)
+    if not finite_number(current) or
+       math.abs(current - saved.numeric[name]) > 1e-9 then
+      local ok, value = pcall(reaper.GetSetProjectInfo, project, name,
+                              saved.numeric[name], true)
+      if not ok or not finite_number(value) then
+        failures[#failures + 1] = name
+      end
+    end
+  end
+  for _, name in ipairs(capture_job_string_fields) do
+    local read_ok, current = reaper.GetSetProjectInfo_String(project, name, "", false)
+    if not read_ok or current ~= saved.strings[name] then
+      local ok, value = pcall(reaper.GetSetProjectInfo_String, project, name,
+                              saved.strings[name], true)
+      if not ok or value == false then
+        failures[#failures + 1] = name
+      end
+    end
+  end
+  for position, track in ipairs(job.track_order) do
+    if track ~= nil then
+      local ok = pcall(reaper.SetTrackSelected, track, job.selected[position])
+      if not ok then failures[#failures + 1] = "track_selection:" .. tostring(position - 1) end
+    end
+  end
+  local dirty_now = reaper.GetSetProjectInfo(project, "DIRTY", 0, false)
+  if finite_number(dirty_now) and math.abs(dirty_now - saved.dirty) <= 1e-9 then
+    -- already restored
+  else
+    local ok, value = pcall(reaper.GetSetProjectInfo, project, "DIRTY", saved.dirty, true)
+    local after = reaper.GetSetProjectInfo(project, "DIRTY", 0, false)
+    if not ok or not finite_number(value) or not finite_number(after) or
+       math.abs(after - saved.dirty) > 1e-9 then
+      failures[#failures + 1] = "project_dirty_state"
+    end
+  end
+  local start_now, end_now = reaper.GetSet_LoopTimeRange2(project, false, false,
+                                                          0, 0, false)
+  if not finite_number(start_now) or not finite_number(end_now) or
+     math.abs(start_now - saved.time_start) > 1e-9 or
+     math.abs(end_now - saved.time_end) > 1e-9 then
+    local ok = pcall(reaper.GetSet_LoopTimeRange2, project, true, false,
+                     saved.time_start, saved.time_end, false)
+    local check_start, check_end = reaper.GetSet_LoopTimeRange2(
+      project, false, false, 0, 0, false)
+    if not ok or not finite_number(check_start) or not finite_number(check_end) or
+       math.abs(check_start - saved.time_start) > 1e-9 or
+       math.abs(check_end - saved.time_end) > 1e-9 then
+      failures[#failures + 1] = "time_selection"
+    end
+  end
+  local cursor_ok = pcall(reaper.SetEditCurPos2, project,
+                          saved.transport.cursor_s, false, false)
+  if not cursor_ok or
+     math.abs(reaper.GetCursorPositionEx(project) - saved.transport.cursor_s) > 1e-6 then
+    failures[#failures + 1] = "edit_cursor"
+  end
+  if reaper.GetPlayStateEx(project) ~= saved.transport.play_state then
+    failures[#failures + 1] = "play_state"
+  end
+  if job.previous_active and job.previous_active ~= project then
+    local ok = pcall(reaper.SelectProjectInstance, job.previous_active)
+    if not ok then failures[#failures + 1] = "active_project_tab" end
+  end
+  return failures, {
+    play_state = reaper.GetPlayStateEx(project),
+    cursor_s = reaper.GetCursorPositionEx(project),
+    edit_cursor_s = reaper.GetCursorPositionEx(project),
+    play_position_s = reaper.GetPlayPositionEx(project),
+    play_position_observed = true,
+    play_position_restorable = false,
+    position_verified = "edit_cursor_s",
+  }
+end
+
+local function capture_job_effective_rate(project, settings)
+  local rate = settings.RENDER_SRATE
+  local source = "render_setting"
+  if rate <= 0 then
+    source = "project_srate"
+    local ok, project_rate = pcall(reaper.GetSetProjectInfo, project,
+                                   "PROJECT_SRATE", 0, false)
+    if ok and finite_number(project_rate) and project_rate > 0 then
+      rate = project_rate
+    else
+      rate = 0
+      source = "unknown"
+    end
+  end
+  return rate, source
+end
+
+local function capture_job_read_settings(project)
+  local settings, missing = {}, nil
+  for _, name in ipairs({ "RENDER_SETTINGS", "RENDER_BOUNDSFLAG",
+                          "RENDER_CHANNELS", "RENDER_SRATE",
+                          "RENDER_TAILFLAG", "RENDER_TAILMS",
+                          "RENDER_ADDTOPROJ" }) do
+    local value = reaper.GetSetProjectInfo(project, name, 0, false)
+    if not finite_number(value) then
+      missing = name
+      break
+    end
+    settings[name] = value
+  end
+  if missing then
+    error("REAPER returned an invalid " .. missing .. " after render setup")
+  end
+  return settings
+end
+
+local function capture_job_apply_render_settings(project, job)
+  local function set_number(name, value)
+    local current = reaper.GetSetProjectInfo(project, name, 0, false)
+    if finite_number(current) and math.abs(current - value) <= 1e-9 then
+      return
+    end
+    local ok_set = pcall(reaper.GetSetProjectInfo, project, name, value, true)
+    if not ok_set then error("REAPER rejected render setting " .. name) end
+    local actual = reaper.GetSetProjectInfo(project, name, 0, false)
+    if not finite_number(actual) or math.abs(actual - value) > 1e-9 then
+      error("REAPER did not retain render setting " .. name)
+    end
+  end
+  local function set_string(name, value)
+    local _, current = reaper.GetSetProjectInfo_String(project, name, "", false)
+    if type(current) == "string" and current == value then return end
+    local ok_set, result = reaper.GetSetProjectInfo_String(project, name, value, true)
+    if not ok_set or result == false then
+      error("REAPER rejected render setting " .. name)
+    end
+  end
+
+  set_string("RENDER_FILE", job.output_dir)
+  set_string("RENDER_PATTERN", job.prefix .. "$tracknumber-$track")
+  set_string("RENDER_FORMAT", "evaw")
+  set_string("RENDER_FORMAT2", "")
+  -- Track sources are rendered through the master with the selected-track
+  -- render mode; capture_render_one flips this to 0 for the master source.
+  set_number("RENDER_SETTINGS", capture_job_track_render_settings)
+  if job.has_section then
+    local range_ok = reaper.GetSet_LoopTimeRange2(
+      project, true, false, job.section_start, job.section_end, false)
+    if not range_ok then error("REAPER rejected the analysis time selection") end
+    set_number("RENDER_BOUNDSFLAG", 2)
+  else
+    set_number("RENDER_BOUNDSFLAG", 1)
+  end
+  set_number("RENDER_CHANNELS", job.render_channels)
+  set_number("RENDER_SRATE", job.sample_rate)
+  if job.tail_ms > 0 then
+    local bounds_flag = job.has_section and 2 or 1
+    set_number("RENDER_TAILFLAG", 2 ^ bounds_flag)
+    set_number("RENDER_TAILMS", job.tail_ms)
+  else
+    set_number("RENDER_TAILFLAG", 0)
+    set_number("RENDER_TAILMS", 0)
+  end
+  set_number("RENDER_ADDTOPROJ", 0)
+  set_number("RENDER_DITHER", 16)
+  set_number("RENDER_NORMALIZE", 0)
+end
+
+local function capture_begin(arguments)
+  local project, path = target_project(arguments)
+  local job_id = arguments.job_id
+  if type(job_id) ~= "string" or not job_id:match("^[A-Za-z0-9_-]+$") or #job_id > 64 then
+    fail("validation_error", "job_id must contain 1 to 64 safe filename characters")
+  end
+  if capture_jobs[job_id] ~= nil then
+    fail("validation_error", "A capture job with this id is already open",
+         { job = job_id })
+  end
+  local output_dir = arguments.output_dir
+  if type(output_dir) ~= "string" or output_dir == "" or
+     not (output_dir:match("^[A-Za-z]:[/\\]") or output_dir:match("^[/\\][/\\]")) then
+    fail("validation_error", "output_dir must be an absolute Windows path")
+  end
+  local channels_name = arguments.channels
+  if channels_name == nil or channels_name == json.null then channels_name = "stereo" end
+  if channels_name ~= "stereo" and channels_name ~= "mono" then
+    fail("validation_error", "channels must be \"stereo\" or \"mono\"",
+         { channels = channels_name })
+  end
+  local sample_rate = arguments.sample_rate
+  if sample_rate == nil or sample_rate == json.null then sample_rate = 0 end
+  if not finite_number(sample_rate) or sample_rate < 0 or sample_rate > 768000 then
+    fail("validation_error",
+         "sample_rate must be 0 (project rate) or a finite rate up to 768000",
+         { sample_rate = sample_rate })
+  end
+  local tail_ms = arguments.tail_ms
+  if tail_ms == nil or tail_ms == json.null then tail_ms = 0 end
+  if not finite_number(tail_ms) or tail_ms < 0 or tail_ms > 3600000 then
+    fail("validation_error", "tail_ms must be a finite number of milliseconds >= 0",
+         { tail_ms = tail_ms })
+  end
+  local revision = project_identity_state(project, path)
+  local expected = arguments.expected_revision
+  if not same_revision_fields(expected, revision) then
+    fail("stale_context", "Project changed before the asynchronous capture",
+         { expected = expected, current = revision })
+  end
+  if reaper.GetPlayStateEx(project) ~= 0 then
+    fail("validation_error", "Stop playback before an asynchronous capture",
+         { play_state = reaper.GetPlayStateEx(project) })
+  end
+  local media_issues = unresolved_sources(project)
+  if #media_issues > 0 then
+    fail("media_unresolved",
+         "Some take sources could not be resolved; the analysis render would be silent",
+         { sources = media_issues })
+  end
+
+  local prior_active = select(1, reaper.EnumProjects(-1, ""))
+  local switched_active = false
+  if prior_active ~= project then
+    local select_ok, selected = pcall(reaper.SelectProjectInstance, project)
+    if not select_ok or selected == false then
+      fail("api_unavailable", "REAPER could not activate the target project for rendering",
+           { project_id = path or "" })
+    end
+    switched_active = true
+  end
+
+  local saved = capture_job_save_state(project)
+  local track_count = reaper.CountTracks(project)
+  local track_order, selected = {}, {}
+  local sources, sources_by_index = json.array(), {}
+  for index = 0, track_count - 1 do
+    local track = reaper.GetTrack(project, index)
+    track_order[index + 1] = track
+    selected[index + 1] = reaper.IsTrackSelected(track)
+    local name_ok, track_name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
+    if not name_ok then track_name = "" end
+    if track_name == "" then track_name = "Track " .. tostring(index + 1) end
+    local source = {
+      index = index,
+      guid = reaper.GetTrackGUID(track),
+      name = track_name,
+      is_master = false,
+    }
+    sources[#sources + 1] = source
+    sources_by_index[index] = source
+  end
+  local master = reaper.GetMasterTrack(project)
+  local master_guid = reaper.GetTrackGUID(master)
+  local master_source = { index = -1, guid = master_guid, name = "MASTER",
+                          is_master = true }
+  sources[#sources + 1] = master_source
+  sources_by_index[-1] = master_source
+
+  local section_start = arguments.section_start_s
+  local section_end = arguments.section_end_s
+  local has_section = finite_number(section_start) and finite_number(section_end) and
+                      section_end > section_start
+  local job = {
+    job_id = job_id,
+    project = project,
+    project_id = revision.project_id,
+    path = revision.path,
+    revision = revision,
+    output_dir = output_dir,
+    prefix = "rali-" .. job_id .. "-",
+    saved = saved,
+    track_order = track_order,
+    selected = selected,
+    track_count = track_count,
+    master_guid = master_guid,
+    sources = sources,
+    sources_by_index = sources_by_index,
+    section_start = section_start,
+    section_end = section_end,
+    has_section = has_section,
+    channels = channels_name,
+    render_channels = channels_name == "mono" and 1 or 2,
+    sample_rate = sample_rate,
+    tail_ms = tail_ms,
+    rendered = json.array(),
+    rendered_by_index = {},
+    master_rendered = false,
+    previous_active = switched_active and prior_active or nil,
+  }
+
+  local ok, apply_error = xpcall(function()
+    capture_job_apply_render_settings(project, job)
+    job.settings_used = capture_job_read_settings(project)
+  end, function(err) return err end)
+  if not ok then
+    local restore_failures = capture_job_restore_state(project, job)
+    fail("capture_failed", tostring(apply_error),
+         { job = job_id, phase = "capture_begin",
+           restore_failures = restore_failures })
+  end
+  capture_jobs[job_id] = job
+  reaper.defer(function() end)
+  return {
+    job = job_id,
+    project_id = job.project_id,
+    revision = revision,
+    revision_after = project_identity_state(project, path),
+    sources = sources,
+    total = #sources,
+    channels = job.render_channels,
+    sample_rate = select(1, capture_job_effective_rate(project, job.settings_used)),
+    tail_s = tail_ms / 1000,
+    render_settings_used = job.settings_used,
+  }
+end
+
+local function capture_render_one(arguments)
+  local job_id = arguments.job
+  if type(job_id) ~= "string" or capture_jobs[job_id] == nil then
+    fail("validation_error", "Unknown capture job; call project.capture_begin first",
+         { job = job_id })
+  end
+  local job = capture_jobs[job_id]
+  local project, path = target_project({ project_id = job.project_id })
+  local live = project_identity_state(project, path)
+  if normalize_project_id(live.project_id) ~= normalize_project_id(job.project_id) or
+     not capture_job_same_path(live.path, job.path) then
+    fail("stale_context", "The active project changed during the capture job",
+         { job = job_id, expected = job.project_id, current = live.project_id })
+  end
+  if reaper.GetPlayStateEx(project) ~= 0 then
+    fail("validation_error", "Stop playback before an asynchronous capture render",
+         { play_state = reaper.GetPlayStateEx(project) })
+  end
+  local index = arguments.index
+  if type(index) ~= "number" or index % 1 ~= 0 then
+    fail("validation_error", "index must be an integer source index")
+  end
+  local source = job.sources_by_index[index]
+  if source == nil then
+    fail("validation_error", "index does not name a source in this capture job",
+         { job = job_id, index = index, total = #job.sources })
+  end
+  if source.is_master then
+    if job.master_rendered then
+      fail("validation_error", "The master source was already rendered for this job",
+           { job = job_id })
+    end
+  else
+    if job.rendered_by_index[index] then
+      fail("validation_error", "This source was already rendered for this job",
+           { job = job_id, index = index })
+    end
+    local track = reaper.GetTrack(project, index)
+    if track == nil or reaper.GetTrackGUID(track) ~= source.guid then
+      fail("stale_context", "The project track layout changed during the capture job",
+           { job = job_id, index = index, expected_guid = source.guid })
+    end
+    for position = 0, job.track_count - 1 do
+      reaper.SetTrackSelected(reaper.GetTrack(project, position), position == index)
+    end
+  end
+
+  -- Before/after enumeration is the only mapping source that cannot be fooled
+  -- by a track name: REAPER decides the file name from the render pattern.
+  local before = {}
+  do
+    local i = 0
+    while true do
+      local name = reaper.EnumerateFiles(job.output_dir, i)
+      if name == nil then break end
+      before[name] = true
+      i = i + 1
+    end
+  end
+  local render_settings = source.is_master and 0 or capture_job_track_render_settings
+  local function set_render_settings(value)
+    local current = reaper.GetSetProjectInfo(project, "RENDER_SETTINGS", 0, false)
+    if finite_number(current) and math.abs(current - value) <= 1e-9 then return end
+    local ok_set = pcall(reaper.GetSetProjectInfo, project, "RENDER_SETTINGS", value, true)
+    if not ok_set then error("REAPER rejected the capture render mode") end
+    local actual = reaper.GetSetProjectInfo(project, "RENDER_SETTINGS", 0, false)
+    if not finite_number(actual) or math.abs(actual - value) > 1e-9 then
+      error("REAPER did not retain the capture render mode")
+    end
+  end
+
+  local ok, result = xpcall(function()
+    set_render_settings(render_settings)
+    local action_name = reaper.kbd_getTextFromCmd(
+      42230, reaper.SectionFromUniqueID(0))
+    if type(action_name) ~= "string" or
+       not action_name:lower():find("render project", 1, true) then
+      error("The installed REAPER render action 42230 is unavailable")
+    end
+    reaper.Main_OnCommandEx(42230, 0, project)
+
+    local produced = {}
+    local i = 0
+    while true do
+      local name = reaper.EnumerateFiles(job.output_dir, i)
+      if name == nil then break end
+      if not before[name] and name:lower():match("%.wav$") and
+         name:sub(1, #job.prefix) == job.prefix then
+        produced[#produced + 1] = job.output_dir .. "/" .. name
+      end
+      i = i + 1
+    end
+    if #produced ~= 1 then
+      error("An asynchronous capture source render must produce exactly one file: got " ..
+            tostring(#produced))
+    end
+    local target = produced[1]
+    local name = target:match("([^/\\]+)$") or ""
+    local rest = name:sub(#job.prefix + 1)
+    local number = tonumber(rest:match("^(%d+)")) or 0
+    local file_guid, track_name, track_index, is_master
+    if source.is_master then
+      if number >= 1 and number <= job.track_count then
+        error("The master render mapped to a project track: " .. target)
+      end
+      file_guid, track_name, track_index, is_master =
+        job.master_guid, "MASTER", -1, true
+    else
+      if number ~= index + 1 then
+        error("The rendered file number does not match the requested track: " .. target)
+      end
+      local track = reaper.GetTrack(project, index)
+      local guids_ok, live_guid = pcall(reaper.GetTrackGUID, track)
+      if not guids_ok or live_guid ~= source.guid then
+        error("The rendered track changed during the capture job: " .. target)
+      end
+      file_guid, track_name, track_index, is_master =
+        source.guid, source.name, index, false
+    end
+    local file = io.open(target, "rb")
+    if not file then error("REAPER did not create analysis audio: " .. target) end
+    local bytes = file:seek("end") or 0
+    file:close()
+    if bytes <= 44 then
+      error("REAPER created an empty or invalid WAV: " .. target)
+    end
+    local settings = capture_job_read_settings(project)
+    local rate, rate_source = capture_job_effective_rate(project, settings)
+    return {
+      job = job_id,
+      project_id = job.project_id,
+      revision = live,
+      revision_after = project_identity_state(project, path),
+      capture_point = "native_render_async_job_source",
+      files = json.array({ {
+        source_guid = file_guid,
+        name = track_name,
+        track_index = track_index,
+        is_master = is_master,
+        path = target,
+        bytes = bytes,
+      } }),
+      render_settings_requested = render_settings,
+      render_settings_used = settings,
+      channels = job.render_channels,
+      sample_rate = rate,
+      sample_rate_source = rate_source,
+      tail_s = job.tail_ms / 1000,
+      index = index,
+      is_master = is_master,
+      rendered_total = #job.rendered + 1,
+    }
+  end, function(err) return err end)
+
+  if not ok then
+    fail("capture_failed", tostring(result),
+         { job = job_id, index = index, phase = "capture_render_one" })
+  end
+  local file_row = result.files[1]
+  job.rendered[#job.rendered + 1] = file_row
+  job.rendered_by_index[index] = true
+  if source.is_master then job.master_rendered = true end
+  -- Yield to REAPER before returning.  The resident loop reschedules itself
+  -- after this request, and this no-op deferral gives REAPER a turn even if a
+  -- client sends the next request immediately.
+  reaper.defer(function() end)
+  return result
+end
+
+local function capture_end(arguments)
+  local job_id = arguments.job
+  if type(job_id) ~= "string" or capture_jobs[job_id] == nil then
+    fail("validation_error", "Unknown capture job; call project.capture_begin first",
+         { job = job_id })
+  end
+  local job = capture_jobs[job_id]
+  local project, path = target_project({ project_id = job.project_id })
+  local live = project_identity_state(project, path)
+  if normalize_project_id(live.project_id) ~= normalize_project_id(job.project_id) or
+     not capture_job_same_path(live.path, job.path) then
+    fail("stale_context", "The active project changed before the capture job ended",
+         { job = job_id, expected = job.project_id, current = live.project_id })
+  end
+  local failures, restored_transport = capture_job_restore_state(project, job)
+  local files = json.array()
+  for _, row in ipairs(job.rendered) do files[#files + 1] = row end
+  local dirty_after = reaper.GetSetProjectInfo(project, "DIRTY", 0, false)
+  local start_after, end_after = reaper.GetSet_LoopTimeRange2(
+    project, false, false, 0, 0, false)
+  local restore_report = {
+    restored = (#failures == 0),
+    failures = json.array(failures),
+    dirty_before = job.saved.dirty,
+    dirty_after = dirty_after,
+    time_selection_before = { start_s = job.saved.time_start,
+                              end_s = job.saved.time_end },
+    time_selection_after = { start_s = start_after, end_s = end_after },
+    transport_position_before_s = job.saved.transport.edit_cursor_s,
+    transport_position_after_s = restored_transport.edit_cursor_s,
+    transport_position_kind = "edit_cursor_s",
+    play_position_semantics = "observed_playback_not_project_cursor",
+    transport_before = job.saved.transport,
+    transport_after = restored_transport,
+  }
+  if #failures > 0 then
+    -- Keep the job so a later capture_end can retry the restore instead of
+    -- stranding the render settings for the rest of the REAPER session.
+    fail("capture_restore_failed",
+         "Capture job ended but REAPER settings could not be restored",
+         { job = job_id, restore_failures = failures, files = files,
+           restore_report = restore_report })
+  end
+  capture_jobs[job_id] = nil
+  reaper.defer(function() end)
+  return {
+    job = job_id,
+    project_id = job.project_id,
+    revision = job.revision,
+    revision_after = project_identity_state(project, path),
+    files = files,
+    rendered_count = #files,
+    channels = job.render_channels,
+    sample_rate = select(1, capture_job_effective_rate(project, job.settings_used)),
+    tail_s = job.tail_ms / 1000,
+    render_settings_used = job.settings_used,
+    restore_report = restore_report,
+    capture_point = "native_render_async_job",
+  }
 end
 
 local function projects_list()
@@ -4814,6 +5445,9 @@ local operations = {
   ["project.tempo_at"] = project_tempo_at,
   ["project.render_settings.read"] = project_render_settings_read,
   ["project.capture_render"] = project_capture_render,
+  ["project.capture_begin"] = capture_begin,
+  ["project.capture_render_one"] = capture_render_one,
+  ["project.capture_end"] = capture_end,
   ["project.set_track_mutes"] = project_set_track_mutes,
   ["project.sample_tracks"] = project_sample_tracks,
   ["fx.list_installed"] = fx_list_installed,
