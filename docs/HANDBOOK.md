@@ -95,7 +95,7 @@ reaper_edit(mode="preview", project_id=..., expected_revision=..., reason="...",
 
 **analysis** — `reaper_analyze` runs analyzers over a capture or the live project; `reaper_mix_evidence` returns mix evidence; `reaper_edit_map` maps editable targets; `reaper_render_candidate(plan_id, project_id, revision_after, start_s, end_s, max_duration_s=120)` renders an applied plan's master; `reaper_release` frees a leased artifact.
 
-**inspect** — `reaper_evidence` quotes units behind an evidence token; `reaper_calibrate` records a plug-in parameter map; `reaper_midi` reads and edits MIDI takes.
+**inspect** — `reaper_evidence` quotes units behind an evidence token; `reaper_calibrate` records a plug-in parameter map; `reaper_midi` reads and edits MIDI takes; `reaper_timing` analyzes audio attacks against the tempo grid and returns a 1x clip plan (`analyze` → `plan` → `inspect`; apply through `reaper_edit`).
 
 **discovery** — `reaper_capabilities` lists tools and analyzers; `reaper_api_search` + `reaper_api_call` reach the REAPER API catalog; `reaper_action` invokes native Actions.
 

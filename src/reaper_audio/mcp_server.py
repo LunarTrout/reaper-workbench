@@ -52,6 +52,7 @@ from .context.state_diff import state_changes as live_state_changes
 from .daw.midi import MidiService
 from .daw.edit import run_edit, send_list, undo_receipt
 from .daw.receipt import FileReceiptStore
+from .daw.timing_service import analyze_timing, inspect_timing, plan_timing
 from .daw.reference import cached_reference_report
 from .daw.session_control import app_action as _app_action
 from .daw.session_status import merge_digest_routing
@@ -321,7 +322,7 @@ TOOL_SURFACE: dict[str, dict[str, Any]] = {
         "use_when": ("a stored measurement must be quoted without rescanning the archive, "
                      "a value target needs a measured mapping, or velocities must change"),
         "context": "project_id for MIDI/calibration; archive_root for evidence and calibration",
-        "tools": ["reaper_evidence", "reaper_calibrate", "reaper_midi"],
+        "tools": ["reaper_evidence", "reaper_calibrate", "reaper_midi", "reaper_timing"],
         "not_for": "replacing a fresh measurement or editing audio items",
     },
     "edit": {
@@ -2216,6 +2217,58 @@ def reaper_media(action: str,
             **encode(source, format=format, bitrate=bitrate,
                      ceiling_dbtp=ceiling_dbtp, out_path=out_path,
                      sample_rate=sample_rate, overwrite=overwrite)}
+
+@server.tool()
+@_guard
+def reaper_timing(action: Literal["analyze", "plan", "inspect"],
+                  project_id: str | None = None,
+                  track_guid: str | None = None,
+                  item_guid: str | None = None,
+                  start_s: float | None = None,
+                  end_s: float | None = None,
+                  profile: str = "auto",
+                  sensitivity: float = 1.8,
+                  min_gap_s: float = 0.03,
+                  analysis_id: str | None = None,
+                  plan_id: str | None = None,
+                  subdivisions: list[int] | None = None,
+                  tolerance_s: float = 0.080,
+                  strength: float = 1.0,
+                  group_gap_s: float = 0.25,
+                  group_shift_s: float = 0.012,
+                  protected_ranges: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Analyze audio timing against the project grid and build a 1x clip plan.
+
+    analyze resolves one file-backed audio item, detects attacks and returns an
+    ``analysis_id``; plan matches them monotonically to the tempo grid and
+    returns a ``plan_id`` with source/project geometry; inspect returns a stored
+    analysis or plan.  Apply the returned geometry through ``reaper_edit``.
+    """
+    if action == "analyze":
+        session = _session(project_id)
+        result = analyze_timing(session, project_id=project_id,
+                                track_guid=track_guid, item_guid=item_guid,
+                                start_s=start_s, end_s=end_s, profile=profile,
+                                sensitivity=sensitivity, min_gap_s=min_gap_s)
+        return {"ok": True, "action": action, **result}
+    if action == "plan":
+        if not isinstance(analysis_id, str) or not analysis_id:
+            raise ValidationError("analysis_id is required for plan")
+        session = _session(project_id)
+        snapshot = session.snapshot(project_id=project_id)
+        tempo = snapshot.get("tempo")
+        result = plan_timing(analysis_id, tempo_context=tempo,
+                             subdivisions=subdivisions or (4, 3, 6, 8),
+                             tolerance_s=tolerance_s, strength=strength,
+                             group_gap_s=group_gap_s,
+                             group_shift_s=group_shift_s,
+                             protected_ranges=protected_ranges or ())
+        return {"ok": True, "action": action, **result}
+    if action == "inspect":
+        return {"ok": True, "action": action,
+                **inspect_timing(analysis_id=analysis_id, plan_id=plan_id)}
+    raise ValidationError("action must be analyze, plan or inspect")
+
 
 @server.tool()
 @_guard

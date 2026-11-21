@@ -142,7 +142,7 @@ def test_readme_describes_the_state_contract() -> None:
     text = README.read_text(encoding="utf-8")
     assert "state.json" in text
     assert "state_token" in text
-    assert "41 tools in 11 groups" in text
+    assert "42 tools in 11 groups" in text
     assert "reaper_panorama_open" not in text
 
 

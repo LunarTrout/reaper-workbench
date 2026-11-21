@@ -34,7 +34,7 @@ Python-библиотека и локальный MCP-сервер для жив
 - **Доставка.** `reaper_media` импортирует референсы или кодирует аудио с
   проверкой true peak после кодека.
 
-MCP-поверхность сгруппирована: **41 инструмент в 11 группах** (`session`,
+MCP-поверхность сгруппирована: **42 инструмента в 11 группах** (`session`,
 `measure`, `edit`, `midi`, `calibrate`, `analyze`, `action`, `api`, `flamingo`,
 `spatial`, `media`). Актуальный список — `reaper_capabilities(mode="tools")`;
 схемы — `tools/list`.
