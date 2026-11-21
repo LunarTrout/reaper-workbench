@@ -1249,6 +1249,31 @@ def _reading(document: Mapping[str, Any], budget: Mapping[str, Any]) -> dict[str
 # build
 # --------------------------------------------------------------------------
 
+def _digest_section(value: Any, record_pointer: str, *,
+                    source_key: str | None) -> dict[str, Any]:
+    """One hash and a pointer instead of re-embedding a large section."""
+    if not isinstance(value, Mapping):
+        return {"sha256": None, "record_pointer": record_pointer,
+                "available": False}
+    encoded = json.dumps(value, sort_keys=True, ensure_ascii=False,
+                         separators=(",", ":")).encode("utf-8")
+    summary: dict[str, Any] = {
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "bytes": len(encoded),
+        "record_pointer": record_pointer,
+        "available": True,
+    }
+    if source_key:
+        rows = value.get(source_key)
+        summary["count"] = len(rows) if isinstance(rows, (list, Mapping)) else None
+    else:
+        tracks = value.get("tracks")
+        items = value.get("items")
+        summary["tracks"] = len(tracks) if isinstance(tracks, Mapping) else None
+        summary["items"] = len(items) if isinstance(items, Mapping) else None
+    return summary
+
+
 def _compact_evidence(value: Any) -> dict[str, Any]:
     """The freshness facts a reader needs, without the repeated prose."""
     value = value if isinstance(value, Mapping) else {}
@@ -1509,8 +1534,12 @@ def build_view(document: Mapping[str, Any], *,
             "time_window": binding.get("time_window"),
             "identity": document.get("identity"),
             "evidence": _compact_evidence(document.get("evidence_freshness")),
-            "render_manifest": document.get("render_manifest"),
-            "structural_facts": document.get("structural_facts"),
+            "render_manifest": _digest_section(
+                document.get("render_manifest"), "#/render_manifest",
+                source_key="sources"),
+            "structural_facts": _digest_section(
+                document.get("structural_facts"), "#/project_map/digest_facts",
+                source_key=None),
             "source_document_schema": document.get("schema_version"),
             "source_document_sha256": document.get("document_sha256"),
             "captured_at": (document.get("provenance") or {}).get("captured_at"),
