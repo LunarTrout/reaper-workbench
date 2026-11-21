@@ -202,6 +202,8 @@ def _track_row(track: Mapping[str, Any], *, detail: str) -> dict[str, Any]:
         "main_send": _flag(track.get("main_send")),
         "folder_depth": _integer(track.get("folder_depth")) or 0,
         "fx_count": len(track.get("fx") or []),
+        "fx_names": [str(item.get("name") or "") for item in track.get("fx") or []
+                     if isinstance(item, Mapping)],
         "send_count": _send_count(track),
         "item_count": len(track.get("items") or []),
     }
