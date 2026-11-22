@@ -45,7 +45,7 @@ if _G.__reaper_audio_bridge_resident and not _G.__reaper_audio_bridge_reloading 
   return
 end
 _G.__reaper_audio_bridge_resident = true
-local bridge_build = "b37-2026-11-22"  -- exact timing replacement readback
+local bridge_build = "b38-2026-11-22"  -- exact timing replacement readback
 -- A second boot inside the same REAPER Lua state must supersede the first:
 -- two loops would both keep heartbeating and the client would see two live
 -- bridges. Every loop compares this token before it reschedules; the newest
@@ -3467,10 +3467,15 @@ local function validate_item_values(values)
   local allowed = { position_s = true, length_s = true, mute = true,
                     stretch_ratio = true, preserve_pitch = true,
                     stretch_markers = true, beat_attachmode = true,
-                    auto_stretch = true, fade_in_s = true, fade_out_s = true }
+                    auto_stretch = true, fade_in_s = true, fade_out_s = true,
+                    start_offset_s = true }
   require_object_values(values, allowed)
   if values.position_s ~= nil and not finite_number(values.position_s) then
     fail("validation_error", "item position_s must be finite")
+  end
+  if values.start_offset_s ~= nil and
+     (not finite_number(values.start_offset_s) or values.start_offset_s < 0) then
+    fail("validation_error", "item start_offset_s must be finite and non-negative")
   end
   if values.length_s ~= nil and
      (not finite_number(values.length_s) or values.length_s <= 0) then
@@ -4010,7 +4015,11 @@ end
 
 local function validate_take_values(values)
   require_object_values(values, { gain = true, pan = true, pitch = true,
-                                  playrate = true })
+                                  playrate = true, start_offset_s = true })
+  if values.start_offset_s ~= nil and
+     (not finite_number(values.start_offset_s) or values.start_offset_s < 0) then
+    fail("validation_error", "take start_offset_s must be finite and non-negative")
+  end
   if values.gain ~= nil and (not finite_number(values.gain) or values.gain < 0) then
     fail("validation_error", "take gain must be a finite non-negative linear value")
   end
@@ -4231,7 +4240,13 @@ local function read_edit_state(project, operation)
                      fade_in_s = "D_FADEINLEN", fade_out_s = "D_FADEOUTLEN" }
     local take = reaper.GetActiveTake(target)
     for key in pairs(values) do
-      if key == "stretch_ratio" then
+      if key == "start_offset_s" then
+        if not take then
+          fail("stale_context", "The item has no active take",
+               { target_guid = operation.target_guid })
+        end
+        state[key] = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+      elseif key == "stretch_ratio" then
         state[key] = take and (1.0 / reaper.GetMediaItemTakeInfo_Value(
           take, "D_PLAYRATE")) or 1.0
       elseif key == "stretch_markers" then
@@ -4333,6 +4348,7 @@ local function read_edit_state(project, operation)
     state.pan = reaper.GetMediaItemTakeInfo_Value(take, "D_PAN")
     state.pitch = reaper.GetMediaItemTakeInfo_Value(take, "D_PITCH")
     state.playrate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+    state.start_offset_s = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
   elseif kind == "send.create" then
     state.send_count = reaper.GetTrackNumSends(target, 0)
     state.destination_guid = values.destination_guid
@@ -4688,7 +4704,13 @@ local function apply_edit(project, inspected)
       if key ~= "stretch_ratio" and key ~= "preserve_pitch" and
          key ~= "stretch_markers" then
         local numeric = type(value) == "boolean" and (value and 1 or 0) or value
-        if key == "fade_in_s" or key == "fade_out_s" then
+        if key == "start_offset_s" then
+          if not take then
+            fail("stale_context", "The item has no active take",
+                 { target_guid = operation.target_guid })
+          end
+          checked_call(reaper.SetMediaItemTakeInfo_Value, take, "D_STARTOFFS", numeric)
+        elseif key == "fade_in_s" or key == "fade_out_s" then
           -- REAPER returns no value for these setters; the readback below is
           -- the proof, not a Lua return code.
           reaper.SetMediaItemInfo_Value(target, fields[key], numeric)
@@ -4761,7 +4783,7 @@ local function apply_edit(project, inspected)
            { target_guid = operation.target_guid })
     end
     local fields = { gain = "D_VOL", pan = "D_PAN", pitch = "D_PITCH",
-                     playrate = "D_PLAYRATE" }
+                     playrate = "D_PLAYRATE", start_offset_s = "D_STARTOFFS" }
     for key, value in pairs(values) do
       checked_call(reaper.SetMediaItemTakeInfo_Value, take, fields[key], value)
     end

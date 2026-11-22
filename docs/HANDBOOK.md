@@ -72,6 +72,10 @@ reaper_edit(mode="preview", project_id=..., expected_revision=..., reason="...",
 ```
 
 - `apply`: with `plan_id` and the plan's base `expected_revision` → `update` + successor `context_token`; with `operations` and no `plan_id` → applies at once and returns a receipt. `undo`: `plan_id` plus the revision apply produced, or `receipt="r-..."`. Every mutation needs a current structural token (`structural_token`); `advisory` reports it missing instead of blocking, `off` skips it.
+- `item.set` accepts `start_offset_s` for the active take alongside item
+  position and length. `take.set` accepts the same key. For 1x audio, moving
+  the left edge earlier requires reducing the offset by the same amount to
+  preserve the existing audio's timeline position.
 - Operations are `{kind, target_guid, values}`, up to 256 per batch: `track.set/create/delete/reorder`, `item.set/create/delete/split/duplicate/timing_apply`, `take.set`, `midi.create`, `fx.set_enabled/set_parameter/insert/delete/move/set_preset/offline`, `send.connect/set/delete`, `envelope.set`, `envelope.level`, `marker.create`, `region.delete`, `tempo.set`.
 - `send.connect` is idempotent; `send.set` addresses a row by `destination_guid` or `send_index`. A batch cannot repeat a connect, mix `send.delete` with other send changes on one source, or delete a track it also changes.
 - `envelope.set`: `name`, `points`, `mode`, `clear`, `guard` (`min_gain_db`, `forbid_silence`). In `mode="preview"` only, `envelope.level` builds a curve from a measured profile (`{"segments":[...],"target_db":...}`) and `fx.set_parameter` with `{"band":3,"target":"-2 dB"}` resolves through the calibration table — preview then apply.

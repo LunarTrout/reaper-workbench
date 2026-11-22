@@ -156,3 +156,18 @@ def test_live_no_op_apply_cannot_undo_the_previous_transaction() -> None:
     session.undo(expected_revision=_revision(session), plan_id=real_plan.plan_id)
     restored = session.snapshot(include_items=False)["tracks"][0]["volume"]
     assert abs(float(restored) - original) < 1e-6
+from pathlib import Path
+
+def test_bridge_offsets_are_validated_read_and_written():
+    bridge = (Path(__file__).resolve().parents[1] / "scripts" / "reaper_bridge.lua").read_text(encoding="utf8")
+    item_validator = bridge.split("local function validate_item_values(values)", 1)[1].split("local function ", 1)[0]
+    take_validator = bridge.split("local function validate_take_values(values)", 1)[1].split("local function ", 1)[0]
+    item_reader = bridge.split('elseif kind == "item.set" then', 2)[2].split('elseif kind == "item.timing_apply"', 1)[0]
+    item_writer = bridge.split('elseif kind == "item.set" then', 3)[3].split('elseif kind == "fx.insert"', 1)[0]
+    assert "start_offset_s = true" in item_validator
+    assert "start_offset_s = true" in take_validator
+    assert 'reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")' in item_reader
+    assert 'checked_call(reaper.SetMediaItemTakeInfo_Value, take, "D_STARTOFFS", numeric)' in item_writer
+    assert 'playrate = "D_PLAYRATE", start_offset_s = "D_STARTOFFS"' in bridge
+    # Extending a forward 1x take left keeps any original source sample at its old time.
+    assert 183.0 + (31.5 - 31.054621) == pytest.approx(182.6 + (31.5 - 30.654621))

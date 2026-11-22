@@ -213,6 +213,14 @@ source overruns, gaps and fade conflicts. Its signal estimates and simulated
 fades are evidence for auditioning, especially on dense or clipped audio.
 `window(detail="full")` adds signal diagnostics to the local clip report.
 
+An `item.set` operation accepts `start_offset_s` together with
+`position_s` and `length_s`. For an ordinary forward 1x take, extending
+the left edge earlier by Δ while retaining the original audio placement
+requires reducing `start_offset_s` by Δ and increasing `length_s` by Δ.
+For example, position 183.0 → 182.6 with offset 31.054621 → 30.654621.
+Inspect source bounds, loop/stretch behavior, adjacent items and fades, then
+preview the batch and read it back. This formula assumes a 1x take.
+
 ## Try moving a whole phrase first
 
 When a line or riff is consistently early or late, first test a rigid move
