@@ -124,6 +124,8 @@ geometry, including whether a seam lets an earlier copy of the attack through.
 ## Keep the analysis tied to the project
 
 A project context includes the arrangement, tempo, routing, FX and revision.
+Workbench stores measured project state in `state.json`. For a compact update
+pass the previous `state_token` as `since` to `reaper_session(action="context")`.
 Measured facts carry their source, interval and freshness. On the next pass
 the agent can request what changed, reuse valid measurements and refresh the
 ones affected by an edit. Verified edits return the values read back from
@@ -188,6 +190,7 @@ py -3.13 -m venv .venv
 > Tell me which REAPER project is open, summarize the routing of the guitar
 > tracks, and show what has already been measured. Leave the project as it is.
 
+Workbench exposes **42 tools in 11 groups**.
 For exact call schemas, use the client's `tools/list` and the capability
 map from `reaper_capabilities(mode="tools")`.
 
