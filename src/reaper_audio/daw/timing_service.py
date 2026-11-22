@@ -592,6 +592,112 @@ def register_timing_refinement(plan):
     PLANS[plan["plan_id"]] = plan
 
 
+def review_timing_pairs(snapshot, *, reference_analysis_id, analysis_id, pairs,
+                        start_s, end_s, offset, limit, reference_plan_id=None, plan_id=None):
+    """Trace confirmed counterparts from two source analyses into live clips."""
+    project_id = (snapshot.get("revision") or {}).get("project_id")
+    analyses = [ANALYSES.get(key) for key in (reference_analysis_id, analysis_id)]
+    if (not all(analyses) or not project_id
+            or any(a["project_id"] != project_id for a in analyses)
+            or analyses[0]["track_guid"] == analyses[1]["track_guid"]):
+        raise ValidationError("Pair review requires analyses of two tracks in the live project")
+    if (not np.isfinite([start_s, end_s]).all() or start_s >= end_s
+            or offset < 0 or not 1 <= limit <= 32):
+        raise ValidationError("Pair review requires a finite increasing window and a valid page")
+    event_maps = [{event["id"]: event for event in a["events"]} for a in analyses]
+    for side, key in enumerate((reference_plan_id, plan_id)):
+        if key is None:
+            continue
+        plan = PLANS.get(key)
+        if not plan or plan.get("analysis_id") != analyses[side]["analysis_id"]:
+            raise ValidationError("A pair plan must belong to the corresponding analysis")
+        event_maps[side].update({a["id"]: a for a in plan["anchors"] if a.get("manual")})
+    tracks = {track["guid"]: track for track in snapshot.get("tracks", [])}
+    clips = []
+    for analysis in analyses:
+        path = Path(analysis["source_path"])
+        if list(_file_fingerprint(path)) != analysis["source_fingerprint"]:
+            raise ValidationError("Source audio changed since pair analysis")
+        track = tracks.get(analysis["track_guid"])
+        if track is None:
+            raise ValidationError("An analyzed track no longer exists")
+        clips.append([item for item in track.get("items", [])
+                      if Path((item.get("active_take") or {}).get("source")
+                              or (item.get("active_take") or {}).get("source_path") or "") == path
+                      and item["position_s"] < end_s
+                      and item["position_s"] + item["length_s"] > start_s])
+
+    def occurrences(event, side):
+        source = event["source_s"]
+        rows = []
+        for item in clips[side]:
+            take = item.get("active_take") or {}
+            rate = take.get("playrate", item.get("playrate", 1))
+            if (abs(rate - 1) > 1e-6 or item.get("stretch_marker_positions")
+                    or take.get("stretch_markers") or take.get("reverse")
+                    or item.get("source_reversed")):
+                continue
+            relative = source - item["start_offset_s"]
+            if not 0 <= relative < item["length_s"] - 1e-6:
+                continue
+            time = item["position_s"] + relative
+            if start_s <= time < end_s:
+                has_fade = (relative < (item.get("fade_in_s") or 0)
+                            or item["length_s"] - relative < (item.get("fade_out_s") or 0))
+                rows.append({"item_guid": item["guid"], "project_s": round(time, 7),
+                             "under_fade": has_fade,
+                             "muted": bool(item.get("mute") or tracks[analyses[side]["track_guid"]].get("mute")),
+                             "source_offline": item.get("source_online") is False})
+        return rows
+
+    seen = [set(), set()]
+    rows = []
+    previous = [-float("inf"), -float("inf")]
+    for pair in pairs:
+        ids = [pair.get("reference_event_id"), pair.get("event_id")]
+        events = [event_maps[side].get(key) for side, key in enumerate(ids)]
+        if any(event is None or key in seen[side]
+               for side, (event, key) in enumerate(zip(events, ids))):
+            raise ValidationError("Pairs must name unique events from their own source analyses",
+                                  details={"pair": pair})
+        observed = [event["project_s"] for event in events]
+        if (any(t <= previous[side] for side, t in enumerate(observed))
+                or not start_s <= observed[0] < end_s):
+            raise ValidationError("List pairs in performance order inside the reference window",
+                                  details={"pair": pair})
+        previous = observed
+        hits = [occurrences(event, side) for side, event in enumerate(events)]
+        measured = all(len(h) == 1 and not any(h[0][key] for key in
+                       ("under_fade", "muted", "source_offline")) for h in hits)
+        for side, key in enumerate(ids):
+            seen[side].add(key)
+        rows.append({"reference_event_id": ids[0], "event_id": ids[1],
+                     "source_s": [event["source_s"] for event in events],
+                     "reference_occurrences": hits[0], "take_occurrences": hits[1],
+                     "original_delta_s": round(observed[1] - observed[0], 7),
+                     "live_delta_s": round(hits[1][0]["project_s"] - hits[0][0]["project_s"], 7)
+                     if measured else None,
+                     "status": "placement_verified" if measured else "placement_unverified"})
+    unmatched = [[{"event_id": e["id"], "source_s": e["source_s"], "project_s": e["project_s"]}
+                  for e in sorted(events.values(), key=lambda event: event["project_s"])
+                  if start_s <= e["project_s"] < end_s and e["id"] not in seen[side]]
+                 for side, events in enumerate(event_maps)]
+    verified = sum(row["status"] == "placement_verified" for row in rows)
+    return {"schema": "reaper-workbench.timing-pairs/1", "window_s": [start_s, end_s],
+            "revision": snapshot.get("revision"), "basis": "live_clip_geometry",
+            "review_status": ("no_confirmed_pairs" if not rows else "incomplete"
+                              if verified < len(rows) or any(unmatched)
+                              else "listed_candidates_checked"),
+            "sound_checked": False,
+            "reference_analysis_id": reference_analysis_id, "analysis_id": analysis_id,
+            "pair_count": len(rows), "verified_pair_count": verified,
+            "unverified_pair_count": len(rows) - verified,
+            "unpaired_counts": [len(side) for side in unmatched],
+            "unpaired": [side[offset:offset+limit] for side in unmatched],
+            "rows": rows[offset:offset+limit],
+            "next_offset": offset+limit if offset+limit < max(len(rows), *map(len, unmatched)) else None}
+
+
 def compare_timing_reviews(plan_id, compare_plan_id, *, start_s, end_s, offset, limit):
     first = inspect_timing_review(plan_id, kind="all", start_s=start_s, end_s=end_s,
                                   offset=offset, limit=limit)
@@ -619,6 +725,11 @@ def crossfade_plan_view(plan, *, detail="summary"):
                          "user_protected_ranges", "rhythm_keep_ranges", "rhythm_choices"})
     return {**{k: v for k, v in plan.items() if k not in excluded},
             "block_count": len(plan["blocks"]), "seam_count": len(plan["seams"]),
+            "verification_scope": {
+                "basis": "single_take_plan_geometry", "sound_checked": False,
+                "pair_sync_checked": False,
+                "note": "No timing change can also mean no targets were assigned.",
+            },
             "protected_range_count": len(plan.get("protected_ranges", []))}
 
 

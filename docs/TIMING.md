@@ -208,6 +208,47 @@ source overruns, gaps and fade conflicts. Its signal estimates and simulated
 fades are evidence for auditioning, especially on dense or clipped audio.
 `window(detail="full")` adds signal diagnostics to the local clip report.
 
+## Verify timing across related takes
+
+Choose a reference performance for the phrase and check its relationship to
+the arrangement. Determine which events should actually land together.
+A consonant, vowel onset, pick attack or release may be the useful landmark,
+depending on the material. Compare the same landmark on both tracks using
+short waveform windows, neighboring musical events and the click when relevant.
+Keep intentional offsets and ornaments explicit. An ambiguous beat or an
+unassigned candidate is unresolved evidence. It does not prove good timing or
+a missing note.
+
+Analyze both takes before editing. Use `pairs` with a short project-time window
+to see unpaired candidates, then supply confirmed counterparts in performance
+order. Keep the same analyses and pairs for the read-back after applying.
+
+```text
+reaper_timing(action="pairs", reference_analysis_id=..., analysis_id=...,
+              start_s=130.5, end_s=132.0,
+              event_pairs=[{"reference_event_id":"evt_00012","event_id":"evt_00017"}])
+```
+
+The result reports original and live deltas (second take minus reference),
+all clip occurrences in the window, and unpaired candidates for each take.
+`placement_verified` describes a unique, online, unmuted 1x occurrence outside
+a fade on each track. It confirms placement of the supplied points. The tool
+does not establish that two detections represent the same musical event or
+measure their audible alignment through FX. Unpaired counts include detector
+candidates, which may be ornaments or noise. Page through the whole window
+before using the summary. Leave room at the bounds for both occurrences.
+
+Use confirmed reference positions as explicit targets for local `refine`
+or `plan`. If a front was missed, inspect its source and register it before
+editing. Include the last child `plan_id` for manually registered events on
+the edited take, or `compare_plan_id` for manual events on the reference.
+Pairs are still read from the live clips. If a target or a possible pairing is disputed, leave it open or compare
+alternatives. Work across the requested passages, review different phrases
+and transitions after application, and state what remains unverified. Two
+good pairs, a lower grid median, a good bus LUFS reading and a matched
+transaction each answer different questions. Check the doubles together
+and against the arrangement when listening is available.
+
 ## Examples from the guitar edits
 
 - **Riff A:** the front at DI `12.8249` played at `1.5583` before and after,

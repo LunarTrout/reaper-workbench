@@ -124,3 +124,44 @@ def test_review_dispatch_respects_filter_when_both_bounds_are_set(monkeypatch):
                                       start_s=1.0, end_s=2.0)
     assert result["kind"] == "unassigned"
     assert (result["start_s"], result["end_s"]) == (1.0, 2.0)
+
+
+def test_pair_review_follows_same_events_after_edit_and_exposes_unpaired(tmp_path, monkeypatch):
+    from reaper_audio import mcp_server
+    from reaper_audio.daw import timing_service as timing
+
+    snapshot = {"revision": {"project_id": "p"}, "tracks": []}
+    for key, position in [("lead", 10.0), ("double", 10.04)]:
+        source = tmp_path / f"{key}.wav"
+        source.write_bytes(b"fixture")
+        analysis = {"analysis_id": key, "project_id": "p", "track_guid": key,
+                    "source_path": str(source),
+                    "source_fingerprint": list(timing._file_fingerprint(source)),
+                    "events": [{"id": "a", "source_s": 0.2, "project_s": position+0.2},
+                               {"id": "b", "source_s": 0.7, "project_s": position+0.7}]}
+        monkeypatch.setitem(timing.ANALYSES, key, analysis)
+        snapshot["tracks"].append({"guid": key, "items": [
+            {"guid": key + "-edited", "position_s": 10.01 if key == "double" else 10.0,
+             "start_offset_s": 0.0, "length_s": 1.0, "active_take": {"source": str(source)}}]})
+
+    class Session:
+        def snapshot(self, **kwargs):
+            return snapshot
+
+    monkeypatch.setattr(mcp_server, "_session", lambda *args: Session())
+    args = dict(action="pairs", reference_analysis_id="lead", analysis_id="double",
+                event_pairs=[{"reference_event_id": "a", "event_id": "a"}],
+                start_s=10.0, end_s=11.1)
+    report = mcp_server.reaper_timing(**args)
+    assert report["verified_pair_count"] == 1
+    assert report["unpaired_counts"] == [1, 1]
+    row, = report["rows"]
+    assert row["original_delta_s"] == pytest.approx(0.04)
+    assert row["live_delta_s"] == pytest.approx(0.01)
+
+    snapshot["tracks"][1]["items"].append({
+        **snapshot["tracks"][1]["items"][0], "guid": "duplicate", "position_s": 10.1})
+    report = mcp_server.reaper_timing(**args)
+    assert report["unverified_pair_count"] == 1
+    assert len(report["rows"][0]["take_occurrences"]) == 2
+    assert report["rows"][0]["live_delta_s"] is None

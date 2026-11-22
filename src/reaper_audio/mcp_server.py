@@ -2226,7 +2226,7 @@ def reaper_media(action: str,
 
 @server.tool()
 @_guard
-def reaper_timing(action: Literal["analyze", "waveform", "clock", "rhythm", "plan", "review", "window", "verify",
+def reaper_timing(action: Literal["analyze", "waveform", "pairs", "clock", "rhythm", "plan", "review", "window", "verify",
                                   "refine", "inspect", "preview", "apply", "undo"],
                   project_id: str | None = None,
                   track_guid: str | None = None,
@@ -2272,12 +2272,16 @@ def reaper_timing(action: Literal["analyze", "waveform", "clock", "rhythm", "pla
                   seam_index: int | None = None,
                   max_shift_s: float = 0.04,
                   refine_reason: str | None = None,
-                  waveform_bins: int = 256) -> dict[str, Any]:
+                  waveform_bins: int = 256,
+                  reference_analysis_id: str | None = None,
+                  event_pairs: list[dict[str, str]] | None = None) -> dict[str, Any]:
     """Analyze audio timing against the project grid and build a 1x clip plan.
 
     Read reaper://guide/timing for checks and examples. Waveform reads a
     continuous pre-FX window of up to four seconds in project time, by item_guid
     or with candidate overlays by analysis_id or plan_id. It needs no event ID.
+    Pairs reviews explicitly matched events across two analyzed tracks and
+    reports unpaired candidates and the actual clip placement of each pair.
     Analyze a clean, file-backed take with an explicit item GUID. Clock verifies
     a dedicated click item against the project beat grid. Rhythm ranks local
     rhythm interpretations with attack and release evidence. Read more with
@@ -2297,8 +2301,17 @@ def reaper_timing(action: Literal["analyze", "waveform", "clock", "rhythm", "pla
         measure_timing_clock, plan_timing_crossfades, read_timing_rhythm,
         refine_timing, review_window, validate_rhythm_analysis,
     )
-    if action in {"analyze", "waveform", "clock", "rhythm", "plan", "refine", "preview", "apply", "undo"}:
+    if action in {"analyze", "waveform", "pairs", "clock", "rhythm", "plan", "refine", "preview", "apply", "undo"}:
         _handbook_required()
+    if action == "pairs":
+        if not reference_analysis_id or not analysis_id or start_s is None or end_s is None:
+            raise ValidationError("Pairs needs two analysis IDs and a project-time window")
+        snapshot = _session(project_id, bridge_session_id).snapshot(
+            project_id=project_id, include_items=True)
+        return {"ok": True, "action": action, **_timing.review_timing_pairs(
+            snapshot, reference_analysis_id=reference_analysis_id, analysis_id=analysis_id,
+            pairs=event_pairs or (), start_s=start_s, end_s=end_s,
+            offset=review_offset, limit=review_limit)}
     if action == "waveform":
         return {"ok": True, "action": action, **_timing.inspect_timing_waveform(
             _session(project_id, bridge_session_id), project_id=project_id,
