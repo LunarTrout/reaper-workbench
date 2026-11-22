@@ -153,7 +153,10 @@ Every failure is `{"ok": false, "error": {"code", "message", "details", "next_ac
 8. **Changing the work mode to pass a gate.** The mode belongs to the owner.
 9. **Treating a receipt as understanding**, or a page subset as the whole map.
 10. **Substituting stages.** `premaster` does not exist here; `master` ≠ `via_master`.
-11. **Silent retries.** After two failures, report the code.
+11. **Repeating the same failed call.** Inspect the error and live state. Try a
+    different supported approach where evidence supports it. A failed local
+    operation does not finish the larger task. Continue independent passages,
+    then report what remains unresolved and the exact reason.
 
 For a phrase with a consistent offset, try a rigid `phrase_shift` before
 individual attack edits. Treat a blocked local move as a local result. Inspect

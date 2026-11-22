@@ -66,7 +66,12 @@ For example, in 4/4, a division of 4 is a sixteenth-note grid. The optional
   scoring model. The raw costs and margins are ranking scores. An
   `ambiguous` or `unresolved` beat defaults to `keep`, preserving its
   project timing. Choose a displayed option explicitly to resolve it.
-- For a score, manually chosen grid goals, or targeted overrides, crossfade
+- For confirmed explicit event targets, set `tolerance_s` large enough to
+cover the intended move. The 0.25-second limit applies to grid inference.
+The solver still checks source coverage and seam geometry; increasing this
+value does not establish that a specific edit is feasible.
+
+For a score, manually chosen grid goals, or targeted overrides, crossfade
   `plan` accepts `reference_events=[{"event_id":"evt_00012","qn":4.5}]`
   or a `target_s` instead of `qn`. Supply explicit references as a separate
   planning mode. Assignments must preserve attack order and stay within the

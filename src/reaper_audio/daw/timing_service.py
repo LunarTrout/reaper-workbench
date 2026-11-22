@@ -486,8 +486,13 @@ def _explicit_targets(references, analysis, tempo, phase_s, tolerance, *, allow_
         target = float(raw) if key == "target_s" else tempo.qn_to_time(float(raw))+phase_s
         if (not window["start_s"]-1e-8 <= target < window["end_s"] or
                 abs(events[event_id]["project_s"]-target) > tolerance+1e-8):
-            raise ValidationError("Explicit target exceeds the item window or timing tolerance",
-                                  details={"event_id": event_id, "target_s": target})
+            raise ValidationError("Explicit target exceeds the item window or requested tolerance",
+                                  details={"event_id": event_id, "target_s": target,
+                                           "observed_s": events[event_id]["project_s"],
+                                           "required_shift_s": target - events[event_id]["project_s"],
+                                           "tolerance_s": tolerance,
+                                           "item_window_s": [window["start_s"], window["end_s"]],
+                                           "next_action": "Check the event pairing and set a sufficient tolerance; inspect clip and seam constraints separately."})
         targets[event_id] = target
     ordered = [targets[e["id"]] for e in analysis["events"] if e["id"] in targets]
     if any(b <= a for a, b in zip(ordered, ordered[1:])):
@@ -510,8 +515,14 @@ def plan_timing_crossfades(analysis_id: str, *, tempo_context: Mapping[str, Any]
     if (analysis is None or analysis.get("method") != "crossfade" or
             (project_id and analysis["project_id"] != project_id)):
         raise ValidationError("Analyze the source item with method=crossfade first")
-    if not 1 <= subdivision <= 32 or not 0 < tolerance_s <= .25 or not 0 <= strength <= 1:
+    if (not isinstance(tolerance_s, (int, float)) or isinstance(tolerance_s, bool)
+            or not np.isfinite(tolerance_s) or not 0 < tolerance_s
+            or not 1 <= subdivision <= 32 or not 0 <= strength <= 1):
         raise ValidationError("Invalid subdivision, tolerance or strength")
+    if reference_events is None and tolerance_s > .25:
+        raise ValidationError("Grid inference accepts tolerance_s up to 0.25 seconds",
+                              details={"code": "grid_tolerance_exceeded", "limit_s": 0.25,
+                                       "next_action": "Inspect the phrase and use explicit confirmed event targets for larger moves."})
     if grid_phase_s is None:
         grid_phase_s = (RHYTHMS.get(rhythm_id or "") or {}).get("grid_phase_s", 0.)
     if not np.isfinite(grid_phase_s):

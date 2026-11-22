@@ -219,3 +219,18 @@ def test_phrase_moves_rigidly_and_refuses_touching_neighbors(monkeypatch):
     assert (phrase["length_s"], phrase["start_offset_s"], phrase["playrate"],
             phrase["fade_in_s"], phrase["fade_out_s"]) == (2.0, 3.0, 1.0, 0.01, 0.02)
     assert neighbor["position_s"] == 12.5
+
+
+def test_large_confirmed_target_is_distinct_from_grid_tolerance(tmp_path):
+    from reaper_audio.daw.timing_service import _explicit_targets
+    from reaper_audio.daw.midi import TempoMap
+    from reaper_audio.errors import ValidationError
+
+    analysis = {"events": [{"id": "front", "project_s": 1.0}],
+                "project_window": {"start_s": 0.0, "end_s": 3.0}}
+    tempo = TempoMap.from_context({"bpm": 120, "numerator": 4, "denominator": 4})
+    target = [{"event_id": "front", "target_s": 1.36}]
+    assert _explicit_targets(target, analysis, tempo, 0.0, 0.4) == {"front": 1.36}
+    with pytest.raises(ValidationError) as error:
+        _explicit_targets(target, analysis, tempo, 0.0, 0.25)
+    assert error.value.details["required_shift_s"] == pytest.approx(0.36)
