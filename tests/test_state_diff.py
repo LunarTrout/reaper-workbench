@@ -5,7 +5,7 @@ These tests pin the contract the state store relies on:
 * a change is reported at field level, not as one opaque "project changed";
 * a fader move on one track does not invalidate another track's facts;
 * master changes reach ``via_master`` facts but never ``premaster`` ones;
-* routing changes reach ``via_master`` facts only;
+* routing changes reach mix and ``via_master`` facts;
 * a removed source is ``source_missing``, not a silent pass;
 * equal fingerprints produce no change at all;
 * fields outside ``FINGERPRINT_FIELDS`` never make a fingerprint look dirty.
@@ -174,9 +174,10 @@ def test_fader_change_affects_only_that_track() -> None:
     assert TRACK_B in changes["unchanged_tracks"]
     assert changes["added_tracks"] == []
     assert changes["removed_tracks"] == []
-    # A fader move on A invalidates A's own measurements, nothing else.
-    assert stale_fact_keys(_facts(), changes) == ["fact:pre:a", "fact:vm:a"]
+    # A fader move on A invalidates its own measurements and the summed master.
+    assert stale_fact_keys(_facts(), changes) == ["fact:master", "fact:pre:a", "fact:vm:a"]
     assert {row["key"]: row["reason"] for row in stale_facts(_facts(), changes)} == {
+        "fact:master": "master_inputs_changed",
         "fact:pre:a": "source_changed",
         "fact:vm:a": "source_changed",
     }
@@ -249,7 +250,7 @@ def test_master_change_stales_via_master_and_master_facts_only() -> None:
     assert [row["key"] for row in stale] == sorted(row["key"] for row in stale)
 
 
-def test_routing_change_stales_via_master_facts_only() -> None:
+def test_routing_change_stales_master_and_via_master_facts() -> None:
     before = _fingerprint()
     after = copy.deepcopy(before)
     after["tracks"][TRACK_B]["sends"] = [
@@ -266,10 +267,10 @@ def test_routing_change_stales_via_master_facts_only() -> None:
     assert set(changes["tracks"]) == {TRACK_B}
     assert changes["tracks"][TRACK_B]["fields"] == ["sends"]
     assert {row["key"]: row["reason"] for row in stale} == {
+        "fact:master": REASON_ROUTING_CHANGED,
         "fact:vm:a": REASON_ROUTING_CHANGED,
         "fact:vm:b": REASON_ROUTING_CHANGED,
     }
-    assert "fact:master" not in {row["key"] for row in stale}
     assert "fact:pre:a" not in {row["key"] for row in stale}
     # B's own premaster signal did not change: only its outgoing send did.
     assert "fact:pre:b" not in {row["key"] for row in stale}
@@ -296,10 +297,9 @@ def test_capture_stage_names_are_classified_structurally() -> None:
 
     assert stale_fact_keys(facts, master_change) == [
         "master:mix", "master:short", "no:stage", "via:long", "via:short"]
-    # Routing reaches the via-master forms only; a premaster and a master-stage
-    # fact stay valid.
+    # Routing reaches the summed master and via-master forms.
     assert stale_fact_keys(facts, routing_change) == [
-        "no:stage", "via:long", "via:short"]
+        "master:mix", "master:short", "no:stage", "via:long", "via:short"]
 
 
 def test_removed_track_marks_its_facts_source_missing() -> None:
@@ -313,10 +313,11 @@ def test_removed_track_marks_its_facts_source_missing() -> None:
     assert changes["added_tracks"] == []
     assert TRACK_B not in changes["tracks"]
     assert {row["key"]: row["reason"] for row in stale} == {
+        "fact:master": "master_inputs_changed",
         "fact:pre:b": REASON_SOURCE_MISSING,
         "fact:vm:b": REASON_SOURCE_MISSING,
     }
-    assert stale_fact_keys(_facts(), changes) == ["fact:pre:b", "fact:vm:b"]
+    assert stale_fact_keys(_facts(), changes) == ["fact:master", "fact:pre:b", "fact:vm:b"]
     assert "fact:vm:a" not in stale_fact_keys(_facts(), changes)
 
 

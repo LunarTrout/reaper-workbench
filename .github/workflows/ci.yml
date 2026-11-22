@@ -34,3 +34,24 @@ jobs:
 
       - name: Run unit tests
         run: python -m pytest -q
+      - name: Check the built MCP resources
+        if: matrix.python-version == '3.13'
+        run: |
+          python -m pip wheel --no-deps --wheel-dir dist .
+          @'
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+          from zipfile import ZipFile
+          import sys
+
+          with TemporaryDirectory() as installed:
+              wheel = next(Path("dist").glob("reaper_workbench-*.whl"))
+              with ZipFile(wheel) as archive:
+                  archive.extractall(installed)
+              sys.path.insert(0, installed)
+              from reaper_audio import mcp_server
+              assert Path(mcp_server.__file__).is_relative_to(installed)
+              assert "REAPER Workbench" in mcp_server.handbook_resource()
+              assert "Inspect a missed front" in mcp_server.timing_guide_resource()
+          '@ | python -
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

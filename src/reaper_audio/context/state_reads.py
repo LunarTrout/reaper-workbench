@@ -586,7 +586,12 @@ def _compare_fields(stored: Mapping[str, Any], live: Mapping[str, Any],
         if stored_value is None:
             continue
         if name in live and live.get(name) is not None:
-            comparable.append(name)
+            if (name == "items" and isinstance(stored_value, Mapping)
+                    and isinstance(live[name], Mapping) and stored_value.get("audio_sha256")
+                    and not live[name].get("audio_sha256")):
+                unverified.append(name)
+            else:
+                comparable.append(name)
         else:
             unverified.append(name)
     if not comparable:
@@ -673,6 +678,29 @@ def _evaluate_fact(fact: Mapping[str, Any],
         changed, unverified = _compare_fields(master, live["master"], kind="master")
         objects.append({"object": "master", "guid": master.get("guid"),
                         "fields": changed, "unverified": unverified})
+    if dependency == "master":
+        master_record = fingerprints.get("master") or {}
+        inputs = master_record.get("inputs")
+        if not isinstance(inputs, Mapping) or not live["present"]["tracks"]:
+            objects.append({"object": "master_inputs", "fields": [],
+                            "unverified": ["tracks"]})
+        else:
+            changed_guids = sorted(set(inputs) ^ set(live["tracks"]))
+            if changed_guids:
+                objects.append({"object": "master_inputs", "fields": changed_guids,
+                                "unverified": []})
+            for track_guid in sorted(set(inputs) & set(live["tracks"])):
+                changed, unverified = _compare_fields(
+                    inputs[track_guid], live["tracks"][track_guid], kind="track", guid=track_guid)
+                objects.append({"object": "master_input", "guid": track_guid,
+                                "fields": changed, "unverified": unverified})
+        if routing is None or live["routing"] is None:
+            objects.append({"object": "routing", "guid": None, "fields": [],
+                            "unverified": ["routing"]})
+        else:
+            changed, unverified = _compare_routing(routing, live["routing"])
+            objects.append({"object": "routing", "guid": None, "fields": changed,
+                            "unverified": unverified})
     if dependency == "via_master":
         if routing is None:
             return {"state": STATE_UNKNOWN, "reason": "fingerprint_incomplete",

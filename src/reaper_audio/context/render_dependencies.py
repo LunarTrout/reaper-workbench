@@ -57,6 +57,7 @@ __all__ = [
     "manifest_by_source",
     "project_render_manifest",
     "render_key_for",
+    "render_item_payload",
 ]
 
 MANIFEST_SCHEMA = "reaper-workbench.render-manifest/1"
@@ -184,7 +185,7 @@ def _folder_relations(tracks: Sequence[Mapping[str, Any]]) -> tuple[dict[str, st
     return parents, children
 
 
-def _item_payload(item: Mapping[str, Any]) -> dict[str, Any]:
+def render_item_payload(item: Mapping[str, Any]) -> dict[str, Any]:
     payload = {key: item.get(key) for key in _ITEM_KEYS}
     payload["take_volume"] = item.get("take_volume")
     payload["take_pan"] = item.get("take_pan")
@@ -261,7 +262,7 @@ def _base_components(*, digest: Mapping[str, Any]) -> dict[str, Any]:
         track_items = items_by_track.get(guid, [])
         track_components[guid] = {
             "track_state": _sha(state),
-            "items": _sha([_item_payload(item) for item in
+            "items": _sha([render_item_payload(item) for item in
                            sorted(track_items, key=lambda item: str(item.get("guid") or ""))]),
             "fx": _sha(_as_list(row.get("fx"))),
             "fx_state": _sha({

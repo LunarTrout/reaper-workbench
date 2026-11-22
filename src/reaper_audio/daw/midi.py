@@ -252,6 +252,9 @@ class TempoMap:
                                  "marker_time_s": points[0].time_s,
                                  "base_bpm": base_bpm},
                     )
+                points.insert(0, TempoPoint(time_s=0.0, qn=0.0, bpm=base_bpm,
+                                            numerator=base_num, denominator=base_den,
+                                            linear=False, measure=0, beat=0.0))
         integration_warnings = _check_tempo_integration(points)
 
         meters: list[_MeterSpan] = [_MeterSpan(

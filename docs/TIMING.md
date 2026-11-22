@@ -26,7 +26,7 @@ track can remain active for playback.
    Set `protected_ranges` to pin time windows. The summary reports the
    coverage of the detected fronts and the largest remaining errors.
    Use `detail="full"` or `inspect(plan_id=...)` for all blocks and seams.
-5. Use `preview` for a dry A/B of the item window. Use
+5. Use `preview` for a dry A/B of the item window and a synthesized click from the plan’s tempo and meter map. Use
    `reaper_timing(action="apply", plan_id=..., expected_revision=...,
    reason=..., dry_run=true)` to check the plan against REAPER and the file.
    Then apply with `dry_run=false`. Require `readback.matched`, save the

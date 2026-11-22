@@ -17,6 +17,7 @@ import soundfile as sf
 
 from ..analysis.audio import load_audio
 from ..errors import ValidationError
+from .midi import TempoMap
 
 PREVIEW_SCHEMA = "reaper-workbench.timing-preview/1"
 
@@ -76,6 +77,25 @@ def _render_aligned(source: np.ndarray, rate: int, blocks: list[Mapping[str, Any
     return out, geometry
 
 
+def _click_beats(tempo: TempoMap, start_s: float, stop_s: float, phase_s: float):
+    start_qn = max(0.0, tempo.time_to_qn(start_s - phase_s))
+    stop_qn = tempo.time_to_qn(stop_s - phase_s)
+    bar, offset = tempo.qn_to_bar_beat(start_qn)
+    while tempo.bar_start_qn(bar) <= stop_qn:
+        origin = tempo.bar_start_qn(bar)
+        length = tempo.bar_length_qn(bar)
+        numerator, _, beat_qn, _ = tempo.meter_at_bar(bar)
+        for beat in range(numerator):
+            delta = beat * beat_qn
+            if delta >= length or delta < offset - 1e-9:
+                continue
+            time_s = tempo.qn_to_time(origin + delta) + phase_s
+            if start_s - 1e-9 <= time_s < stop_s:
+                yield max(0.0, time_s - start_s), beat == 0
+        bar += 1
+        offset = 0.0
+
+
 def render_timing_preview(plan: Mapping[str, Any], *, out_dir: str | Path,
                           bpm: float | None = None,
                           click: bool = True) -> dict[str, Any]:
@@ -112,31 +132,30 @@ def render_timing_preview(plan: Mapping[str, Any], *, out_dir: str | Path,
     root = Path(out_dir)
     root.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(
-        (str(source_path) + repr(plan.get("blocks"))).encode("utf-8")).hexdigest()[:16]
+        repr((str(source_path), plan.get("blocks"), plan.get("tempo_context"),
+              plan.get("grid_phase_s"), bpm, click)).encode("utf-8")).hexdigest()[:16]
     prefix = root / f"timing-preview-{digest}"
     original_path = prefix.with_name(prefix.name + "-A-original.wav")
     aligned_path = prefix.with_name(prefix.name + "-B-aligned.wav")
     sf.write(original_path, samples, rate, subtype="PCM_24")
     sf.write(aligned_path, aligned, rate, subtype="PCM_24")
     click_path = None
-    if click and bpm and bpm > 0:
+    tempo_context = plan.get("tempo_context")
+    if click and (tempo_context or (bpm and bpm > 0)):
         click_path = prefix.with_name(prefix.name + "-click.wav")
         total = max(len(samples), len(aligned))
         click_samples = np.zeros((total, 2), dtype=np.float64)
-        period = 60.0 / float(bpm)
+        tempo = TempoMap.from_context(tempo_context or
+                                     {"bpm": bpm, "numerator": 4, "denominator": 4})
         phase = float(plan.get("grid_phase_s", 0.))
-        index = int(np.ceil((project_start-phase)/period-1e-9))
-        t = max(0., phase+index*period-project_start)
-        while t < len(click_samples) / rate:
-            at = int(round(t * rate))
+        for time_s, accent in _click_beats(tempo, project_start,
+                                           project_start + total / rate, phase):
+            at = int(round(time_s * rate))
             length = max(1, int(0.025 * rate))
             env = np.exp(-np.linspace(0, 6, length))
-            tone = (0.6 * env * np.sin(2 * np.pi * (1500 if index % 4 == 0 else 1000) *
-                                       np.arange(length) / rate))
-            click_samples[at:at + length, 0] += tone
-            click_samples[at:at + length, 1] += tone
-            t += period
-            index += 1
+            tone = 0.6 * env * np.sin(2 * np.pi * (1500 if accent else 1000) *
+                                      np.arange(length) / rate)
+            click_samples[at:at + length, :] += tone[:total-at, None]
         sf.write(click_path, click_samples, rate, subtype="PCM_24")
     return {
         "schema": PREVIEW_SCHEMA,

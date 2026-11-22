@@ -54,7 +54,7 @@ from .project_state import (
 from .state_diff import STAGE_EXTERNAL_FILE, diff_fingerprints
 from ..daw.fx_state import classify_parameters, summarize_fx
 
-__all__ = ["fill_state_from_capture"]
+__all__ = ["digest_state_rows", "fill_state_from_capture"]
 
 _TRACK_EVIDENCE_PREFIX = "track:"
 _MASTER_EVIDENCE_PREFIX = "master:"
@@ -226,7 +226,7 @@ def _read_session_rows(session: Any) -> tuple[list[dict[str, Any]],
             fields = digest.get("fields")
             if (isinstance(fields, Mapping)
                     and ("tracks" in fields or "master" in fields)):
-                return _digest_rows(digest)
+                return digest_state_rows(digest)
 
     status_reader = getattr(session, "status", None)
     if callable(status_reader):
@@ -290,7 +290,7 @@ def _automation_envelopes(
     return by_track, master
 
 
-def _digest_rows(digest: Mapping[str, Any]
+def digest_state_rows(digest: Mapping[str, Any]
                  ) -> tuple[list[dict[str, Any]], Mapping[str, Any] | None,
                             list[dict[str, Any]] | None]:
     fields = _mapping(digest.get("fields"))

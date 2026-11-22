@@ -148,10 +148,11 @@ def test_state_evidence_full_reports_groups_and_stale_rows(tmp_path: Path) -> No
 
     assert section["state"] == "stale"
     assert section["reason"] == "facts_stale"
-    assert section["units_stale"] == 1
+    assert section["units_stale"] == 2
     assert section["by_source"][f"track:{TRACK_A}"]["stale"] == 1
     assert section["by_stage"][TRACK_STAGE]["stale"] == 1
-    assert [row["source_id"] for row in section["stale_facts"]] == [f"track:{TRACK_A}"]
+    assert {row["source_id"] for row in section["stale_facts"]} == {
+        f"track:{TRACK_A}", f"master:{MASTER}"}
 
 
 def test_status_uses_state_evidence_and_adds_a_state_block(tmp_path: Path) -> None:
@@ -236,9 +237,11 @@ def test_state_freshness_is_stale_after_a_fingerprint_change(tmp_path: Path) -> 
         {"object": "source", "guid": TRACK_A, "fields": ["volume"],
          "unverified": []},
     ]
-    assert report["summary"]["sources_stale"] == 1
-    assert report["summary"]["sources_current"] == 1  # the master fact still holds
-    assert report["changes"][0]["source_id"] == f"track:{TRACK_A}"
+    assert report["sources"][f"master:{MASTER}"][MASTER_STAGE]["state"] == "stale"
+    assert report["summary"]["sources_stale"] == 2
+    assert report["summary"]["sources_current"] == 0
+    assert {row["source_id"] for row in report["changes"]} == {
+        f"track:{TRACK_A}", f"master:{MASTER}"}
     assert report["changes"][0]["objects"][0]["fields"] == ["volume"]
 
 
@@ -435,3 +438,26 @@ def test_read_state_refuses_a_broken_document(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError):
         read_state(tmp_path / "archive", PROJECT)
+
+def test_middle_item_edit_invalidates_both_source_and_master(tmp_path):
+    from copy import deepcopy
+
+    track = track_row(TRACK_A)
+    track["items"] = [
+        {"guid": f"item-{index}", "position_s": float(index), "length_s": 1.0,
+         "active_take": {"guid": f"take-{index}", "source": "di.wav"}}
+        for index in range(3)
+    ]
+    state = ProjectState(StateStore(tmp_path), PROJECT)
+    state.upsert_objects([track], master_row(), [send_row()])
+    state.upsert_fact(source_id=f"track:{TRACK_A}", stage=TRACK_STAGE, window=[0, 3],
+                      metrics={"lufs": -14.0},
+                      fingerprints={"source": fingerprint_track(track),
+                                    "master": fingerprint_master(master_row()),
+                                    "routing": fingerprint_routing([send_row()])})
+    add_master_fact(state)
+    edited = deepcopy(track)
+    edited["items"][1].update(position_s=1.2, fade_in_s=0.05, start_offset_s=0.1)
+    report = state_freshness(state.state, live_read(track=edited))
+    assert report["sources"][f"track:{TRACK_A}"][TRACK_STAGE]["changed_fields"] == ["items"]
+    assert report["sources"][f"master:{MASTER}"][MASTER_STAGE]["state"] == "stale"

@@ -45,7 +45,7 @@ if _G.__reaper_audio_bridge_resident and not _G.__reaper_audio_bridge_reloading 
   return
 end
 _G.__reaper_audio_bridge_resident = true
-local bridge_build = "b36-2026-11-21"  -- typed item.timing_apply handle overlap and pre-roll
+local bridge_build = "b37-2026-11-22"  -- exact timing replacement readback
 -- A second boot inside the same REAPER Lua state must supersede the first:
 -- two loops would both keep heartbeating and the client would see two live
 -- bridges. Every loop compares this token before it reschedules; the newest
@@ -5047,8 +5047,16 @@ local function apply_edit(project, inspected)
         end
       end
     end
+    local replaced_leftover_guids = {}
     for _, leftover in ipairs(leftovers) do
-      reaper.DeleteTrackMediaItem(track, leftover)
+      local guid_ok, guid = reaper.GetSetMediaItemInfo_String(leftover, "GUID", "", false)
+      if not guid_ok or guid == "" then
+        fail("stale_context", "A previous timing clip has no readable GUID")
+      end
+      if not reaper.DeleteTrackMediaItem(track, leftover) then
+        fail("transaction_failed", "Could not remove a previous timing clip", { item_guid = guid })
+      end
+      replaced_leftover_guids[#replaced_leftover_guids + 1] = guid
     end
     local name_ok, take_name = reaper.GetSetMediaItemTakeInfo_String(
       take, "P_NAME", "", false)
@@ -5172,7 +5180,8 @@ local function apply_edit(project, inspected)
     return { changed = true, apply_id = values.apply_id,
              blocks = #values.blocks, created_item_guids = created,
              deleted_source_item_guid = deleted_guid,
-             replaced_leftovers = #leftovers,
+             replaced_leftovers = #replaced_leftover_guids,
+             replaced_leftover_guids = replaced_leftover_guids,
              item_count_after = reaper.CountTrackMediaItems(track) }
   elseif kind == "item.duplicate" then
     local source_take = reaper.GetActiveTake(target)

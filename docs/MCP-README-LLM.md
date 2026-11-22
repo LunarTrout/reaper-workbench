@@ -7,7 +7,9 @@
 > large; pages replace the full context, never duplicate it.
 > `reaper_session(action="state", ...)` reads facts that were already measured,
 > filtered by source, stage, window and metric, without a render. Missing values
-> mean "not measured in this window", not "absent".
+> mean "not measured in this window", not "absent". A `freshness_basis` of
+> `stored_only` means the reply uses archived status without a live
+> fingerprint check.
 >
 > The panorama tools below remain the archived whole-project view: capture a
 > revision, page through it, acknowledge delivery and query exact rows. They are

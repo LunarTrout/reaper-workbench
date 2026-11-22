@@ -151,6 +151,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from .render_dependencies import render_item_payload
+
 from ..errors import ValidationError
 
 __all__ = [
@@ -451,6 +453,7 @@ def _item_summary(row: Mapping[str, Any]) -> dict[str, Any] | None:
         ends: list[float] = []
         takes: list[str] = []
         active: list[str] = []
+        audio_rows: list[dict[str, Any]] = []
         for item in items:
             if not isinstance(item, Mapping):
                 continue
@@ -476,12 +479,24 @@ def _item_summary(row: Mapping[str, Any]) -> dict[str, Any] | None:
                 take_guid = _non_empty_text(item.get("take_guid"))
             if take_guid is not None:
                 active.append(take_guid)
+            audio_rows.append({
+                "guid": item.get("guid"),
+                "position_s": position, "length_s": length,
+                "render": render_item_payload(item),
+                "shape": {name: item.get(name) for name in (
+                    "fade_in_shape", "fade_out_shape", "fade_in_dir", "fade_out_dir",
+                    "volume", "take_count",
+                )},
+                "active_take": {name: value for name, value in take.items()
+                                if name not in {"name", "selected"}},
+            })
         return {
             "count": len(items),
             "start_s": min(starts) if starts else None,
             "end_s": max(ends) if ends else None,
             "takes": sorted(takes),
             "active_takes": sorted(active),
+            "audio_sha256": _digest(sorted(audio_rows, key=_canonical)),
         }
     item_count = _integer(row.get("item_count"))
     if item_count is not None:
@@ -491,6 +506,7 @@ def _item_summary(row: Mapping[str, Any]) -> dict[str, Any] | None:
             "end_s": None,
             "takes": None,
             "active_takes": None,
+            "audio_sha256": None,
         }
     return None
 
@@ -1073,9 +1089,8 @@ class ProjectState:
 
         ``tracks`` is a sequence of track rows or a ``{guid: row}`` mapping;
         rows must carry a non-empty ``guid``.  Only supplied objects are
-        touched: a partial read cannot erase the rest of the state, and object
-        removal is deliberately outside schema v1 (the integration stream can
-        report a removal through :meth:`mark_stale`).
+        touched. A caller with a complete read can explicitly remove deleted
+        tracks after invalidating their facts.
 
         Returns ``{"tracks": {"added", "updated", "unchanged"},
         "master": {...}, "routing": {"added", "updated", "unchanged"},
@@ -1200,6 +1215,15 @@ class ProjectState:
             rows[guid] = row
         return rows
 
+    def remove_tracks(self, guids: Sequence[str]) -> None:
+        objects = self._state["objects"]["tracks"]
+        removed = sorted(guid for guid in guids if guid in objects)
+        if removed:
+            for guid in removed:
+                del objects[guid]
+            token = self._begin_change()
+            self._append_change({"seq": token, "kind": "objects", "tracks_removed": removed})
+
     # -- facts -------------------------------------------------------------- #
 
     def upsert_fact(
@@ -1235,6 +1259,15 @@ class ProjectState:
         key_hash = _key_hash(key)
         stored_metrics = _clone(dict(metrics))
         stored_fingerprints = _normalise_fingerprints(fingerprints)
+        master = stored_fingerprints.get("master")
+        if _stage_dependency(stage) == "master" and master is not None:
+            master["inputs"] = {
+                guid: _clone(row["fingerprint"]["fields"])
+                for guid, row in self._state["objects"]["tracks"].items()
+            }
+            routing = self._state["objects"].get("routing")
+            if stored_fingerprints["routing"] is None and routing:
+                stored_fingerprints["routing"] = _clone(routing["fingerprint"])
         stored_revision = _clone(revision)
 
         facts = self._state["facts"]
@@ -1320,7 +1353,8 @@ class ProjectState:
         :meth:`upsert_objects`.
 
         Dependency rule (frozen): via-master facts depend on source + master +
-        routing; master-stage facts on master only; source-stage facts on their
+        routing; master-stage facts also depend on the project's inputs and
+        routing; source-stage facts on their
         source only.  Only ``current`` facts transition; already-stale or
         superseded facts are left alone, so a repeated call reports nothing.
         Returns ``{fact_id: reason}`` for the facts that went stale.
@@ -1365,6 +1399,10 @@ class ProjectState:
             if dependency == "master":
                 if master_fields:
                     reasons.append(f"master:{','.join(master_fields) or 'unknown'}")
+                if normalised:
+                    reasons.append("master_inputs")
+                if routing_changed:
+                    reasons.append("routing")
             elif dependency == "via_master":
                 if source_changed:
                     reasons.append(f"source:{','.join(source_fields) or 'unknown'}")

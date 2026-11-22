@@ -333,7 +333,8 @@ class FakeTimingProject:
         return {"changed": True, "apply_id": values["apply_id"],
                 "blocks": len(blocks), "created_item_guids": created,
                 "deleted_source_item_guid": deleted,
-                "replaced_leftovers": len(leftovers)}
+                "replaced_leftovers": len(leftovers),
+                "replaced_leftover_guids": [item.guid for item in leftovers]}
 
 
 # ---------------------------------------------------------------------------
@@ -867,3 +868,34 @@ def test_bridge_declares_and_applies_the_typed_operation() -> None:
     assert "D_FADEINLEN_AUTO" in text and "D_FADEOUTLEN_AUTO" in text
     assert "timing_note_prefix" in text
     assert "timing_geometry_mismatch" in text
+
+@pytest.mark.parametrize("condition,field", [
+    ("extra", "extra_item_guids"), ("missing_other", "missing_item_guids"),
+    ("retained", "source_item"), ("no_audio", "source_path"), ("offline", "source_path"),
+])
+def test_readback_requires_exact_track_membership_and_media(condition, field):
+    from reaper_audio.daw.timing_apply import normalize_clips, verify_applied_geometry
+
+    row = {"position_s": 1.0, "length_s": 1.0, "source_start_s": 0.0,
+           "fade_in_s": 0.0, "fade_out_s": 0.0}
+    clip, = normalize_clips([row], project_start_s=1.0)
+    new = {**row, "start_offset_s": 0.0, "guid": "new", "playrate": 1.0,
+           "active_take": {"source": SOURCE_PATH}}
+    items = [new, {"guid": "keep", "position_s": 10.0}]
+    if condition == "extra":
+        items.append({"guid": "leftover"})
+    elif condition == "missing_other":
+        items.pop()
+    elif condition == "retained":
+        items.append({"guid": "old"})
+    elif condition == "no_audio":
+        new["active_take"] = {}
+    elif condition == "offline":
+        new["source_online"] = False
+    report = verify_applied_geometry(
+        {"tracks": [{"guid": TRACK_GUID, "items": items}]}, track_guid=TRACK_GUID,
+        clips=[clip], created_guids=["new"], source_item_guid="old",
+        source_removed=condition != "retained", source_path=SOURCE_PATH,
+        before_item_guids=["old", "keep"])
+    assert not report["matched"]
+    assert field in {entry["field"] for entry in report["mismatches"]}

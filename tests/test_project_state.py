@@ -441,7 +441,7 @@ def test_source_change_stales_that_source_only(tmp_path: Path) -> None:
     assert fact_b["id"] not in stale
 
 
-def test_routing_change_stales_via_master_facts_only(tmp_path: Path) -> None:
+def test_routing_change_stales_mix_and_via_master_facts(tmp_path: Path) -> None:
     state = ProjectState(StateStore(tmp_path), PROJECT)
     via_master = add_fact(state, source_id=f"track:{TRACK_A}", stage="via_master",
                           source_guid=TRACK_A)
@@ -452,9 +452,9 @@ def test_routing_change_stales_via_master_facts_only(tmp_path: Path) -> None:
 
     stale = state.mark_stale({}, routing_changed=True)
 
-    assert set(stale) == {via_master["id"]}
+    assert set(stale) == {via_master["id"], master_stage["id"]}
     assert stale[via_master["id"]] == "routing"
-    assert master_stage["id"] not in stale
+    assert stale[master_stage["id"]] == "routing"
     assert source_stage["id"] not in stale
 
 

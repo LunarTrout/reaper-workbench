@@ -30,7 +30,7 @@
                  rhythm_choices={"bar_2_beat_3": "option_2", "bar_2_beat_4": "keep"})
    ```
 
-5. `preview` создаёт сухое сравнение до и после. `apply` с `dry_run=true`
+5. `preview` создаёт сухое сравнение до и после и клик по карте темпа и размера плана. `apply` с `dry_run=true`
    проверяет транзакцию. Для монтажа передай `plan_id`, актуальную
    `expected_revision` и `reason` вместе с `dry_run=false`. Успешный
    `readback.matched` подтверждает геометрию айтемов. Результат содержит ID

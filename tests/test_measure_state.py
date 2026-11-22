@@ -383,3 +383,21 @@ def test_no_archive_root_writes_no_state(tmp_path, monkeypatch) -> None:
     assert result["state"] == {"state_token": 0, "facts_written": 0, "changes": {}}
     assert not (tmp_path / "projects").exists(), "no state directory is created"
     assert bridge.digest_reads == 1, "only the render read the digest"
+
+def test_saved_mcp_state_refreshes_master_after_live_fader_change(tmp_path):
+    from types import SimpleNamespace
+    from reaper_audio.mcp_server import _refresh_saved_state
+
+    service, bridge = _service(tmp_path)
+    service.measure(sources="all", stage="master", intervals=[[0, 2]],
+                    metrics=["lufs"], analysis_workers=1)
+    bridge.volume[next(iter(TRACKS))] = 0.5
+    session = SimpleNamespace(digest=bridge.project_digest)
+    prior_renders = len(bridge.render_calls)
+    document, basis = _refresh_saved_state(session, str(tmp_path / "archive"), PROJECT_ID)
+    assert basis == "live_digest"
+    master, = document["facts"].values()
+    assert master["status"] == "stale"
+    assert "master_inputs" in master["stale_reason"]
+    assert _state(tmp_path).facts_for()[0]["status"] == "stale"
+    assert len(bridge.render_calls) == prior_renders

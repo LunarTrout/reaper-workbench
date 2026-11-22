@@ -223,6 +223,8 @@ def test_second_capture_marks_facts_stale_before_upserting_new_ones(
     assert result["changes"]["changed_objects"][TRACK_A] == ["volume"]
     assert result["changes"]["stale_facts"] == {
         old_fact["id"]: "source:volume",
+        next(f["id"] for f in state.facts_for() if f["source_id"].startswith("master:")):
+            "master_inputs",
     }
 
     log = reloaded.state["changes"]
@@ -233,9 +235,8 @@ def test_second_capture_marks_facts_stale_before_upserting_new_ones(
     assert new_fact_seqs
     # mark_stale ran first: every invalidation precedes the new facts.
     assert max(stale_seqs) < min(new_fact_seqs)
-    assert log[[entry["seq"] for entry in log].index(stale_seqs[0])]["facts"] == {
-        old_fact["id"]: "source:volume",
-    }
+    assert log[[entry["seq"] for entry in log].index(stale_seqs[0])]["facts"] == (
+        result["changes"]["stale_facts"])
 
     facts = reloaded.facts_for(source_id=f"track:{TRACK_A}")
     assert len(facts) == 2

@@ -99,6 +99,7 @@ REASON_SOURCE_UNKNOWN = "source_unknown"
 REASON_MASTER_CHANGED = "master_changed"
 REASON_ROUTING_CHANGED = "routing_changed"
 REASON_PROJECT_CHANGED = "project_changed"
+REASON_MASTER_INPUTS_CHANGED = "master_inputs_changed"
 
 #: A fact may be invalidated by more than one dependency.  The reported
 #: ``reason`` is the most specific one, in this order.
@@ -108,6 +109,7 @@ _REASON_PRIORITY: tuple[str, ...] = (
     REASON_SOURCE_CHANGED,
     REASON_MASTER_CHANGED,
     REASON_ROUTING_CHANGED,
+    REASON_MASTER_INPUTS_CHANGED,
     REASON_SOURCE_UNKNOWN,
     REASON_PROJECT_CHANGED,
 )
@@ -1106,7 +1108,7 @@ def stale_facts(facts: Sequence[Mapping[str, Any]],
 
     * ``external_file`` facts depend on nothing in the project and are never
       stale from a fingerprint diff;
-    * master-stage facts depend on the master fingerprint only;
+    * master-stage facts depend on the master, input tracks and routing;
     * ``via_master`` facts depend on their own source, on the master and on
       routing — any routing change feeds a different mix to the master;
     * ``premaster`` facts depend on their own source only;
@@ -1124,11 +1126,9 @@ def stale_facts(facts: Sequence[Mapping[str, Any]],
     routing = _mapping(changes.get("routing"))
     routing_changed = (bool(routing.get("changed"))
                        or bool(_changed_fields(routing)))
-    any_change = bool(
-        master_changed or routing_changed
-        or _mapping(changes.get("tracks"))
-        or changes.get("added_tracks") or changes.get("removed_tracks")
-    )
+    inputs_changed = bool(_mapping(changes.get("tracks"))
+                          or changes.get("added_tracks") or changes.get("removed_tracks"))
+    any_change = master_changed or routing_changed or inputs_changed
     master_guid = changes.get("master_guid")
     if not isinstance(master_guid, str) or not master_guid:
         master_guid = None
@@ -1154,6 +1154,10 @@ def stale_facts(facts: Sequence[Mapping[str, Any]],
         elif kind == "master":
             if master_changed:
                 reasons.append(REASON_MASTER_CHANGED)
+            if routing_changed:
+                reasons.append(REASON_ROUTING_CHANGED)
+            if inputs_changed:
+                reasons.append(REASON_MASTER_INPUTS_CHANGED)
         elif kind == "project":
             if any_change:
                 reasons.append(REASON_PROJECT_CHANGED)

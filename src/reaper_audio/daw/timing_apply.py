@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from pathlib import Path
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -694,7 +695,8 @@ def verify_applied_geometry(snapshot: Mapping[str, Any], *,
                             source_item_guid: str,
                             source_removed: bool,
                             source_path: str,
-                            before_item_guids: Sequence[str] = ()) -> dict[str, Any]:
+                            before_item_guids: Sequence[str] = (),
+                            replaced_item_guids: Sequence[str] = ()) -> dict[str, Any]:
     """Check every created clip and refuse to call duplicates a success."""
     items = _track_items(snapshot, track_guid)
     by_guid = {str(item.get("guid") or ""): item for item in items}
@@ -702,6 +704,9 @@ def verify_applied_geometry(snapshot: Mapping[str, Any], *,
     if len(created_guids) != len(clips):
         mismatches.append({"field": "created_item_guids", "expected": len(clips),
                            "actual": len(created_guids)})
+    if len(set(created_guids)) != len(created_guids):
+        mismatches.append({"field": "created_item_guids", "expected": "unique",
+                           "actual": list(created_guids)})
     for index, (clip, guid) in enumerate(zip(clips, created_guids)):
         item = by_guid.get(guid)
         if item is None:
@@ -710,7 +715,7 @@ def verify_applied_geometry(snapshot: Mapping[str, Any], *,
             continue
         mismatches.extend(_item_matches(item, clip, expected_index=index))
         take_path = _take_source_path(item)
-        if take_path and take_path != source_path:
+        if not take_path or Path(take_path) != Path(source_path) or item.get("source_online") is False:
             mismatches.append({"block_index": index, "field": "source_path",
                                "expected": source_path, "actual": take_path})
     duplicates: list[dict[str, Any]] = []
@@ -720,18 +725,29 @@ def verify_applied_geometry(snapshot: Mapping[str, Any], *,
                     and not isinstance(item.get("position_s"), bool)
                     and abs(float(item["position_s"]) - clip.position_s) <= GEOMETRY_ATOL
                     and isinstance(item.get("start_offset_s"), (int, float))
-                    and abs(float(item["start_offset_s"]) - clip.source_start_s) <= GEOMETRY_ATOL]
+                    and abs(float(item["start_offset_s"]) - clip.source_start_s) <= GEOMETRY_ATOL
+                    and Path(_take_source_path(item)) == Path(source_path)]
         if len(matching) > 1:
             duplicates.append({"block_index": index, "guids": matching,
                                "position_s": _round(clip.position_s),
                                "source_start_s": _round(clip.source_start_s)})
-    expected_guids = set(created_guids) | set(before_item_guids)
-    extra = sorted(set(by_guid) - expected_guids)
+    before_guids = set(before_item_guids)
+    created, replaced = set(created_guids), set(replaced_item_guids)
+    retained = before_guids - {source_item_guid}
+    if created & before_guids or not replaced <= retained:
+        mismatches.append({"field": "item_identity", "expected": "new clips and known replacements",
+                           "actual": {"created": list(created_guids),
+                                      "replaced": list(replaced_item_guids)}})
+    expected_guids = (retained - replaced) | created
+    extra = sorted(set(by_guid) - expected_guids - {source_item_guid})
+    missing = sorted(expected_guids - set(by_guid))
+    for field, guids in (("extra_item_guids", extra), ("missing_item_guids", missing)):
+        if guids:
+            mismatches.append({"field": field, "expected": [], "actual": guids})
     removed = source_item_guid not in by_guid
-    if removed != source_removed:
-        mismatches.append({"field": "source_item",
-                           "expected": "removed" if source_removed else "present",
-                           "actual": "removed" if removed else "present"})
+    if not removed or not source_removed:
+        mismatches.append({"field": "source_item", "expected": "removed",
+                           "actual": "present" if not removed else "removal_not_reported"})
     return {
         "matched": not mismatches and not duplicates,
         "checked_blocks": len(clips),
@@ -872,7 +888,6 @@ def apply_timing_plan(
         if target_item != plan_doc.get("item_guid") or target_track != plan_doc.get("track_guid"):
             raise ValidationError("The apply target must match the planned item and track")
         from .timing_service import _file_fingerprint
-        from pathlib import Path
         if item["take_count"] != 1 or item["take_fx_count"]:
             raise ValidationError("Crossfade replacement requires a single take without take FX")
         if (plan_doc.get("project_id") != revision.project_id or
@@ -899,8 +914,6 @@ def apply_timing_plan(
     receipt_key = (revision, operation.values["apply_id"])
     needs_dry_run = crossfade and isinstance(plan, str) and bool(plan_doc.get("parent_plan_id"))
     if crossfade:
-        from pathlib import Path
-
         source_path = Path(item["source_path"])
         window_start, window_end = item["position_s"], item["position_s"] + item["length_s"]
         blockers = [row["guid"] for row in before_items
@@ -973,13 +986,14 @@ def apply_timing_plan(
     created = [str(guid) for guid in facts.get("created_item_guids") or ()]
     if len(created) != len(clips):
         created = []
-    source_removed = bool(facts.get("deleted_source_item_guid"))
+    source_removed = facts.get("deleted_source_item_guid") == target_item
     after_snapshot = session.snapshot(project_id=project_id, include_items=True)
     readback = verify_applied_geometry(
         after_snapshot, track_guid=target_track, clips=clips,
         created_guids=created, source_item_guid=target_item,
         source_removed=source_removed, source_path=item["source_path"],
-        before_item_guids=base["before_item_guids"])
+        before_item_guids=base["before_item_guids"],
+        replaced_item_guids=facts.get("replaced_leftover_guids") or ())
     matched = bool(readback["matched"])
     result = {
         "ok": True,

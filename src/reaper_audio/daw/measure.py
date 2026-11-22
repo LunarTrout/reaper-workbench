@@ -49,6 +49,7 @@ from ..analysis.artifacts import AudioArtifactWorkspace
 from ..analysis.audio import load_audio
 from ..analysis.metrics import ANALYSIS_VERSION
 from ..context import contract_v2
+from ..context.capture_state import digest_state_rows
 from ..context.evidence import EvidenceStore
 from ..context.measurement_cache import MeasurementCache
 from ..context.project_state import (ProjectState, StateStore, fingerprint_master,
@@ -162,68 +163,6 @@ def _digest_fields(digest: object) -> Mapping[str, Any]:
     return fields if isinstance(fields, Mapping) else {}
 
 
-def _digest_track_rows(digest: object) -> dict[str, dict[str, Any]]:
-    """Fingerprint-ready track rows from one digest read.
-
-    A digest keeps tracks, automation and items in three sections.  A track
-    fingerprint is only as rich as the row it is built from, so the sections are
-    joined here by GUID: ``envelopes`` comes from the automation section and
-    ``items`` from the item section.  A section the digest did not carry leaves
-    its field absent (and therefore ``null`` in the fingerprint) instead of
-    claiming that the track has no automation and no items.
-    """
-    fields = _digest_fields(digest)
-    rows: dict[str, dict[str, Any]] = {}
-    raw_tracks = fields.get("tracks")
-    for row in raw_tracks if isinstance(raw_tracks, list) else []:
-        if not isinstance(row, Mapping):
-            continue
-        guid = row.get("guid")
-        if isinstance(guid, str) and guid:
-            rows[guid] = dict(row)
-    automation = fields.get("automation")
-    envelope_rows = automation.get("tracks") if isinstance(automation, Mapping) else None
-    if isinstance(envelope_rows, list):
-        for row in envelope_rows:
-            if not isinstance(row, Mapping):
-                continue
-            guid = row.get("track_guid")
-            if isinstance(guid, str) and guid in rows:
-                rows[guid]["envelopes"] = list(row.get("envelopes") or [])
-    item_rows = fields.get("items")
-    if isinstance(item_rows, list):
-        grouped: dict[str, list[Mapping[str, Any]]] = {}
-        for item in item_rows:
-            if not isinstance(item, Mapping):
-                continue
-            guid = item.get("track_guid")
-            if isinstance(guid, str) and guid:
-                grouped.setdefault(guid, []).append(item)
-        for guid, row in rows.items():
-            row["items"] = list(grouped.get(guid, ()))
-    return rows
-
-
-def _digest_master_row(digest: object) -> Mapping[str, Any] | None:
-    """The digest's master row, or ``None`` when it was not read."""
-    master = _digest_fields(digest).get("master")
-    return master if isinstance(master, Mapping) and master else None
-
-
-def _routing_rows(track_rows: Mapping[str, Mapping[str, Any]],
-                  master_row: Mapping[str, Any] | None) -> list[Mapping[str, Any]] | None:
-    """Owner rows that carry a ``sends`` list, or ``None`` when routing is unread.
-
-    A routing fingerprint may only be built from rows that actually enumerate
-    sends: one row without a ``sends`` list is missing evidence, and an empty
-    edge list would wrongly claim "nothing is routed".
-    """
-    rows = list(track_rows.values()) + ([master_row] if master_row is not None else [])
-    if not rows or any(not isinstance(row.get("sends"), list) for row in rows):
-        return None
-    return rows
-
-
 def _fingerprint_fields(fingerprint: object) -> dict[str, Any]:
     """The field map of a stored fingerprint, or an empty mapping."""
     if isinstance(fingerprint, Mapping):
@@ -255,6 +194,66 @@ def _stored_object_view(objects: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(routing, Mapping):
         view["routing"] = _fingerprint_fields(routing.get("fingerprint"))
     return view
+
+
+def refresh_state_objects(state: ProjectState, digest: object):
+    """Update saved fingerprints and invalidate facts from a live digest."""
+    if not isinstance(digest, Mapping) or not isinstance(_digest_fields(digest).get("tracks"), list):
+        return {}, None, None, {}
+    rows, master_row, routing_rows = digest_state_rows(digest)
+    track_rows = {row["guid"]: row for row in rows}
+
+    track_fingerprints = {guid: fingerprint_track(row)
+                          for guid, row in track_rows.items()}
+    master_fingerprint = (fingerprint_master(master_row)
+                          if master_row is not None else None)
+    routing_fingerprint = (fingerprint_routing(routing_rows)
+                           if routing_rows is not None else None)
+
+    stored_view = _stored_object_view(state.objects)
+    current_view: dict[str, Any] = {
+        "tracks": {guid: _fingerprint_fields(fingerprint)
+                   for guid, fingerprint in track_fingerprints.items()},
+    }
+    comparable_stored: dict[str, Any] = {"tracks": dict(stored_view["tracks"])}
+    if master_fingerprint is not None:
+        current_view["master"] = _fingerprint_fields(master_fingerprint)
+        comparable_stored["master"] = stored_view.get("master", {})
+    if routing_fingerprint is not None:
+        current_view["routing"] = _fingerprint_fields(routing_fingerprint)
+        comparable_stored["routing"] = stored_view.get("routing", {})
+    changes = state_changes(comparable_stored, current_view)
+    objects_block = changes.get("objects") or {}
+    changed: dict[str, list[str]] = {}
+    for guid, section in (objects_block.get("tracks") or {}).items():
+        if isinstance(section, Mapping):
+            changed[str(guid)] = [str(field) for field in section.get("fields") or []]
+    for guid in (*objects_block.get("added_tracks", ()), *objects_block.get("removed_tracks", ())):
+        changed.setdefault(guid, ["track_identity"])
+    master_fields = (objects_block.get("master") or {}).get("fields") or []
+    if master_fields:
+        changed[MASTER_CHANGE_KEY] = [str(field) for field in master_fields]
+    routing_changed = bool((objects_block.get("routing") or {}).get("changed"))
+
+    stale = state.mark_stale(changed, routing_changed=routing_changed)
+
+    if track_rows or master_row is not None or routing_rows is not None:
+        state.upsert_objects(
+            tracks=track_rows or None,
+            master=master_row,
+            routing=routing_rows,
+        )
+    if objects_block.get("removed_tracks"):
+        state.remove_tracks(objects_block["removed_tracks"])
+
+    return track_fingerprints, master_fingerprint, routing_fingerprint, {
+        "objects_changed": bool(changes.get("changed")),
+        "changed": changed,
+        "routing_changed": routing_changed,
+        "stale_facts": sorted(stale),
+        "added_tracks": list(objects_block.get("added_tracks") or []),
+        "removed_tracks": list(objects_block.get("removed_tracks") or []),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,48 +380,8 @@ class MeasureService(FullCaptureService):
             return disabled
 
         digest = self._state_digest(digest, project_id)
-        track_rows = _digest_track_rows(digest)
-        master_row = _digest_master_row(digest)
-        routing_rows = _routing_rows(track_rows, master_row)
-
-        track_fingerprints = {guid: fingerprint_track(row)
-                              for guid, row in track_rows.items()}
-        master_fingerprint = (fingerprint_master(master_row)
-                              if master_row is not None else None)
-        routing_fingerprint = (fingerprint_routing(routing_rows)
-                               if routing_rows is not None else None)
-
-        stored_view = _stored_object_view(state.objects)
-        current_view: dict[str, Any] = {
-            "tracks": {guid: _fingerprint_fields(fingerprint)
-                       for guid, fingerprint in track_fingerprints.items()},
-        }
-        comparable_stored: dict[str, Any] = {"tracks": dict(stored_view["tracks"])}
-        if master_fingerprint is not None:
-            current_view["master"] = _fingerprint_fields(master_fingerprint)
-            comparable_stored["master"] = stored_view.get("master", {})
-        if routing_fingerprint is not None:
-            current_view["routing"] = _fingerprint_fields(routing_fingerprint)
-            comparable_stored["routing"] = stored_view.get("routing", {})
-        changes = state_changes(comparable_stored, current_view)
-        objects_block = changes.get("objects") or {}
-        changed: dict[str, list[str]] = {}
-        for guid, section in (objects_block.get("tracks") or {}).items():
-            if isinstance(section, Mapping):
-                changed[str(guid)] = [str(field) for field in section.get("fields") or []]
-        master_fields = (objects_block.get("master") or {}).get("fields") or []
-        if master_fields:
-            changed[MASTER_CHANGE_KEY] = [str(field) for field in master_fields]
-        routing_changed = bool((objects_block.get("routing") or {}).get("changed"))
-
-        stale = state.mark_stale(changed, routing_changed=routing_changed)
-
-        if track_rows or master_row is not None or routing_rows is not None:
-            state.upsert_objects(
-                tracks=track_rows or None,
-                master=master_row,
-                routing=routing_rows,
-            )
+        track_fingerprints, master_fingerprint, routing_fingerprint, state_changes_report = (
+            refresh_state_objects(state, digest))
 
         def facts_for(source_id: str, stage: str, kind: str) -> dict[str, Any] | None:
             """The three fingerprints a fact of this source depends on."""
@@ -476,14 +435,7 @@ class MeasureService(FullCaptureService):
         return {
             "state_token": int(state.state_token),
             "facts_written": written,
-            "changes": {
-                "objects_changed": bool(changes.get("changed")),
-                "changed": changed,
-                "routing_changed": routing_changed,
-                "stale_facts": sorted(stale),
-                "added_tracks": list(objects_block.get("added_tracks") or []),
-                "removed_tracks": list(objects_block.get("removed_tracks") or []),
-            },
+            "changes": state_changes_report,
         }
 
     def measure(self, *,

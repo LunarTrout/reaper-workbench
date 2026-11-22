@@ -46,9 +46,7 @@ from .context.state_query import (query_facts, changes_since as state_changes_si
 from .context.project_context import (build_project_context, estimated_tokens,
                                        project_context_pages)
 from .context.journal import JournalStore, make_entry
-from .context.project_state import (StateStore, ProjectState, fingerprint_track,
-                                    fingerprint_master)
-from .context.state_diff import state_changes as live_state_changes
+from .context.project_state import ProjectState, StateStore
 from .daw.midi import MidiService
 from .daw.edit import run_edit, send_list, undo_receipt
 from .daw.receipt import FileReceiptStore
@@ -86,7 +84,7 @@ from .context.plugin_summary import PluginDescriptor, summarize
 from .context.panorama_view import DEFAULT_RESPONSE_BYTES
 from .context.revision import digest_evidence
 from .context.identity import identity_from_mapping
-from .errors import (BridgeUnavailable, PanoramaCapacityError, ReaperAudioError,
+from .errors import (BridgeTimeout, BridgeUnavailable, PanoramaCapacityError, ReaperAudioError,
                      StaleContext, ValidationError)
 from .models import AudioBuffer, MeasurementReport, MetricValue, Section
 from .reaper.api_catalog import get_api_catalog
@@ -104,7 +102,10 @@ _LOG = logging.getLogger("reaper_audio.mcp")
 
 # --- handbook gate -----------------------------------------------------------
 
-_HANDBOOK_PATH = Path(__file__).resolve().parents[2] / "docs" / "HANDBOOK.md"
+_SOURCE_DOCS = Path(__file__).resolve().parents[2] / "docs"
+_PACKAGED_GUIDES = Path(__file__).with_name("guides")
+_GUIDE_DIR = _PACKAGED_GUIDES if _PACKAGED_GUIDES.is_dir() else _SOURCE_DOCS
+_HANDBOOK_PATH = _GUIDE_DIR / "HANDBOOK.md"
 _handbook_read: set[str] = set()
 _handbook_lock = threading.Lock()
 
@@ -1566,6 +1567,24 @@ def _capture_audio_buffer(archive: CaptureArchive, asset: Mapping[str, Any], *,
                        provenance=provenance)
 
 
+def _refresh_saved_state(session: ProjectSession, archive_root: str, project_id: str):
+    from .daw.measure import refresh_state_objects
+
+    store = StateStore(archive_root)
+    if not store.path_for(project_id).exists():
+        return None, "no_state"
+    state = ProjectState(store, project_id)
+    token = state.state_token
+    try:
+        digest = session.digest(project_id)
+    except (BridgeUnavailable, BridgeTimeout):
+        return state.state, "stored_only"
+    *_, changes = refresh_state_objects(state, digest)
+    if state.state_token != token:
+        state.save()
+    return state.state, "live_digest" if changes else "stored_only"
+
+
 @server.tool()
 @_guard
 def reaper_session(action: str = "health",
@@ -1623,32 +1642,14 @@ def reaper_session(action: str = "health",
         if action == "context":
             if not archive_root:
                 raise ValidationError("archive_root is required for action=context")
-            from .context.state_reads import read_state
             selected = project_id or session.project_id
             if not selected:
                 raise ValidationError("project_id is required when no project is active")
-            state = read_state(archive_root, selected)
+            state, freshness_basis = _refresh_saved_state(session, archive_root, selected)
             if state is None:
                 raise ValidationError("no project state exists yet; run a capture or measure")
             snapshot = session.snapshot(include_items=False)
-            live_tracks = {str(t.get("guid")): fingerprint_track(t)
-                           for t in (snapshot.get("tracks") or [])
-                           if t.get("guid")}
             live_master = snapshot.get("master") or {}
-            try:
-                live = state_changes(state.get("objects") or {},
-                                     {"tracks": live_tracks,
-                                      "master": fingerprint_master(live_master) if live_master else None})
-                if live.get("changed"):
-                    ps = ProjectState(StateStore(archive_root), selected)
-                    ps.mark_stale(live.get("changed") or {},
-                                  routing_changed=bool(live.get("routing_changed")))
-                    ps.upsert_objects(tracks=list(live_tracks.values()),
-                                      master=live_master or None)
-                    ps.save()
-                    state = ps.state
-            except Exception:
-                pass
             map_document = state.get("map")
             if not isinstance(map_document, Mapping):
                 map_document = {"tracks": snapshot.get("tracks") or [],
@@ -1684,25 +1685,26 @@ def reaper_session(action: str = "health",
                 if isinstance(changes, dict):
                     changes["revision"] = snapshot.get("revision")
             answer = {"ok": True, "action": "context", "context": context,
+                      "freshness_basis": freshness_basis,
                       "estimated_tokens": estimated_tokens(context)}
             if context_pages:
                 pages = project_context_pages(context, page_bytes=context_page_bytes)
                 return {"ok": True, "action": "context", "pages": pages,
+                        "freshness_basis": freshness_basis,
                         "estimated_tokens": estimated_tokens(context),
                         "context": None}
             return answer
         if action == "state":
             if not archive_root:
                 raise ValidationError("archive_root is required for action=state")
-            from .context.state_reads import read_state
             selected = project_id or session.project_id
             if not selected:
                 raise ValidationError("project_id is required when no project is active")
-            state = read_state(archive_root, selected)
+            state, freshness_basis = _refresh_saved_state(session, archive_root, selected)
             report = state_availability(state)
             if state_since is not None:
                 return {"ok": True, "action": "state",
-                        "availability": report,
+                        "availability": report, "freshness_basis": freshness_basis,
                         **state_changes_since(state, state_since)}
             rows = query_facts(state, source_id=state_source, stage=state_stage,
                                window=state_window, metrics=state_metrics,
@@ -1727,7 +1729,8 @@ def reaper_session(action: str = "health",
                     })
                 rows = compact
             return {"ok": True, "action": "state", "availability": report,
-                    "facts": rows, "state_token": (state or {}).get("token")}
+                    "facts": rows, "state_token": (state or {}).get("token"),
+                    "freshness_basis": freshness_basis}
         if action == "preflight":
             return session.preflight(allow_solo=allow_solo, check_focus=check_focus)
         if action == "transport":
