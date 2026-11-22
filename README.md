@@ -1,8 +1,13 @@
 # REAPER Workbench
 
-**Audio analysis and verified editing for a live REAPER project.**
+**Agent-driven mixing, reference comparison and audio timing in REAPER.**
 
 [Русская версия](README.ru.md) · [Installation](docs/INSTALLATION.md) · [MCP guide](docs/MCP-README-LLM.md)
+
+Give an AI agent your REAPER project and a reference track. It can measure
+how your mix differs, apply mix decisions in REAPER, and render again to
+check what those changes did. The same tools can investigate and correct
+performance timing down to individual attacks and crossfades.
 
 Why does the bass disappear when the chorus guitars come in? Is a riff
 dragging against the click, or did the detector pick the wrong edge of a note?
@@ -14,6 +19,22 @@ and measure what changed after an edit.
 Workbench connects **three kinds of evidence in the same session**: the sound
 REAPER renders, the project state that produced it, and the changes written
 back to the DAW. It exposes them through a local MCP server and a Python library.
+
+## Mix toward a reference
+
+Compare a project render with one or more reference tracks. Choose full
+files or specific excerpts independently of the project timeline. For
+example, compare your chorus with a similarly dense section of a reference
+and inspect differences in loudness, dynamics, frequency balance and stereo
+width.
+
+The agent can use those differences to choose and apply changes to levels,
+panning or FX, then re-render the same passage and compare it again. The
+reference gives the mix a direction. The agent can use the individual tracks
+and their routing to decide where to make a change, and the edits remain
+available for auditioning and adjustment in REAPER.
+
+[Reference excerpts and project analysis](docs/MCP-README-LLM.md)
 
 ## Analyze the mix that actually plays
 
