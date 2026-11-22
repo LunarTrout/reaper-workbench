@@ -1,32 +1,66 @@
 # REAPER Workbench
 
-**A local bridge between an AI agent and a live REAPER session.**
+**Audio analysis and verified editing for a live REAPER project.**
 
 [Русская версия](README.ru.md) · [Installation](docs/INSTALLATION.md) · [MCP guide](docs/MCP-README-LLM.md)
 
-Give an MCP client access to the project you already have open in REAPER.
-It can inspect the arrangement, routing and FX, measure the audio REAPER
-actually renders, and make edits you can open, listen to and adjust in the DAW.
-Python scripts can use the same library directly.
+Why does the bass disappear when the chorus guitars come in? Is a riff
+dragging against the click, or did the detector pick the wrong edge of a note?
+REAPER Workbench gives an AI agent the audio and project context to investigate
+questions like these. It can render a specific passage through REAPER, compare
+sources in time and frequency, follow an exact attack back to the clean take,
+and measure what changed after an edit.
 
-For example, ask an agent to **check why a guitar riff drifts against the
-click**. It can inspect the clean DI around a missed attack, compare grid
-interpretations, preview an edit, and apply it as ordinary REAPER clips
-with crossfades at 1× playback speed. You can audition the result with the
-original amp chain and see precisely what changed. [Audio timing guide](docs/TIMING.md)
+Workbench connects **three kinds of evidence in the same session**: the sound
+REAPER renders, the project state that produced it, and the changes written
+back to the DAW. It exposes them through a local MCP server and a Python library.
 
-## What you can do
+## Analyze the mix that actually plays
 
-| Task | What Workbench provides |
-| --- | --- |
-| **Understand the open project** | Track and item identities, timeline, tempo, routing, FX and project health. Read a compact context or request only what changed. |
-| **Investigate a mix** | Measure the selected sources and time ranges through REAPER. Compare loudness, peaks, frequency bands, stereo balance and other metrics at the relevant processing stages. |
-| **Edit audio timing** | Examine clean source waveforms, compare local rhythm hypotheses, add missed attacks manually and refine specific seams. Preview a dry A/B, then create native clips and crossfades. |
-| **Make and verify edits** | Preview and apply typed changes to tracks, FX, sends, items, automation and MIDI. Receipts bind edits to a project revision and record the values read back from REAPER. Undo is available for supported transactions. |
-| **Keep evidence across passes** | Project state records measured facts and their freshness. An agent can reuse measurements it already has and see which facts need to be refreshed after a change. |
+- **Measure the passage and processing stage that matter.** Workbench renders
+  selected sources and time ranges in REAPER. It records the stage alongside
+  the result, so a track routed through the master and a master render stay
+  distinguishable. Compare loudness, peaks, transient metrics, frequency
+  bands and stereo relationships in context.
+- **Find where sources compete.** Look at time-resolved band levels and
+  relative dominance across sources, or compare phase and stereo evidence.
+  For example, inspect the bass and guitars on the exact bars where the bass
+  recedes. Band overlap can point to a passage worth auditioning. Source
+  loudness attribution has a separate reconstruction check that can withhold
+  the estimate when the source renders fail to account for the declared mix.
+- **Find out what an edit did to the audio.** Render and measure the same
+  passage at the same stage before and after a change. Workbench can compare
+  stored analyses down to the individual time-series measurements, so an
+  improvement in one section stays visible alongside a regression elsewhere.
 
-There are also tools for asynchronous audio capture, importing references
-and encoding audio with a post-codec true-peak check.
+[Measurement and mix evidence](docs/MCP-README-LLM.md) · [Loudness reconstruction check](docs/PARTIAL-LOUDNESS-GATE.md)
+
+## Find the attack, then decide how to move it
+
+Compare clean DI waveforms against the project tempo map and click. The timing
+tools surface alternative rhythms, candidates without a target and residual
+errors that a good median can hide. Zoom into the source between detected
+events to find a missed pick, then trace that same front through the plan and
+every fade that touches it.
+
+Once a decision is made, preview a dry A/B and apply the edit as **native REAPER
+clips and crossfades at 1×**. The original amp chain is still available for
+auditioning. The result can be checked one attack at a time in the saved
+geometry, including whether a seam lets an earlier copy of the attack through.
+
+[Audio timing and guitar examples](docs/TIMING.md)
+
+## Keep the analysis tied to the project
+
+A project context includes the arrangement, tempo, routing, FX and revision.
+Measured facts carry their source, interval and freshness. On the next pass
+the agent can request what changed, reuse valid measurements and refresh the
+ones affected by an edit. Verified edits return the values read back from
+REAPER and a receipt for supported undo operations.
+
+The same connection also supports asynchronous capture, reference import,
+MIDI and automation edits, and audio encoding with a post-codec true-peak
+check.
 
 ## How it connects
 
