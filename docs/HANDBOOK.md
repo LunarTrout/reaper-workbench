@@ -156,7 +156,9 @@ Every failure is `{"ok": false, "error": {"code", "message", "details", "next_ac
 11. **Silent retries.** After two failures, report the code.
 
 For a phrase with a consistent offset, try a rigid `phrase_shift` before
-individual attack edits. Verify timing against the arrangement and synchrony across
+individual attack edits. Treat a blocked local move as a local result. Inspect
+its reported boundary or flags, and continue where the evidence permits edits.
+Verify timing against the arrangement and synchrony across
 tracks separately. Pair the same musical events and read their placement back
 after editing. Report coverage and ambiguous or unpaired events. A single-track
 median, a successful write or a bus-level measurement certifies neither

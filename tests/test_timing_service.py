@@ -202,6 +202,12 @@ def test_phrase_moves_rigidly_and_refuses_touching_neighbors(monkeypatch):
     blocked = mcp_server.reaper_timing(**args, shift_s=0.6)
     assert blocked["status"] == "blocked" and not timing.PHRASE_PLANS
     assert blocked["conflicts"][0]["item_guid"] == "next"
+    assert blocked["code"] == "phrase_neighbor_collision"
+    assert blocked["available_shift_s"] == [-10.0, 0.5]
+    phrase["loop_source"] = True
+    ineligible = mcp_server.reaper_timing(**args, shift_s=0.35)
+    assert ineligible["failed_checks"] == ["loop_source"]
+    phrase.pop("loop_source")
 
     preview = mcp_server.reaper_timing(**args, shift_s=0.35)
     assert preview["status"] == "preview"

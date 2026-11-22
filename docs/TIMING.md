@@ -223,7 +223,11 @@ space beside it. Use the existing item editing tools for this preparation.
 per-attack quantization tolerance on this move. It preserves length, source
 offset, rate and existing fades. It returns the old and new item windows and
 blocks a move that would overlap or pass another item on the same track.
-Resolve any boundary conflict before applying. The move can leave a pause.
+The move can leave a pause. On a collision, inspect the named neighbor and
+the reported available shift range. Inspect both sides of the boundary
+before changing it. An ineligible item reports its exact failed checks.
+Solve a local conflict where the evidence supports a safe edit and continue
+through the other requested passages while that phrase remains unresolved.
 
 ```text
 reaper_timing(action="phrase_shift", track_guid=..., item_guid=...,

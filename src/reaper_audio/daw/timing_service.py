@@ -709,12 +709,22 @@ def plan_phrase_shift(session, *, project_id, item_guid, track_guid, shift_s, re
     revision = ProjectRevision.from_dict(snapshot["revision"])
     track, item = _find_item(snapshot, item_guid, track_guid)
     take = item.get("active_take") or {}
-    if (not (take.get("source") or take.get("source_path")) or item.get("mute")
-            or item.get("source_online") is False or item.get("loop_source")
-            or item.get("stretch_marker_positions") or take.get("stretch_markers")
-            or item.get("source_reversed") or item.get("reverse") or take.get("reverse")
-            or abs(take.get("playrate", item.get("playrate", 1)) - 1) > 1e-6):
-        raise ValidationError("Phrase shift needs an isolated, online 1x audio item without looping")
+    eligibility = {
+        "source_missing": not (take.get("source") or take.get("source_path")),
+        "muted": item.get("mute") is True,
+        "source_offline": item.get("source_online") is False,
+        "loop_source": item.get("loop_source") is True,
+        "stretch_markers": bool(item.get("stretch_marker_positions") or take.get("stretch_markers")),
+        "reversed": bool(item.get("source_reversed") or item.get("reverse") or take.get("reverse")),
+        "non_unit_playrate": abs(take.get("playrate", item.get("playrate", 1)) - 1) > 1e-6,
+    }
+    failed_checks = [check for check, failed in eligibility.items() if failed]
+    if failed_checks:
+        return {"status": "blocked", "code": "phrase_item_ineligible", "plan_id": None,
+                "item_guid": item_guid, "failed_checks": failed_checks,
+                "next_action": ("Inspect only the listed properties. Preserve any existing "
+                                "warp and loop behavior. Continue with other phrases while "
+                                "this item is unresolved.")}
     start = float(item["position_s"])
     length = float(item["length_s"])
     destination = start + shift_s
@@ -727,10 +737,23 @@ def plan_phrase_shift(session, *, project_id, item_guid, track_guid, shift_s, re
                 and other["position_s"] < high - 1e-6
                 and other["position_s"] + other["length_s"] > low + 1e-6]
     if blockers:
-        return {"status": "blocked", "plan_id": None, "shift_s": shift_s,
-                "original_window_s": [start, start + length],
+        neighbors = [other for other in track.get("items", []) if other["guid"] != item_guid]
+        left_edge = max((other["position_s"] + other["length_s"] for other in neighbors
+                         if other["position_s"] < start), default=0.0)
+        right_edge = min((other["position_s"] for other in neighbors
+                          if other["position_s"] >= start), default=float("inf"))
+        max_shift = right_edge - (start + length)
+        return {"status": "blocked", "code": "phrase_neighbor_collision", "plan_id": None,
+                "shift_s": shift_s, "original_window_s": [start, start + length],
                 "destination_window_s": [destination, destination + length],
-                "conflicts": blockers, "reason": "The phrase would overlap or cross another item"}
+                "conflicts": blockers, "available_shift_s":
+                [round(left_edge - start, 7), round(max_shift, 7) if np.isfinite(max_shift) else None],
+                "reason": "The phrase would overlap or cross another item",
+                "next_action": ("Inspect the colliding boundary on both sources with waveform. "
+                                "If there is quiet material, isolate the actual phrase with "
+                                "clearance in the working copy and preview again. Otherwise "
+                                "test a smaller meaningful phrase or shift. Continue through "
+                                "the other requested passages while this phrase is unresolved.")}
     pair_changes = []
     if pairs:
         if not reference_analysis_id or not analysis_id or start_s is None or end_s is None:
