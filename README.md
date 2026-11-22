@@ -56,6 +56,56 @@ available for auditioning and adjustment in REAPER.
 
 [Measurement and mix evidence](docs/MCP-README-LLM.md) · [Loudness reconstruction check](docs/PARTIAL-LOUDNESS-GATE.md)
 
+## Analysis catalog
+
+The core audio report contains **24 scalar metrics**, plus frequency-band
+profiles, time series and short-event reports. You can measure a whole track
+or a selected passage, from one source up to the mix. Reference comparisons
+return deltas for compatible scalar metrics, with units and coverage. When
+you supply several references, each metric also gets a reference median and
+median absolute deviation. Open the separate band profiles and time series
+to see *where* differences occur.
+
+### Measurements in the audio report
+
+| What to compare | Metrics and what they show |
+| --- | --- |
+| **Overall loudness and dynamics** | `integrated_lufs` measures program loudness; `loudness_range_lu` measures variation over the passage; `rms_dbfs` measures average signal level; `crest_db` measures how far the sample peak rises above RMS. |
+| **Peaks and signal integrity** | `peak_dbfs` is the highest sample level; `true_peak_estimate_dbfs` estimates intersample peaks; `clipped_sample_count` and `clipped_sample_ratio` show the count and fraction of clipped samples; `clipping_event_count` counts detected clipping events; `dc_offset` measures the signal's offset from zero. |
+| **Frequency balance** | `spectral_centroid_hz` describes where spectral energy is centered. `band_level_dbfs` tracks energy in **28 third-octave bands**, with an average profile and a separate time series (`band_level_time_dbfs`). `reaper_measure` can also report octave bands or caller-selected frequency ranges. |
+| **Stereo and mono compatibility** | `stereo_correlation` measures similarity between left and right; `side_mid_db` measures the side-to-mid level ratio; `mono_fold_loss_db` measures level lost when folding to mono. |
+| **Attacks and short events** | `transient_count` and `transient_density_per_s` describe transient activity; `two_ms_event_count`, `onset_count` and `spike_count` summarize the short-event detector and provide leads for closer inspection. |
+| **Tempo, modulation and pitch** | `local_tempo_median_bpm` summarizes usable local tempo estimates; `modulation_rate_hz` and `modulation_depth` describe recurring variations in the signal envelope; `pitch_jitter_pct` describes pitch variation where it is measurable; `coarse_speech_band_ratio` estimates speech-band energy as a descriptive proxy. |
+
+The time series add a 400 ms RMS curve, band curves and a temporal profile
+with local attack and decay, spectral flux, spread, flatness and rolloff,
+fundamental pitch and harmonic-to-noise ratio, stereo width, pan and
+coherence where available. An attack or a short noisy event can be investigated in the
+source even when the average over a whole song barely changes.
+
+### Scoped analyzers and comparisons
+
+| Analyzer ID | What it adds |
+| --- | --- |
+| `metrics` | Per-source measurements, curves and measurement context for the requested intervals. |
+| `temporal_profile` | Individual profile cells with source and time coordinates. |
+| `band_balance` | Compare band energy across sources at aligned measured times. |
+| `masking` | Report where one source dominates another in the same band at the same time, as evidence for auditioning. |
+| `phase` | Compare selected pairs using correlation, relative delay, band-level phase evidence and the level change when summed. |
+| `partial_loudness` | Estimate per-source contributions when the source renders pass the mix reconstruction check. |
+| `mix_evidence` | Collect measured findings and open questions. For compatible stored analyses, compare exact changed cells before and after an edit. |
+
+That gives the agent several ways to test the same mixing decision. If the
+chorus is close to the reference in LUFS but still feels crowded, inspect
+the band balance and source overlap in that passage. If a panning change
+improves the stereo image, also check the mono fold and what happened on the
+master. Coverage tells the agent which comparisons the available audio
+supports.
+
+`reaper_capabilities(mode="tools")` exposes the current analyzer catalog.
+Use `reaper_analyze` for project and reference analysis and `reaper_measure`
+for a targeted source-by-interval measurement table. [MCP analysis guide](docs/MCP-README-LLM.md)
+
 ## Find the attack, then decide how to move it
 
 Compare clean DI waveforms against the project tempo map and click. The timing
