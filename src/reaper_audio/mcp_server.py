@@ -2223,7 +2223,7 @@ def reaper_media(action: str,
 
 @server.tool()
 @_guard
-def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review", "window", "verify",
+def reaper_timing(action: Literal["analyze", "waveform", "clock", "rhythm", "plan", "review", "window", "verify",
                                   "refine", "inspect", "preview", "apply", "undo"],
                   project_id: str | None = None,
                   track_guid: str | None = None,
@@ -2256,7 +2256,7 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review"
                   rhythm_offset: int = 0,
                   rhythm_limit: int = 8,
                   detail: Literal["summary", "full"] | None = None,
-                  review_kind: Literal["all", "residual", "unassigned"] = "all",
+                  review_kind: Literal["all", "residual", "unassigned"] | None = None,
                   review_offset: int = 0,
                   review_limit: int = 12,
                   refine_action: Literal["pin", "manual", "exclude", "rhythm",
@@ -2268,9 +2268,13 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review"
                   compare_plan_id: str | None = None,
                   seam_index: int | None = None,
                   max_shift_s: float = 0.04,
-                  refine_reason: str | None = None) -> dict[str, Any]:
+                  refine_reason: str | None = None,
+                  waveform_bins: int = 256) -> dict[str, Any]:
     """Analyze audio timing against the project grid and build a 1x clip plan.
 
+    Read reaper://guide/timing for checks and examples. Waveform reads a
+    continuous pre-FX window of up to four seconds in project time, by item_guid
+    or with candidate overlays by analysis_id or plan_id. It needs no event ID.
     Analyze a clean, file-backed take with an explicit item GUID. Clock verifies
     a dedicated click item against the project beat grid. Rhythm ranks local
     rhythm interpretations with attack and release evidence. Read more with
@@ -2290,8 +2294,14 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review"
         measure_timing_clock, plan_timing_crossfades, read_timing_rhythm,
         refine_timing, review_window, validate_rhythm_analysis,
     )
-    if action in {"analyze", "clock", "rhythm", "plan", "refine", "preview", "apply", "undo"}:
+    if action in {"analyze", "waveform", "clock", "rhythm", "plan", "refine", "preview", "apply", "undo"}:
         _handbook_required()
+    if action == "waveform":
+        return {"ok": True, "action": action, **_timing.inspect_timing_waveform(
+            _session(project_id, bridge_session_id), project_id=project_id,
+            track_guid=track_guid, item_guid=item_guid, start_s=start_s, end_s=end_s,
+            analysis_id=analysis_id, plan_id=plan_id, bins=waveform_bins,
+            subdivisions=subdivisions, grid_phase_s=grid_phase_s)}
     if action == "clock":
         if not item_guid:
             raise ValidationError("item_guid is required for clock measurement")
@@ -2358,7 +2368,7 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review"
             return {"ok": True, "action": action, **_timing.compare_timing_reviews(
                 plan_id, compare_plan_id, start_s=start_s, end_s=end_s,
                 offset=review_offset, limit=review_limit)}
-        if start_s is not None and end_s is not None:
+        if review_kind is None and start_s is not None and end_s is not None:
             plan = _timing.PLANS.get(plan_id or "")
             if not plan:
                 raise ValidationError("Window review needs a live crossfade plan_id")
@@ -2374,7 +2384,7 @@ def reaper_timing(action: Literal["analyze", "clock", "rhythm", "plan", "review"
                     data["signal_unavailable"] = str(error)[:200]
             return {"ok": True, "action": "review", "mode": "window", **data}
         return {"ok": True, "action": action, **inspect_timing_review(
-            plan_id, kind=review_kind, start_s=start_s, end_s=end_s,
+            plan_id, kind=review_kind or "all", start_s=start_s, end_s=end_s,
             offset=review_offset, limit=review_limit)}
     if action == "window":
         plan = _timing.PLANS.get(plan_id or "")
@@ -5342,6 +5352,13 @@ MODEL_GUIDE: dict[str, Any] = {
                  mime_type="application/json")
 def model_guide_resource() -> str:
     return json.dumps(MODEL_GUIDE, ensure_ascii=False, separators=(",", ":"))
+
+
+@server.resource("reaper://guide/timing", name="Audio timing guide",
+                 description="Timing evidence, missed attacks, local edits and verification.",
+                 mime_type="text/markdown")
+def timing_guide_resource() -> str:
+    return _HANDBOOK_PATH.with_name("TIMING.md").read_text(encoding="utf-8")
 
 
 @server.resource("reaper://handbook", name="REAPER Workbench handbook",

@@ -295,3 +295,14 @@ def test_window_rejects_bad_intervals_and_non_crossfade_plans():
         review_window(_plan(), start_s=11.0, end_s=10.0)
     with pytest.raises(ValidationError):
         review_window({"method": "other"}, start_s=1.0, end_s=2.0)
+
+
+def test_window_tracks_manual_source_and_planned_position_separately():
+    plan = _plan()
+    plan["anchors"][1].update(source_s=100.510, achieved_shift_s=-0.005, residual_s=0.019)
+    row = next(row for row in review_window(plan, start_s=10.49, end_s=10.53)["attacks"]
+               if row["event_id"] == "a2")
+    assert row["source_s"] == pytest.approx(100.510)
+    assert row["planned_s"] == pytest.approx(10.510)
+    assert row["residual_s"] == pytest.approx(0.019)
+    assert [occ["project_s"] for occ in row["occurrences"]] == [10.51, 10.51]

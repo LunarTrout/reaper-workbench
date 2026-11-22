@@ -14,8 +14,8 @@
 > not the first call for ordinary orientation; state context is. Use panorama
 > when you need the immutable capture document or exact archived rows.
 
-> **Current interface:** the stdio server registers 41 tools and five resource
-> templates, plus three static resources (`reaper://guide/model`,
+> **Current interface:** the stdio server registers task tools, resource templates
+> and static resources (`reaper://guide/model`, `reaper://guide/timing`,
 > `reaper://handbook` and `reaper://capabilities/index`), including the
 > bundled 732-signature REAPER v7.85 catalog, structured
 > API search, generic dispatch, project context, capture/panorama lifecycle,
@@ -68,7 +68,7 @@
 > whole-project evidence, when the user asks for a complete overview, or before a
 > final whole-project conclusion.
 >
-> The 41 tools are a small, grouped task surface, not one tool per ReaScript
+> The tools form a grouped task surface, not one tool per ReaScript
 > function or metric. The 732 documented API functions stay reachable through
 > `reaper_capabilities` / `reaper_api_search` plus the typed `reaper_api_call`
 > dispatcher. See "Tool surface contract" below.
@@ -203,7 +203,7 @@ the task while keeping the project and audio evidence connected:
 
 ## Tool surface contract
 
-`tools/list` has 40 definitions. They are a grouped task surface, not a button
+`tools/list` exposes a grouped task surface, not a button
 catalog. `reaper_capabilities(mode="tools")` returns the same grouping with the
 required context for each group. It is a map, not a mechanism that hides
 schemas: every registered definition is still sent to the client.
@@ -292,7 +292,7 @@ Safe consolidations already made or kept deliberately:
 | `reaper_edit_map` | Build cut and seam evidence from an existing analysis; it does not edit the project. |
 | `reaper_render_candidate` | Render one applied plan's processed master output through the native REAPER path, for one exact interval, with verified settings restoration, explicit post-render revision, stage/FX/routing provenance, SHA-256 and a leased audio resource. |
 | `reaper_release` | Release one analysis or candidate report and its temporary WAV files now. |
-| `reaper_timing` | Analyze clean source attacks, infer local rhythm in `plan`, inspect explicit alternatives by `rhythm_id`, and use `review` and `refine` to address individual timing problems before applying the native 1x plan. See [Audio timing](TIMING.md). |
+| `reaper_timing` | Read `reaper://guide/timing` before timing work. Use `waveform` to inspect any short pre-FX window, `review` and `refine` for local decisions, and verify the native 1x clips after application. See [Audio timing](TIMING.md). |
 
 ### Measurement by interval (3)
 

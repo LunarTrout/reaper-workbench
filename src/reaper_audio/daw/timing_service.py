@@ -22,6 +22,7 @@ from ..analysis.timing_rhythm import DEFAULT_DIVISIONS, infer_rhythm
 from ..analysis.timing_review import review_page, review_plan
 from ..daw.midi import TempoMap
 from ..errors import ValidationError
+from ..models import Section
 
 ANALYSES: dict[str, dict[str, Any]] = {}
 PLANS: dict[str, dict[str, Any]] = {}
@@ -58,6 +59,100 @@ def _source_window(item: Mapping[str, Any], start_s: float | None,
                               details={"position_s": position, "length_s": length,
                                        "start_s": start_s, "end_s": end_s})
     return start, end
+
+
+def inspect_timing_waveform(session: Any, *, project_id: str | None,
+                            item_guid: str | None, track_guid: str | None,
+                            start_s: float | None, end_s: float | None,
+                            analysis_id: str | None = None, plan_id: str | None = None,
+                            bins: int = 256, subdivisions: Sequence[int] | None = None,
+                            grid_phase_s: float | None = None) -> dict[str, Any]:
+    """Read a continuous pre-FX window from the original 1x take."""
+    if (start_s is None or end_s is None or not np.isfinite([start_s, end_s]).all()
+            or not 0 < end_s - start_s <= 4.0):
+        raise ValidationError("Waveform needs a project-time window of at most four seconds")
+    if isinstance(bins, bool) or not isinstance(bins, int) or not 1 <= bins <= 1024:
+        raise ValidationError("waveform_bins must be between 1 and 1024")
+    if plan_id is not None:
+        plan = PLANS.get(plan_id)
+        if not plan or not plan.get("analysis_id"):
+            raise ValidationError("Waveform needs a live timing plan")
+        if analysis_id is not None and analysis_id != plan["analysis_id"]:
+            raise ValidationError("The plan and analysis do not refer to the same input")
+        analysis_id = plan["analysis_id"]
+    else:
+        plan = None
+    if item_guid is None and analysis_id is None:
+        raise ValidationError("Waveform needs item_guid, analysis_id or plan_id")
+
+    snapshot = session.snapshot(project_id=project_id, include_items=True)
+    analysis = validate_rhythm_analysis(analysis_id, snapshot) if analysis_id else None
+    if analysis:
+        if ((item_guid is not None and item_guid != analysis["item_guid"])
+                or (track_guid is not None and track_guid != analysis["track_guid"])):
+            raise ValidationError("The selected item or track differs from the timing analysis")
+        item_guid, track_guid = analysis["item_guid"], analysis["track_guid"]
+    track, item = _find_item(snapshot, item_guid, track_guid)
+    take = item.get("active_take") or {}
+    source_path = take.get("source_path") or take.get("source") or item.get("source_path")
+    playrate = float(take.get("playrate", item.get("playrate", 1.0)))
+    if (not source_path or abs(playrate - 1.0) > 1e-6 or take.get("stretch_markers")
+            or item.get("stretch_marker_positions") or item.get("source_length_is_qn")
+            or item.get("reverse") or take.get("reverse") or item.get("source_reversed")):
+        raise ValidationError("Waveform requires a forward file-backed 1x take without stretch markers")
+    position = float(item["position_s"])
+    offset = float(item.get("start_offset_s") or 0.0)
+    low, high = _source_window(item, start_s, end_s)
+    audio = load_audio(source_path, Section(offset + (low - position),
+                                            offset + (high - position)))
+    sample_rate = audio.sample_rate
+    first_sample = round(audio.start_s * sample_rate)
+    count = min(bins, len(audio.samples))
+    boundaries = np.linspace(0, len(audio.samples), count + 1, dtype=int)
+    levels = []
+    for left, right in zip(boundaries, boundaries[1:]):
+        span = audio.samples[left:right]
+        levels.append([round(float(span.min()), 6), round(float(span.max()), 6),
+                       round(float(np.sqrt(np.mean(span ** 2))), 6)])
+
+    tempo_context = snapshot["tempo"]
+    if plan and plan.get("tempo_context") != tempo_context:
+        raise ValidationError("Project tempo changed since planning; prepare a fresh plan")
+    tempo = TempoMap.from_context(tempo_context)
+    phase = grid_phase_s if grid_phase_s is not None else (plan or {}).get("grid_phase_s", 0.0)
+    divisions = tuple(dict.fromkeys(subdivisions if subdivisions is not None
+                                    else (1, (plan or {}).get("subdivision") or 4)))
+    if (not np.isfinite(phase) or not divisions
+            or any(isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= 64
+                   for n in divisions)):
+        raise ValidationError("Pass a finite grid phase and divisions between 1 and 64")
+    first_qn, last_qn = tempo.time_to_qn(low - phase), tempo.time_to_qn(high - phase)
+    if (not np.isfinite([first_qn, last_qn]).all()
+            or np.spacing(max(abs(first_qn), abs(last_qn))) >= 1 / max(divisions)):
+        raise ValidationError("Grid lies outside the supported numeric range")
+    if sum(divisions) * (last_qn - first_qn) + len(divisions) > 1024:
+        raise ValidationError("Grid is too dense for this window; zoom in or use fewer divisions")
+    grid = [{"qn": row["qn"], "project_s": round(row["time_s"] + phase, 7),
+             "subdivision": row["subdivision"]}
+            for row in grid_times(tempo, low - phase, high - phase, divisions)]
+    if plan:
+        candidates = [row for row in plan["review_rows"] if low <= row["observed_s"] < high]
+    else:
+        candidates = [{**event, "observed_s": event["project_s"]}
+                      for event in (analysis or {}).get("events", ())
+                      if low <= event["project_s"] < high]
+    return {
+        "schema": "reaper-workbench.timing-waveform/1",
+        "revision": snapshot.get("revision"), "track_guid": track["guid"],
+        "item_guid": item["guid"], "take_guid": take.get("guid"), "source_path": str(source_path),
+        "analysis_id": analysis_id, "plan_id": plan_id, "signal": "source_pre_fx",
+        "project_window_s": [low, high], "sample_rate": sample_rate,
+        "source_sample_boundaries": (boundaries + first_sample).tolist(),
+        "item_position_s": position, "source_offset_s": offset,
+        "level_columns": ["minimum", "maximum", "rms"], "levels": levels,
+        "grid": grid, "grid_phase_s": phase,
+        "candidates": candidates[:128], "candidate_count": len(candidates),
+    }
 
 
 def analyze_timing(session: Any, *, project_id: str | None,
@@ -801,7 +896,7 @@ def review_window(plan, *, start_s, end_s, context_beats=2.0):
         if not (lo - context <= project_s <= hi + context):
             continue
         target_s = float(anchor.get("target_s", project_s))
-        source_s = offset + (project_s - position)
+        source_s = float(anchor.get("source_s", offset + (project_s - position)))
         left = max([seam for seam in seams if seam <= project_s], default=position)
         right = min([seam for seam in seams if seam > project_s],
                     default=position + item_length)
@@ -819,13 +914,15 @@ def review_window(plan, *, start_s, end_s, context_beats=2.0):
             if fade_out > 0.0 and source_s > end - fade_out:
                 fade = max(fade, 1.0 - (end - source_s) / fade_out)
             occurrences.append({"block_index": index,
+                                "project_s": round(float(clip["position_s"]) + source_s - start, 7),
                                 "fade_attenuation": round(float(min(max(fade, 0.0), 1.0)), 4)})
         row = {
             "event_id": anchor["id"],
             "source_s": round(source_s, 6),
             "project_s": round(project_s, 6),
             "target_s": round(target_s, 6),
-            "residual_s": round(project_s - target_s, 6),
+            "planned_s": round(project_s + float(anchor.get("achieved_shift_s") or 0.0), 7),
+            "residual_s": round(float(anchor.get("residual_s", project_s - target_s)), 6),
             "in_window": bool(lo <= project_s <= hi),
             "confidence": anchor.get("confidence"),
             "seam_left_s": round(left, 6),

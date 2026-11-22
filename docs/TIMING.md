@@ -136,101 +136,87 @@ material and rhythm. This path edits a file-backed 1x item, and does not
 reconstruct stretch markers, layered takes, or per-take processing. Prefer
 track FX when retaining the same processing across an A/B.
 
-## Window review, verify and refine
+## Inspect a missed front
 
-`reaper_timing(action="review", plan_id=..., start_s=..., end_s=...)` switches
-`review` from the compact batch view to one phrase.  Every attack row keeps
-three separate times — `source_s` (seconds in the media file), `project_s`
-(timeline) and `target_s` (musical goal) — plus `residual_s`, the nearest
-seams, every block that reads it (`occurrences`, with `fade_attenuation`),
-`blockers` and, for in-window attacks, a 41-point `envelope_db` at 2 ms steps.
-Every seam row reports `cut_source_s`, both fade lengths and
-`source_audio_left_s`; when the source runs out, `edge_source_exhausted` is
-true and the remainder is reported as 0.0 instead of a negative number.
-`detail="full"` adds a `signal` block and `conflicts`.
+Use `review(review_kind="unassigned", start_s=..., end_s=...)` for candidates
+the detector found but the plan left without a target. Use `window` with a
+`plan_id` for anchor placements, local seams, fades and short envelopes
+around known attacks. If you suspect a front **between** detected events,
+ask for a continuous clean source window. It works even with zero candidates.
 
-### Counting duplicate attacks
+```text
+reaper_timing(action="waveform", plan_id=..., start_s=68.48, end_s=68.72,
+              waveform_bins=240, subdivisions=[1, 4])
+```
 
-Do not count duplicates from the audio.  Two measurements disagree on dense
-clipped material: an energy-front rule with a 20 % rise flags 99 % of attacks
-(two fronts), and adding a 6 dB valley requirement only lowers it to 89-92 %,
-while cross-checking against a librosa-based labelling gave 0.851 accuracy at
-zero true positives.  A 30-75 ms attack rise simply produces several
-threshold crossings.
+Use `item_guid` to read a take before analysis, `analysis_id` for detected
+candidates or `plan_id` to include assignments and planned occurrences.
+Supply project-time bounds and zoom as needed. Each request covers up to
+four seconds and returns up to 1024 bins. Each bin contains signed minimum,
+maximum and RMS in linear sample units across channels, without normalization.
+Bin edges are file sample indices. Divide by `sample_rate` to get source
+seconds. Map a source time to the original item with
+`item_position_s + source_s - source_offset_s`. The grid is an overlay,
+including the plan phase if applicable. It does not assign targets.
 
-The exact answer is geometric and comes free with the plan: `duplicate_geometry`
-counts attacks whose source position is covered by two or more blocks.  It needs
-no threshold and no audio.  `signal_echo` keeps the detector output for
-reference and must not be read as "two attacks played".
+Read nearby beats before choosing a front. Zoom in to distinguish the initial
+rise from a later peak, and consider the neighboring notes, click and other
+takes when relevant. A missing detector mark does not establish silence.
+Two rises may belong to one pick. If the musical target is unclear, compare
+alternatives in context or defer that event while continuing elsewhere.
 
-### Local actions
+## Work iteratively and verify what changed
 
-`daw/timing_refine_actions.py` provides the per-event edits the agent needs:
-`pin_attack`, `manual_attack`, `exclude_candidate`, `choose_rhythm_option`,
-`protect_interval`, `recompute_seam`.  Each returns `(child_plan, changes)`,
-never mutates its input, keeps every untouched block byte-identical, and
-reports a `conflict` (insufficient source, neighbouring attack overlap, clip
-under 4 ms) instead of moving a seam it cannot place.
+Start wherever the available evidence is weakest. You can compare two draft
+plans from the same analysis with `review(compare_plan_id=...)`. Use the
+same DI events as the comparison basis, including events without a target.
+Inspect the passage before increasing the correction or cutting more clips.
 
-### Checking the result
+For a confirmed missed front, create an event with
+`refine_action="manual"`: `source_s` is its onset in the file, `start_s`
+is the observed timeline position in the **current input draft**, and
+`target_s` is the musical goal. Pass `attack_end_s` to protect the entire
+transient. Then use `refine_action="seam"` with the returned event ID, that
+same DI coordinate and the child `plan_id`. For known events, inspect their
+targets and actual clip occurrences first. If a seam fails, inspect both
+neighbors and the available source handles. Broaden the local window when
+that gives a clean transition. A safe remaining error can be a better result
+than a split or doubled attack.
 
-`daw/timing_verify.py` builds what REAPER will play (`render_plan`: sample
-accurate block slices, linear fades, additive overlaps, silence outside) and
-reports per attack whether the front is where the plan wants it, per seam
-whether a front appears there, and a `conflict_report` covering source
-overruns, attacks under a fade, gaps and blocks shorter than 4 ms.
+| Avoid | What to check |
+| --- | --- |
+| Treating a lower median as a finished riff | Compare identical events and goals. Look at unassigned, unchanged and worsened events, especially audible trouble spots. |
+| Selecting the nearest event ID or loudest peak | Confirm the same file and source coordinates on the clean DI. Check the onset and the whole transient against the rhythmic context. |
+| Cutting on every detector peak or forcing a single grid on every passage | Compare plausible subdivisions and match the musical pattern. Use as many cuts as the material needs. |
+| Checking only that a clip covers the target time | Calculate where the **same source front** actually plays, using position and source offset. Inspect all its occurrences and fades. |
+| Extending an edge through a second copy of the attack | Check that the intended transient passes intact once, the old occurrence is suppressed, and no gap or damaged neighboring attack appears. Use 1x clips with real source handles and paired fades. |
+| Applying a parent plan, the original take or a second montage on top | Check the working item and track GUIDs, current revision and final child plan. Dry-run that exact plan before applying. |
+| Repeating an apply that may already have written clips | Read the actual project and transaction result. Verify the rollback or recover from a known copy before retrying. |
+| Reporting sound quality from `readback.matched` | Read-back confirms clip geometry. Trace the front again in the written clips. Use preview for dry A/B and listen with the click and intended track FX when available. State which checks were actually performed. |
 
-## Worked example: the standard planner on Riff A
+Repeat local checks where evidence points to a problem, carrying forward the
+latest verified draft and preserving good seams. Each pass should resolve a
+specific uncertainty. Avoid rebuilding an accepted passage just to chase a
+number. Work autonomously across clear cases within the user's scope. When
+the user wants to judge successive versions, keep a comparable version and
+use their feedback to guide the next pass. If the agent cannot audition
+audio, distinguish the verified geometry from the listening check. Musical
+intent or an unavailable input can leave a specific decision open.
 
-Measured on the real project, two clean takes, `subdivisions=[4]`,
-`tolerance_s=0.03`, `profile="picked"`:
+For a closer check, `verify` simulates the dry plan and reports signal fronts,
+source overruns, gaps and fade conflicts. Its signal estimates and simulated
+fades are evidence for auditioning, especially on dense or clipped audio.
+`window(detail="full")` adds signal diagnostics to the local clip report.
 
-| take | blocks | median before | median after | worst residual >= 15 ms |
-|---|---|---|---|---|
-| riff 1 `{83EDFD23}` | 64 | 8.17 ms | 2.14 ms | none |
-| riff 2 `{99C603E8}` | 53 | 9.82 ms | 2.29 ms | none |
+## Examples from the guitar edits
 
-Both plans applied with `readback.matched: true` and `duplicate_count: 0`, so
-`analyze -> plan -> apply` is enough for material where every attack is within
-the planner's reach. The per-event path is not needed there.
-
-That run also shows the limit worth remembering: an individual attack with a
-10-15 ms residual can stay exactly where it was (the front at DI `12.8249` s
-played at `1.5583` s before and after), because the planner moves blocks, not
-events. When one attack has to land on a specific sixteenth, use the per-event
-path below.
-
-## Worked example: one pick through manual_attack -> insert_seam -> apply
-
-Confirmed case: the pick at DI `17.1955` s played at `68.5540` s, its target was
-`68.5852` s (+31.2 ms). `manual_attack(source_s=17.1955, project_s=68.5540)`
-creates the event (the detector never reported it), then `insert_seam` on that
-id produces:
-
-- the outgoing clip ends exactly where the pick would repeat (`68.5540`) with a
-  fade that reaches zero there;
-- the incoming clip starts one fade earlier (`68.5460`) reading source
-  `17.1563` s, so the whole transient plays once, at `68.5852`;
-- the outgoing seam's overlap equals both fades and the source reuse stays
-  inside 60 ms, so `apply` accepts the geometry;
-- the following seam is lengthened to absorb the source skip the move creates.
-
-`tests/test_timing_refine_actions.py::test_manual_path_moves_one_pick_once_with_no_hole_and_keeps_neighbours`
-reproduces this case numerically: the pick is audible once on target, the old
-copy has zero gain, no hole appears on the timeline and the neighbouring attack
-keeps its time.
-
-### Validate a per-event refinement
-
-For a missed front, call `refine` with `refine_action="manual"`.
-Pass the DI onset as `source_s`, its current project time as `start_s`,
-and its musical goal as `target_s`. Supply `attack_end_s` to check the
-whole transient. Run `refine_action="seam"` on the new plan with the
-returned `event_id` and the same `source_s`.
-
-Run `apply(dry_run=true)` on the final child plan at the revision you
-intend to apply. A refined front must pass in one clip outside its fades.
-Pass the destination `track_guid` and working `item_guid` for both calls.
-Review reports the remaining timing error. Use
-`review(compare_plan_id=...)` to compare targets and errors between plans
-from one source analysis, including events without targets.
+- **Riff A:** the front at DI `12.8249` played at `1.5583` before and after,
+  14.9 ms from its proposed goal. Other attacks improved and the user accepted
+  the phrase after listening and inspecting the seams. The measured residual
+  describes this edit. It supplies no universal tolerance.
+- **Riff B:** the missed pick at DI `17.1955` played at `68.5540` in the
+  base and belonged at `68.5852`. An early draft hit the goal while leaving
+  another audible copy. The verified revision put the pick on the goal and
+  ended the outgoing clip where its earlier occurrence was faded to zero.
+  The input seam overlapped by 8 ms in this case. A longer output fade was a
+  separate listening check. Both numbers describe that edit.

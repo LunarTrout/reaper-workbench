@@ -63,3 +63,13 @@ def test_instructions_stay_short():
     assert "reaper://handbook" in block
     assert "HANDBOOK_REQUIRED" in block
     assert os.environ.get("REAPER_HANDBOOK_TEST") == "1"
+
+
+def test_timing_guide_is_discoverable_without_unlocking_measurement():
+    assert "reaper://guide/timing" in mcp_server.server._resource_manager._resources
+    assert "reaper://guide/timing" in mcp_server.handbook_resource()
+    mcp_server._handbook_read.clear()
+    assert mcp_server.timing_guide_resource() == mcp_server._HANDBOOK_PATH.with_name(
+        "TIMING.md").read_text(encoding="utf-8")
+    with pytest.raises(ValidationError, match="HANDBOOK_REQUIRED"):
+        mcp_server._handbook_required()
