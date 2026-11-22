@@ -1,100 +1,105 @@
 # REAPER Workbench
 
-[English](README.md) · [Русский](README.ru.md)
+**A local bridge between an AI agent and a live REAPER session.**
 
-Python library and local MCP server for a live REAPER project: read the project,
-measure real rendered audio, edit through typed batches, and keep one state
-document that tells an agent what is known and what has gone stale.
+[Русская версия](README.ru.md) · [Installation](docs/INSTALLATION.md) · [MCP guide](docs/MCP-README-LLM.md)
 
-The model never sees screenshots or a GUI. It talks to a resident ReaScript
-bridge over a local file mailbox; REAPER can stay in the background.
+Give an MCP client access to the project you already have open in REAPER.
+It can inspect the arrangement, routing and FX, measure the audio REAPER
+actually renders, and make edits you can open, listen to and adjust in the DAW.
+Python scripts can use the same library directly.
 
-## What it does
+For example, ask an agent to **check why a guitar riff drifts against the
+click**. It can inspect the clean DI around a missed attack, compare grid
+interpretations, preview an edit, and apply it as ordinary REAPER clips
+with crossfades at 1× playback speed. You can audition the result with the
+original amp chain and see precisely what changed. [Audio timing guide](docs/TIMING.md)
 
-- **Project state.** One `state.json` per project holds the map, object
-  fingerprints, measured facts and their freshness. `capture` and `measure`
-  write it; status, freshness, coverage and context read it.
-- **One context call.** `reaper_session(action="context")` returns the project,
-  revision, compact map, health, facts summary, FX summary and changes.
-  `since=<state_token>` returns only the delta; `pages=true` returns pages
-  without a duplicate full view.
-- **Measure, don't guess.** `reaper_measure` renders through REAPER and returns
-  a sources × intervals × metrics table with LUFS, peaks, crest, bands,
-  stereo and timing metrics, plus an evidence token and revision.
-- **Measured facts without re-rendering.** `reaper_session(action="state")`
-  reads what has already been measured, filtered by source, stage, window and
-  metric. Stale facts stay marked stale.
-- **Typed editing.** `reaper_edit` previews, applies and undoes track, item,
-  take, FX, send, envelope, MIDI, marker, region and tempo changes. Every edit
-  batch carries a receipt, readback and revision; apply/undo require a
-  `journal.why`, stored append-only with its basis.
-- **Audio timing.** `reaper_timing` measures clean attack fronts, compares
-  local rhythm interpretations, and creates native 1x items with verified
-  crossfade geometry. Ambiguous passages can stay in place.
-- **Async capture.** Per-source capture jobs report progress instead of
-  blocking the control channel; offline media is woken before a render.
-- **Delivery.** `reaper_media` imports references or encodes audio with a
-  post-codec true-peak check.
+## What you can do
 
-Workbench exposes **42 tools in 11 groups**. Call
-Call `reaper_capabilities(mode="tools")` for the current tool groups and
-`tools/list` for exact argument schemas.
+| Task | What Workbench provides |
+| --- | --- |
+| **Understand the open project** | Track and item identities, timeline, tempo, routing, FX and project health. Read a compact context or request only what changed. |
+| **Investigate a mix** | Measure the selected sources and time ranges through REAPER. Compare loudness, peaks, frequency bands, stereo balance and other metrics at the relevant processing stages. |
+| **Edit audio timing** | Examine clean source waveforms, compare local rhythm hypotheses, add missed attacks manually and refine specific seams. Preview a dry A/B, then create native clips and crossfades. |
+| **Make and verify edits** | Preview and apply typed changes to tracks, FX, sends, items, automation and MIDI. Receipts bind edits to a project revision and record the values read back from REAPER. Undo is available for supported transactions. |
+| **Keep evidence across passes** | Project state records measured facts and their freshness. An agent can reuse measurements it already has and see which facts need to be refreshed after a change. |
 
-## Install
+There are also tools for asynchronous audio capture, importing references
+and encoding audio with a post-codec true-peak check.
 
-See [Installation](docs/INSTALLATION.md). Short version:
+## How it connects
+
+```mermaid
+flowchart LR
+    A["AI agent or MCP client"] --> B["Local MCP server"]
+    B --> C["Python library"]
+    P["Python script"] --> C
+    C <-->|Local file mailbox| D["Lua ReaScript bridge"]
+    D <--> E["Open REAPER project"]
+```
+
+The Lua bridge runs inside REAPER. The MCP server and Python library run
+outside it. The client gets structured project data, audio measurements
+and edit receipts through the bridge. REAPER can stay in the background.
+
+## Quick start
+
+The bridge is documented and tested on **Windows**. You need REAPER with
+ReaScript and **Python 3.13+**. An MCP client is optional for Python-only use.
 
 ```powershell
 git clone https://github.com/LunarTrout/reaper-workbench.git
 Set-Location reaper-workbench
 py -3.13 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[mcp]"
+.\.venv\Scripts\python.exe -m pip install -e ".[mcp]"
 ```
 
-Load `scripts/reaper_bridge.lua` in REAPER (Actions → Load ReaScript, then Run).
-It keeps a heartbeat and serves the Python client.
+1. In REAPER, open the project, load [the Lua bridge](scripts/reaper_bridge.lua)
+   from the Actions window and run it. Keep [its JSON helper](scripts/lua_json.lua)
+   in the same directory as the bridge.
+2. In your MCP client, point the server command at the virtual environment's
+   Python. Replace the example path with the location of your clone.
 
-## MCP
+   ```json
+   {
+     "mcpServers": {
+       "reaper-workbench": {
+         "command": "C:\\path\\to\\reaper-workbench\\.venv\\Scripts\\python.exe",
+         "args": ["-m", "reaper_audio.mcp_server"]
+       }
+     }
+   }
+   ```
 
-```json
-{
-  "mcpServers": {
-    "reaper-workbench": {
-      "command": "python",
-      "args": ["-m", "reaper_audio.mcp_server"],
-      "env": { "PYTHONPATH": "src" }
-    }
-  }
-}
-```
+3. Have the client read `reaper://handbook` through MCP before measuring or
+   editing. Check the connection with `reaper_session(action="health")` and
+   `reaper_project`. For timing work, also read `reaper://guide/timing`.
 
-At the start of a session read the resource `reaper://handbook` (or
-`docs/HANDBOOK.md`). Measure/edit/midi/analyze refuse with `HANDBOOK_REQUIRED`
-until it is read.
+[Full installation and connection guide](docs/INSTALLATION.md)
+
+### Try a read-only request first
+
+> Tell me which REAPER project is open, summarize the routing of the guitar
+> tracks, and show what has already been measured. Leave the project as it is.
+
+For exact call schemas, use the client's `tools/list` and the capability
+map from `reaper_capabilities(mode="tools")`.
 
 ## Documentation
 
-- [Handbook](docs/HANDBOOK.md) — the current operating contract · [Russian](docs/HANDBOOK.ru.md)
-- [MCP guide for models](docs/MCP-README-LLM.md)
-- [Installation](docs/INSTALLATION.md) · [Russian](docs/INSTALLATION.ru.md)
-- [Policy](docs/POLICY.md) — thresholds belong to the owner
-- [Safety](docs/SAFETY.md) — trust boundary and state guarantees
-- [Audio timing and rhythm maps](docs/TIMING.md) · [Russian](docs/TIMING.ru.md)
-- [Partial loudness](docs/PARTIAL-LOUDNESS-GATE.md) — gate and residual method
-- [Flamingo](docs/flamingo.md), [Ossicle](docs/ossicle.md) — optional listening backends
+- [Handbook](docs/HANDBOOK.md) and [MCP guide for agents](docs/MCP-README-LLM.md)
+- [Audio timing, missed attacks and local refinements](docs/TIMING.md)
+- [Measurement policy](docs/POLICY.md), [partial loudness](docs/PARTIAL-LOUDNESS-GATE.md) and [safety](docs/SAFETY.md)
+- Optional audio model integrations: [Flamingo](docs/flamingo.md) and [Ossicle](docs/ossicle.md)
 
-## Tests
+## Development
 
 ```powershell
-$env:PYTHONPATH = "src"
-python -m pytest -q
+.\.venv\Scripts\python.exe -m pip install -e ".[dev,mcp]"
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-The suite is offline and uses mock bridges and synthetic audio; live REAPER
-checks are separate.
-
-## License and model weights
-
-Model weights are not vendored. Flamingo weights are under NVIDIA OneWay
-Noncommercial Research; review that licence before use beyond research.
+The offline suite uses simulated bridges and test audio. Live REAPER checks
+are separate. Optional model weights are downloaded separately and subject
+to their own licenses.
