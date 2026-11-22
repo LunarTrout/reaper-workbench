@@ -21,12 +21,14 @@ from ..analysis.timing_seams import attack_candidates, plan_crossfades
 from ..analysis.timing_rhythm import DEFAULT_DIVISIONS, infer_rhythm
 from ..analysis.timing_review import review_page, review_plan
 from ..daw.midi import TempoMap
-from ..errors import ValidationError
+from .session import EditOperation, ProjectRevision
+from ..errors import ReaperAudioError, StaleContext, ValidationError
 from ..models import Section
 
 ANALYSES: dict[str, dict[str, Any]] = {}
 PLANS: dict[str, dict[str, Any]] = {}
 RHYTHMS: dict[str, dict[str, Any]] = {}
+PHRASE_PLANS: dict[str, dict[str, Any]] = {}
 
 
 def _find_item(snapshot: Mapping[str, Any], item_guid: str | None,
@@ -696,6 +698,109 @@ def review_timing_pairs(snapshot, *, reference_analysis_id, analysis_id, pairs,
             "unpaired": [side[offset:offset+limit] for side in unmatched],
             "rows": rows[offset:offset+limit],
             "next_offset": offset+limit if offset+limit < max(len(rows), *map(len, unmatched)) else None}
+
+
+def plan_phrase_shift(session, *, project_id, item_guid, track_guid, shift_s, reason,
+                      reference_analysis_id=None, analysis_id=None, pairs=(), start_s=None,
+                      end_s=None):
+    if not np.isfinite(shift_s) or abs(shift_s) <= 1e-6:
+        raise ValidationError("Phrase shift requires a finite nonzero shift_s")
+    snapshot = session.snapshot(project_id=project_id, include_items=True)
+    revision = ProjectRevision.from_dict(snapshot["revision"])
+    track, item = _find_item(snapshot, item_guid, track_guid)
+    take = item.get("active_take") or {}
+    if (not (take.get("source") or take.get("source_path")) or item.get("mute")
+            or item.get("source_online") is False or item.get("loop_source")
+            or item.get("stretch_marker_positions") or take.get("stretch_markers")
+            or item.get("source_reversed") or item.get("reverse") or take.get("reverse")
+            or abs(take.get("playrate", item.get("playrate", 1)) - 1) > 1e-6):
+        raise ValidationError("Phrase shift needs an isolated, online 1x audio item without looping")
+    start = float(item["position_s"])
+    length = float(item["length_s"])
+    destination = start + shift_s
+    if destination < 0 or length <= 0:
+        raise ValidationError("The shifted phrase must have a positive length and start inside the project")
+    low, high = min(start, destination), max(start, destination) + length
+    blockers = [{"item_guid": other["guid"], "window_s":
+                 [other["position_s"], other["position_s"] + other["length_s"]]}
+                for other in track.get("items", []) if other["guid"] != item_guid
+                and other["position_s"] < high - 1e-6
+                and other["position_s"] + other["length_s"] > low + 1e-6]
+    if blockers:
+        return {"status": "blocked", "plan_id": None, "shift_s": shift_s,
+                "original_window_s": [start, start + length],
+                "destination_window_s": [destination, destination + length],
+                "conflicts": blockers, "reason": "The phrase would overlap or cross another item"}
+    pair_changes = []
+    if pairs:
+        if not reference_analysis_id or not analysis_id or start_s is None or end_s is None:
+            raise ValidationError("Phrase pair preview needs both analyses and their project window")
+        if len(pairs) > 32:
+            raise ValidationError("Review up to 32 verified pairs per phrase")
+        report = review_timing_pairs(snapshot, reference_analysis_id=reference_analysis_id,
+                                     analysis_id=analysis_id, pairs=pairs, start_s=start_s,
+                                     end_s=end_s, offset=0, limit=32)
+        for row in report["rows"]:
+            if row["live_delta_s"] is None or row["take_occurrences"][0]["item_guid"] != item_guid:
+                raise ValidationError("Each phrase pair needs a unique verified event in the moved item",
+                                      details={"event_id": row["event_id"]})
+            before = row["live_delta_s"]
+            after = before + shift_s
+            pair_changes.append({"reference_event_id": row["reference_event_id"],
+                                 "event_id": row["event_id"], "before_s": before,
+                                 "predicted_after_s": round(after, 7),
+                                 "worsens": abs(after) > abs(before) + 1e-6})
+    edit = session.plan([EditOperation("item.set", item_guid, {"position_s": destination})],
+                        reason=reason, expected_revision=revision)
+    PHRASE_PLANS[edit.plan_id] = {"edit": edit, "track_guid": track["guid"],
+                                  "item": item, "destination_s": destination,
+                                  "neighbors": {other["guid"]: other for other in track["items"]
+                                                if other["guid"] != item_guid}}
+    return {"status": "preview", "plan_id": edit.plan_id, "revision": revision.to_dict(),
+            "item_guid": item_guid, "track_guid": track["guid"], "shift_s": shift_s,
+            "original_window_s": [start, start+length], "destination_window_s":
+            [destination, destination+length], "pair_predictions": pair_changes,
+            "sound_checked": False}
+
+
+def apply_phrase_shift(session, *, plan_id, expected_revision):
+    proposal = PHRASE_PLANS.get(plan_id)
+    if proposal is None:
+        raise ValidationError("Preview a phrase shift before applying it")
+    revision = ProjectRevision.from_dict(expected_revision)
+    edit = proposal["edit"]
+    if revision != edit.revision:
+        raise StaleContext("Phrase preview belongs to a different project revision")
+    before = proposal["item"]
+    result = session.apply(edit, dry_run=False)
+    if not result["applied"]:
+        return {"ok": False, "status": "not_applied", "plan_id": plan_id}
+    snapshot = session.snapshot(project_id=revision.project_id, include_items=True)
+    track = next((row for row in snapshot["tracks"] if row["guid"] == proposal["track_guid"]), {})
+    item = next((row for row in track.get("items", ()) if row["guid"] == before["guid"]), {})
+    numeric_fields = ("length_s", "start_offset_s", "playrate", "fade_in_s", "fade_out_s")
+    neighbors = {other["guid"]: other for other in track.get("items", ())
+                 if other["guid"] != before["guid"]}
+    matched = (result.get("revision_after") == snapshot.get("revision")
+               and neighbors == proposal["neighbors"]
+               and abs(item.get("position_s", float("inf")) - proposal["destination_s"]) <= 1e-6
+               and all(abs(item.get(key, float("inf")) - before.get(key, 0)) <= 1e-6
+                       for key in numeric_fields)
+               and item.get("active_take") == before.get("active_take"))
+    if not matched:
+        rollback = None
+        if result.get("revision_after") == snapshot.get("revision"):
+            try:
+                rollback = session.undo(expected_revision=ProjectRevision.from_dict(snapshot["revision"]),
+                                        plan_id=plan_id)
+            except ReaperAudioError as exc:
+                rollback = {"error": str(exc)}
+        return {"ok": False, "status": "phrase_readback_mismatch", "plan_id": plan_id,
+                "rollback": rollback}
+    PHRASE_PLANS.pop(plan_id, None)
+    return {"ok": True, "status": "applied", "plan_id": plan_id, "item_guid": item["guid"],
+            "position_s": item["position_s"], "revision_after": snapshot["revision"],
+            "readback_matched": True, "sound_checked": False}
 
 
 def compare_timing_reviews(plan_id, compare_plan_id, *, start_s, end_s, offset, limit):

@@ -155,7 +155,8 @@ Every failure is `{"ok": false, "error": {"code", "message", "details", "next_ac
 10. **Substituting stages.** `premaster` does not exist here; `master` ≠ `via_master`.
 11. **Silent retries.** After two failures, report the code.
 
-For related takes, verify timing against the arrangement and synchrony across
+For a phrase with a consistent offset, try a rigid `phrase_shift` before
+individual attack edits. Verify timing against the arrangement and synchrony across
 tracks separately. Pair the same musical events and read their placement back
 after editing. Report coverage and ambiguous or unpaired events. A single-track
 median, a successful write or a bus-level measurement certifies neither

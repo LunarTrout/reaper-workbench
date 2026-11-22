@@ -2226,7 +2226,7 @@ def reaper_media(action: str,
 
 @server.tool()
 @_guard
-def reaper_timing(action: Literal["analyze", "waveform", "pairs", "clock", "rhythm", "plan", "review", "window", "verify",
+def reaper_timing(action: Literal["analyze", "waveform", "pairs", "phrase_shift", "phrase_apply", "clock", "rhythm", "plan", "review", "window", "verify",
                                   "refine", "inspect", "preview", "apply", "undo"],
                   project_id: str | None = None,
                   track_guid: str | None = None,
@@ -2274,7 +2274,8 @@ def reaper_timing(action: Literal["analyze", "waveform", "pairs", "clock", "rhyt
                   refine_reason: str | None = None,
                   waveform_bins: int = 256,
                   reference_analysis_id: str | None = None,
-                  event_pairs: list[dict[str, str]] | None = None) -> dict[str, Any]:
+                  event_pairs: list[dict[str, str]] | None = None,
+                  shift_s: float | None = None) -> dict[str, Any]:
     """Analyze audio timing against the project grid and build a 1x clip plan.
 
     Read reaper://guide/timing for checks and examples. Waveform reads a
@@ -2282,6 +2283,8 @@ def reaper_timing(action: Literal["analyze", "waveform", "pairs", "clock", "rhyt
     or with candidate overlays by analysis_id or plan_id. It needs no event ID.
     Pairs reviews explicitly matched events across two analyzed tracks and
     reports unpaired candidates and the actual clip placement of each pair.
+    Phrase_shift previews a rigid move of one isolated 1x item. Phrase_apply
+    commits that preview at the same revision.
     Analyze a clean, file-backed take with an explicit item GUID. Clock verifies
     a dedicated click item against the project beat grid. Rhythm ranks local
     rhythm interpretations with attack and release evidence. Read more with
@@ -2301,8 +2304,22 @@ def reaper_timing(action: Literal["analyze", "waveform", "pairs", "clock", "rhyt
         measure_timing_clock, plan_timing_crossfades, read_timing_rhythm,
         refine_timing, review_window, validate_rhythm_analysis,
     )
-    if action in {"analyze", "waveform", "pairs", "clock", "rhythm", "plan", "refine", "preview", "apply", "undo"}:
+    if action in {"analyze", "waveform", "pairs", "phrase_shift", "phrase_apply", "clock", "rhythm", "plan", "refine", "preview", "apply", "undo"}:
         _handbook_required()
+    if action == "phrase_shift":
+        if not item_guid or not track_guid or shift_s is None or not reason:
+            raise ValidationError("Phrase shift needs track_guid, item_guid, shift_s and reason")
+        return {"ok": True, "action": action, **_timing.plan_phrase_shift(
+            _session(project_id, bridge_session_id), project_id=project_id,
+            item_guid=item_guid, track_guid=track_guid, shift_s=shift_s, reason=reason,
+            reference_analysis_id=reference_analysis_id, analysis_id=analysis_id,
+            pairs=event_pairs or (), start_s=start_s, end_s=end_s)}
+    if action == "phrase_apply":
+        if not plan_id or not expected_revision:
+            raise ValidationError("Phrase apply needs the preview plan_id and expected_revision")
+        return {"action": action, **_timing.apply_phrase_shift(
+            _session(project_id, bridge_session_id), plan_id=plan_id,
+            expected_revision=expected_revision)}
     if action == "pairs":
         if not reference_analysis_id or not analysis_id or start_s is None or end_s is None:
             raise ValidationError("Pairs needs two analysis IDs and a project-time window")

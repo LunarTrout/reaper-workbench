@@ -165,3 +165,51 @@ def test_pair_review_follows_same_events_after_edit_and_exposes_unpaired(tmp_pat
     assert report["unverified_pair_count"] == 1
     assert len(report["rows"][0]["take_occurrences"]) == 2
     assert report["rows"][0]["live_delta_s"] is None
+
+
+def test_phrase_moves_rigidly_and_refuses_touching_neighbors(monkeypatch):
+    from copy import deepcopy
+
+    from reaper_audio import mcp_server
+    from reaper_audio.daw import timing_service as timing
+    from reaper_audio.daw.session import EditPlan, ProjectRevision
+
+    revision = ProjectRevision("p", 7, "test.rpp").to_dict()
+    phrase = {"guid": "phrase", "position_s": 10.0, "length_s": 2.0, "start_offset_s": 3.0,
+              "playrate": 1.0, "fade_in_s": 0.01, "fade_out_s": 0.02,
+              "active_take": {"guid": "take", "source": "audio.wav"}}
+    neighbor = {"guid": "next", "position_s": 12.5, "length_s": 2.0}
+    snapshot = {"revision": revision, "tracks": [{"guid": "track", "items": [phrase, neighbor]}]}
+    monkeypatch.setattr(timing, "PHRASE_PLANS", {})
+
+    class Session:
+        def snapshot(self, **kwargs):
+            return deepcopy(snapshot)
+
+        def plan(self, operations, *, reason, expected_revision):
+            return EditPlan(expected_revision, tuple(operations), reason, "move-preview")
+
+        def apply(self, edit, *, dry_run):
+            assert not dry_run
+            assert edit.operations[0].to_dict() == {
+                "kind": "item.set", "target_guid": "phrase", "values": {"position_s": 10.35}}
+            phrase.update(edit.operations[0].values)
+            snapshot["revision"] = {**revision, "change_count": 8}
+            return {"applied": True, "revision_after": snapshot["revision"]}
+
+    monkeypatch.setattr(mcp_server, "_session", lambda *args: Session())
+    args = dict(action="phrase_shift", track_guid="track", item_guid="phrase", reason="Phrase")
+    blocked = mcp_server.reaper_timing(**args, shift_s=0.6)
+    assert blocked["status"] == "blocked" and not timing.PHRASE_PLANS
+    assert blocked["conflicts"][0]["item_guid"] == "next"
+
+    preview = mcp_server.reaper_timing(**args, shift_s=0.35)
+    assert preview["status"] == "preview"
+    assert phrase["position_s"] == 10.0
+    result = mcp_server.reaper_timing(action="phrase_apply", plan_id=preview["plan_id"],
+                                     expected_revision=revision)
+    assert result["readback_matched"]
+    assert phrase["position_s"] == pytest.approx(10.35)
+    assert (phrase["length_s"], phrase["start_offset_s"], phrase["playrate"],
+            phrase["fade_in_s"], phrase["fade_out_s"]) == (2.0, 3.0, 1.0, 0.01, 0.02)
+    assert neighbor["position_s"] == 12.5

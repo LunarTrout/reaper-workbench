@@ -208,6 +208,36 @@ source overruns, gaps and fade conflicts. Its signal estimates and simulated
 fades are evidence for auditioning, especially on dense or clipped audio.
 `window(detail="full")` adds signal diagnostics to the local clip report.
 
+## Try moving a whole phrase first
+
+When a line or riff is consistently early or late, first test a rigid move
+of the whole phrase. Its notes keep their relative timing. Use individual
+attack edits when the deviations vary within the phrase. Confirm musical
+counterparts before choosing a shift. A lower median can hide a word that the
+same move makes worse.
+
+On a working copy, isolate the phrase at quiet boundaries and leave usable
+space beside it. Use the existing item editing tools for this preparation.
+`phrase_shift` takes the GUID of a single isolated 1x item and an explicit
+`shift_s` in seconds. Positive values move the phrase later. There is no
+per-attack quantization tolerance on this move. It preserves length, source
+offset, rate and existing fades. It returns the old and new item windows and
+blocks a move that would overlap or pass another item on the same track.
+Resolve any boundary conflict before applying. The move can leave a pause.
+
+```text
+reaper_timing(action="phrase_shift", track_guid=..., item_guid=...,
+              shift_s=0.312, reason="Move the confirmed phrase later")
+reaper_timing(action="phrase_apply", plan_id=..., expected_revision=...)
+```
+
+For a double, pass the two analysis IDs, window and confirmed `event_pairs`
+to the preview. It shows the predicted residual and whether it worsens for
+each pair. Read those results before applying. After apply, check the same
+pairs with `pairs` and inspect both neighbors. Audition the phrase with its
+surroundings when available. A shift that helps some words and displaces others
+calls for a smaller phrase or targeted edits.
+
 ## Verify timing across related takes
 
 Choose a reference performance for the phrase and check its relationship to
